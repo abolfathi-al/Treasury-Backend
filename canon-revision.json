@@ -1,6 +1,6 @@
 {
   "repository": "Treasury-Canon",
-  "revision": "329b591bfb3a9b78cf6b8e549653300d87e3cc4b",
+  "revision": "4e4909d5f69ced2c7613f7a91d5db335046f63cf",
   "canon_root": "canon-v4",
-  "authorized_delivery_slice": "SLICE-1-FOUNDATION"
+  "authorized_delivery_slice": "INC-1A-AUTH-METHODS"
 }

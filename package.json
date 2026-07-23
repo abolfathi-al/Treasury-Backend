@@ -5,7 +5,9 @@
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit -p tsconfig.json",
-    "test": "node --import tsx --test test/*.test.ts",
+    "test": "node --import tsx --test --test-concurrency=1 test/*.test.ts",
+    "db:migrate": "tsx scripts/migrate.ts",
+    "bootstrap:operator": "tsx scripts/bootstrap.ts",
     "start": "node dist/main.js",
     "start:dev": "tsx watch src/main.ts"
   },
@@ -16,11 +18,18 @@
     "@nestjs/common": "^11.0.0",
     "@nestjs/core": "^11.0.0",
     "@nestjs/platform-express": "^11.0.0",
+    "argon2": "^0.45.1",
+    "class-transformer": "^0.5.1",
+    "class-validator": "^0.15.1",
+    "drizzle-orm": "^0.45.2",
+    "pg": "^8.22.0",
     "reflect-metadata": "^0.2.2",
     "rxjs": "^7.8.0"
   },
   "devDependencies": {
+    "@types/express": "^5.0.6",
     "@types/node": "^25.0.0",
+    "@types/pg": "^8.20.0",
     "tsx": "^4.0.0",
     "typescript": "^5.0.0"
   }
