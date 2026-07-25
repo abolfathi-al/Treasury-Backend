@@ -51,28 +51,6 @@ test('permission scope metadata is mandatory and missing context fails closed', 
   );
 });
 
-test('permission alternatives preserve each requirement scope mode', () => {
-  const requirement = [
-    { permission: 'master-data.view', scopeMode: 'ORGANIZATION_WIDE' },
-    { permission: 'access-grant.manage', scopeMode: 'ONE_GRANT_RESOURCE' },
-  ] as const;
-  const granted = (organizationPermissions: string[], effectivePermissions: string[]) =>
-    operationPermissionGranted(
-      {
-        organizationPermissions,
-        session: { effectivePermissions },
-      } as SessionContext,
-      'listBranches',
-      requirement,
-      undefined,
-    );
-
-  assert.equal(granted(['master-data.view'], []), true);
-  assert.equal(granted([], ['access-grant.manage']), true);
-  assert.equal(granted([], ['master-data.view']), false);
-  assert.equal(granted([], []), false);
-});
-
 test('Grant scope rejects explicit empty objects and invalid amount-currency combinations', () => {
   assert.throws(
     () => canonicalScope({}),

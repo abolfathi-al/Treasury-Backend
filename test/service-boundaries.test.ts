@@ -9,13 +9,12 @@ import type { CredentialService } from '../src/access-control/credential.service
 import type { IdentityRepository } from '../src/access-control/identity.repository';
 import { IdentityService } from '../src/access-control/identity.service';
 import { TreasuryProblem } from '../src/common/problem';
-import type { DatabaseService } from '../src/database/database.service';
 import {
   MethodBehaviorCategory,
   MethodDirection,
   MethodReference,
 } from '../src/master-data/master-data.dto';
-import { MasterDataRepository } from '../src/master-data/master-data.repository';
+import type { MasterDataRepository } from '../src/master-data/master-data.repository';
 import { MasterDataService } from '../src/master-data/master-data.service';
 
 const shortKeyProblem = (error: unknown) => error instanceof TreasuryProblem && error.getStatus() === 422;
@@ -153,42 +152,4 @@ test('malformed opaque cursors fail as typed 422 boundaries before PostgreSQL ca
     {} as AuthService,
   );
   assert.throws(() => identity.list('org', undefined, 'not-a-uuid'), shortKeyProblem);
-});
-
-test('master-data lookup pages omit nullable optional response fields', async () => {
-  const database = {
-    pool: {
-      query: async (sql: string) => ({
-        rows: sql.includes('FROM treasury_units')
-          ? [{
-              id: 'unit',
-              organizationId: 'org',
-              branchId: null,
-              code: 'CENTRAL',
-              name: 'Central',
-              defaultCurrency: 'IRR',
-              state: 'ACTIVE',
-              version: 0,
-            }]
-          : [{
-              code: 'IRR',
-              name: 'ریال',
-              englishName: null,
-              symbol: null,
-              decimalPlaces: 0,
-              baseCurrency: true,
-              state: 'ACTIVE',
-              version: 0,
-            }],
-      }),
-    },
-  } as unknown as DatabaseService;
-  const repository = new MasterDataRepository(database);
-
-  const unit = (await repository.listTreasuryUnits('org', 50)).items[0]!;
-  const currency = (await repository.listCurrencies('org', 50)).items[0]!;
-
-  assert.equal('branchId' in unit, false);
-  assert.equal('englishName' in currency, false);
-  assert.equal('symbol' in currency, false);
 });

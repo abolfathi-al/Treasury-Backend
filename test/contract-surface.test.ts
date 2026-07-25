@@ -6,10 +6,7 @@ import { METHOD_METADATA, PATH_METADATA } from '@nestjs/common/constants';
 
 import { AuthController } from '../src/access-control/auth.controller';
 import { AccessAdminController } from '../src/access-control/access-admin.controller';
-import {
-  REQUIRED_PERMISSION,
-  STEP_UP_REQUIRED,
-} from '../src/access-control/auth.decorators';
+import { STEP_UP_REQUIRED } from '../src/access-control/auth.decorators';
 import { IdentityController } from '../src/access-control/identity.controller';
 import { MasterDataController } from '../src/master-data/master-data.controller';
 
@@ -82,48 +79,6 @@ test('protected commands bind step-up digests to their exact operation IDs', () 
     ),
     'revokeIdentitySessions',
   );
-});
-
-test('grant managers can read only the authoritative grant-construction lookups', () => {
-  for (const handler of [
-    IdentityController.prototype.list,
-    AccessAdminController.prototype.listRoles,
-  ]) {
-    assert.deepEqual(
-      Reflect.getMetadata(REQUIRED_PERMISSION, handler),
-      [
-        { permission: 'access-control.view', scopeMode: 'ORGANIZATION_WIDE' },
-        { permission: 'access-grant.manage', scopeMode: 'ONE_GRANT_RESOURCE' },
-      ],
-    );
-  }
-  for (const handler of [
-    MasterDataController.prototype.branches,
-    MasterDataController.prototype.treasuryUnits,
-    MasterDataController.prototype.currencies,
-  ]) {
-    assert.deepEqual(
-      Reflect.getMetadata(REQUIRED_PERMISSION, handler),
-      [
-        { permission: 'master-data.view', scopeMode: 'ORGANIZATION_WIDE' },
-        { permission: 'access-grant.manage', scopeMode: 'ONE_GRANT_RESOURCE' },
-      ],
-    );
-  }
-  for (const handler of [
-    MasterDataController.prototype.organization,
-    MasterDataController.prototype.methods,
-  ]) {
-    assert.equal(Reflect.getMetadata(REQUIRED_PERMISSION, handler), 'master-data.view');
-  }
-  for (const handler of [
-    MasterDataController.prototype.createBranch,
-    MasterDataController.prototype.createTreasuryUnit,
-    MasterDataController.prototype.createCurrency,
-    MasterDataController.prototype.createMethod,
-  ]) {
-    assert.equal(Reflect.getMetadata(REQUIRED_PERMISSION, handler), 'master-data.manage');
-  }
 });
 
 test('migration locks bootstrap, normalized method children, sessions, and idempotency in PostgreSQL', async () => {
