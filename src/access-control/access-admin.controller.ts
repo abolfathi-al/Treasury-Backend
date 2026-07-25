@@ -74,7 +74,13 @@ export class AccessAdminController {
   }
 
   @Get('roles')
-  @RequirePermission('access-control.view', 'listRoles', 'ORGANIZATION_WIDE')
+  @RequirePermission(
+    [
+      { permission: 'access-control.view', scopeMode: 'ORGANIZATION_WIDE' },
+      { permission: 'access-grant.manage', scopeMode: 'ONE_GRANT_RESOURCE' },
+    ],
+    'listRoles',
+  )
   listRoles(
     @Req() request: TreasuryRequest,
     @Query('limit') limit?: string,

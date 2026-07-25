@@ -22,6 +22,7 @@ import {
   PERMISSION_SCOPE_MODE,
   PUBLIC_OPERATION,
   REQUIRED_PERMISSION,
+  RequiredPermission,
   STEP_UP_REQUIRED,
 } from './auth.decorators';
 import { AuthService, SessionContext } from './auth.service';
@@ -64,7 +65,7 @@ export class AuthGuard implements CanActivate {
       setSessionCookies(response, auth.rotatedSessionToken, auth.refreshedXsrfToken);
     }
 
-    const permission = this.reflector.getAllAndOverride<string>(REQUIRED_PERMISSION, [
+    const permission = this.reflector.getAllAndOverride<RequiredPermission>(REQUIRED_PERMISSION, [
       context.getHandler(),
       context.getClass(),
     ]);
@@ -127,14 +128,18 @@ export class AuthGuard implements CanActivate {
 export function operationPermissionGranted(
   auth: SessionContext,
   operationId: string | undefined,
-  permission: string,
+  permission: RequiredPermission,
   scopeMode: PermissionScopeMode | undefined,
 ): boolean {
-  if (!operationId || !scopeMode) return false;
-  const permissions = scopeMode === 'ORGANIZATION_WIDE'
-    ? auth.organizationPermissions
-    : auth.session.effectivePermissions;
-  return permissions.includes(permission);
+  if (!operationId) return false;
+  const requirements = typeof permission === 'string'
+    ? (scopeMode ? [{ permission, scopeMode }] : [])
+    : permission;
+  return requirements.some((requirement) => (
+    requirement.scopeMode === 'ORGANIZATION_WIDE'
+      ? auth.organizationPermissions
+      : auth.session.effectivePermissions
+  ).includes(requirement.permission));
 }
 
 export function csrfValid(

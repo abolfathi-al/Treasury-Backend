@@ -22,7 +22,13 @@ export class IdentityController {
   constructor(@Inject(IdentityService) private readonly service: IdentityService) {}
 
   @Get('user-refs')
-  @RequirePermission('access-control.view', 'listUserRefs', 'ORGANIZATION_WIDE')
+  @RequirePermission(
+    [
+      { permission: 'access-control.view', scopeMode: 'ORGANIZATION_WIDE' },
+      { permission: 'access-grant.manage', scopeMode: 'ONE_GRANT_RESOURCE' },
+    ],
+    'listUserRefs',
+  )
   list(
     @Req() request: TreasuryRequest,
     @Query('limit') limit?: string,

@@ -30,7 +30,13 @@ export class MasterDataController {
   }
 
   @Get('branches')
-  @RequirePermission('master-data.view', 'listBranches', 'ORGANIZATION_WIDE')
+  @RequirePermission(
+    [
+      { permission: 'master-data.view', scopeMode: 'ORGANIZATION_WIDE' },
+      { permission: 'access-grant.manage', scopeMode: 'ONE_GRANT_RESOURCE' },
+    ],
+    'listBranches',
+  )
   branches(
     @Req() request: TreasuryRequest,
     @Query('limit') limit?: string,
@@ -50,7 +56,13 @@ export class MasterDataController {
   }
 
   @Get('treasury-units')
-  @RequirePermission('master-data.view', 'listTreasuryUnits', 'ORGANIZATION_WIDE')
+  @RequirePermission(
+    [
+      { permission: 'master-data.view', scopeMode: 'ORGANIZATION_WIDE' },
+      { permission: 'access-grant.manage', scopeMode: 'ONE_GRANT_RESOURCE' },
+    ],
+    'listTreasuryUnits',
+  )
   treasuryUnits(
     @Req() request: TreasuryRequest,
     @Query('limit') limit?: string,
@@ -70,7 +82,13 @@ export class MasterDataController {
   }
 
   @Get('currencies')
-  @RequirePermission('master-data.view', 'listCurrencies', 'ORGANIZATION_WIDE')
+  @RequirePermission(
+    [
+      { permission: 'master-data.view', scopeMode: 'ORGANIZATION_WIDE' },
+      { permission: 'access-grant.manage', scopeMode: 'ONE_GRANT_RESOURCE' },
+    ],
+    'listCurrencies',
+  )
   currencies(
     @Req() request: TreasuryRequest,
     @Query('limit') limit?: string,
