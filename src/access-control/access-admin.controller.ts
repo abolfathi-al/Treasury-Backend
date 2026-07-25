@@ -26,7 +26,7 @@ export class AccessAdminController {
   constructor(@Inject(AccessAdminService) private readonly service: AccessAdminService) {}
 
   @Get('identity-accounts')
-  @RequirePermission('identity-account.manage')
+  @RequirePermission('identity-account.manage', 'listIdentityAccounts')
   listIdentityAccounts(
     @Req() request: TreasuryRequest,
     @Query('limit') limit?: string,
@@ -36,7 +36,7 @@ export class AccessAdminController {
   }
 
   @Get('identity-accounts/:resourceId/sessions')
-  @RequirePermission('identity-account.manage')
+  @RequirePermission('identity-account.manage', 'listIdentityAccountSessions')
   listIdentityAccountSessions(
     @Req() request: TreasuryRequest,
     @Param('resourceId') resourceId: string,
@@ -53,7 +53,7 @@ export class AccessAdminController {
   }
 
   @Post('identity-accounts/:resourceId/session-revocations')
-  @RequirePermission('identity-account.manage')
+  @RequirePermission('identity-account.manage', 'revokeIdentitySessions')
   @RequireStepUp('revokeIdentitySessions')
   @HttpCode(200)
   revokeIdentitySessions(
@@ -74,7 +74,7 @@ export class AccessAdminController {
   }
 
   @Get('roles')
-  @RequirePermission('access-control.view')
+  @RequirePermission('access-control.view', 'listRoles')
   listRoles(
     @Req() request: TreasuryRequest,
     @Query('limit') limit?: string,
@@ -84,7 +84,7 @@ export class AccessAdminController {
   }
 
   @Post('roles')
-  @RequirePermission('role.manage')
+  @RequirePermission('role.manage', 'createRole')
   @RequireStepUp('createRole')
   createRole(
     @Req() request: TreasuryRequest,
@@ -102,7 +102,7 @@ export class AccessAdminController {
   }
 
   @Get('access-grants')
-  @RequirePermission('access-control.view')
+  @RequirePermission('access-control.view', 'listAccessGrants')
   listAccessGrants(
     @Req() request: TreasuryRequest,
     @Query('limit') limit?: string,
@@ -117,7 +117,7 @@ export class AccessAdminController {
   }
 
   @Post('access-grants')
-  @RequirePermission('access-grant.manage')
+  @RequirePermission('access-grant.manage', 'createAccessGrant')
   @RequireStepUp('createAccessGrant')
   createAccessGrant(
     @Req() request: TreasuryRequest,

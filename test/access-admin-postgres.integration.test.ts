@@ -8,6 +8,7 @@ import { AccessAdminService } from '../src/access-control/access-admin.service';
 import { SessionRevokeScope } from '../src/access-control/access-admin.dto';
 import { AuthRepository } from '../src/access-control/auth.repository';
 import { AuthService, SessionContext } from '../src/access-control/auth.service';
+import { operationPermissionGranted } from '../src/access-control/auth.guard';
 import { CredentialService } from '../src/access-control/credential.service';
 import { commandDigest, digest } from '../src/common/http';
 import { TreasuryProblem } from '../src/common/problem';
@@ -30,6 +31,27 @@ test('INC-1B PostgreSQL commands are scoped, replay-safe, atomic, and session-ch
   try {
     const fixture = await seed(database);
     const actor = sessionContext(fixture);
+    const scopedAdmin = await seedScopedAdmin(database, fixture);
+    const scopedAuth = await auth.authenticateSession(scopedAdmin.token);
+    assert.ok(scopedAuth.session.effectivePermissions.includes('role.manage'));
+    assert.deepEqual(scopedAuth.organizationPermissions, []);
+    for (const [operationId, permission] of [
+      ['listIdentityAccounts', 'identity-account.manage'],
+      ['listIdentityAccountSessions', 'identity-account.manage'],
+      ['revokeIdentitySessions', 'identity-account.manage'],
+      ['listRoles', 'access-control.view'],
+      ['createRole', 'role.manage'],
+    ] as const) {
+      assert.equal(operationPermissionGranted(scopedAuth, operationId, permission), false);
+    }
+    assert.equal(
+      operationPermissionGranted(scopedAuth, 'listAccessGrants', 'access-control.view'),
+      true,
+    );
+    assert.equal(
+      operationPermissionGranted(scopedAuth, 'createAccessGrant', 'access-grant.manage'),
+      true,
+    );
 
     const roleBody = {
       code: 'TREASURY_VIEWER',
@@ -70,6 +92,36 @@ test('INC-1B PostgreSQL commands are scoped, replay-safe, atomic, and session-ch
       )).rows[0]!.count,
       1,
     );
+    await database.pool.query(`
+      UPDATE auth_step_up_proofs SET expires_at = now() - interval '1 second'
+      WHERE token_digest = $1
+    `, [digest(roleStep.proofId)]);
+    assert.equal(
+      await new AuthRepository(database).validateStepUpProof(
+        digest(roleStep.proofId),
+        {
+          organizationId: fixture.organizationId,
+          operationId: 'createRole',
+          sessionId: fixture.actorSessionId,
+          method: 'POST',
+          path: '/v1/roles',
+          bodyDigest: commandDigest('createRole', roleBody),
+          idempotencyKey: 'role-command',
+        },
+      ),
+      false,
+    );
+    await assert.rejects(
+      service.createRole(
+        fixture.organizationId,
+        roleBody,
+        'role-command',
+        'role-expired-replay',
+        actor,
+        roleStep,
+      ),
+      (error) => problem(error, 'TRS-AUT-010', 428),
+    );
 
     const conflictingRole = { ...roleBody, name: 'Changed viewer' };
     const conflictStep = await step(
@@ -106,6 +158,53 @@ test('INC-1B PostgreSQL commands are scoped, replay-safe, atomic, and session-ch
       validFrom: '2026-01-01T00:00:00.000Z',
       reason: 'Foundation access',
     };
+    const oversizedBody = {
+      ...grantBody,
+      scope: {
+        ...grantBody.scope,
+        amountCeiling: {
+          amount: '1234567890123456789012345678901',
+          currency: 'USD',
+        },
+      },
+    };
+    const oversizedStep = await step(
+      database,
+      fixture.actorAccountId,
+      fixture.actorSessionId,
+      'createAccessGrant',
+      '/v1/access-grants',
+      oversizedBody,
+      'grant-oversized',
+    );
+    const targetEpochBeforeOversized = await epoch(database, fixture.targetAccountId);
+    await assert.rejects(
+      service.createAccessGrant(
+        fixture.organizationId,
+        oversizedBody,
+        'grant-oversized',
+        'grant-oversized-request',
+        actor,
+        oversizedStep,
+      ),
+      (error) => problem(error, 'TRS-GEN-001', 422),
+    );
+    const oversizedState = await database.pool.query<{
+      grants: string;
+      idempotency: string;
+      proof_consumed: Date | null;
+    }>(`
+      SELECT
+        (SELECT count(*) FROM access_grants WHERE user_ref_id = $1)::text AS grants,
+        (SELECT count(*) FROM idempotency_records
+         WHERE idempotency_key = 'grant-oversized')::text AS idempotency,
+        p.consumed_at AS proof_consumed
+      FROM auth_step_up_proofs p WHERE p.token_digest = $2
+    `, [fixture.targetUserId, digest(oversizedStep.proofId)]);
+    assert.equal(oversizedState.rows[0]!.grants, '0');
+    assert.equal(oversizedState.rows[0]!.idempotency, '0');
+    assert.equal(oversizedState.rows[0]!.proof_consumed, null);
+    assert.equal(await epoch(database, fixture.targetAccountId), targetEpochBeforeOversized);
     const grantStep = await step(
       database,
       fixture.actorAccountId,
@@ -441,6 +540,12 @@ function sessionContext(fixture: Awaited<ReturnType<typeof seed>>): SessionConte
     accountId: fixture.actorAccountId,
     organizationId: fixture.organizationId,
     physicalSessionId: fixture.actorSessionId,
+    organizationPermissions: [
+      'access-control.view',
+      'access-grant.manage',
+      'identity-account.manage',
+      'role.manage',
+    ],
     xsrfDigest: digest('actor-xsrf'),
     presentedTokenDigest: digest('actor-token'),
     matchedCurrent: true,
@@ -460,6 +565,63 @@ function sessionContext(fixture: Awaited<ReturnType<typeof seed>>): SessionConte
       ],
     },
   };
+}
+
+async function seedScopedAdmin(
+  database: DatabaseService,
+  fixture: Awaited<ReturnType<typeof seed>>,
+) {
+  const user = await database.pool.query<{ id: string }>(`
+    INSERT INTO user_refs (organization_id, subject_key, display_name)
+    VALUES ($1,'scoped-admin','Scoped Administrator') RETURNING id
+  `, [fixture.organizationId]);
+  const account = await database.pool.query<{ id: string }>(`
+    INSERT INTO identity_accounts (
+      user_ref_id, normalized_login, password_hash, privileged,
+      totp_ciphertext, totp_iv, totp_auth_tag, totp_key_version
+    ) VALUES ($1,'scoped-admin','hash',true,'ciphertext','iv','tag',1)
+    RETURNING id
+  `, [user.rows[0]!.id]);
+  const role = await database.pool.query<{ id: string }>(`
+    INSERT INTO roles (organization_id, code, name)
+    VALUES ($1,'SCOPED_ADMIN','Scoped Administrator') RETURNING id
+  `, [fixture.organizationId]);
+  for (const permission of [
+    'access-control.view',
+    'access-grant.manage',
+    'identity-account.manage',
+    'role.manage',
+  ]) {
+    await database.pool.query(
+      'INSERT INTO role_permissions (role_id, permission) VALUES ($1,$2)',
+      [role.rows[0]!.id, permission],
+    );
+  }
+  const grant = await database.pool.query<{ id: string }>(`
+    INSERT INTO access_grants (
+      organization_id, user_ref_id, role_id, scope_type, scope_id, valid_from
+    ) VALUES ($1,$2,$3,'ORGANIZATION',$1,'2020-01-01T00:00:00.000Z')
+    RETURNING id
+  `, [fixture.organizationId, user.rows[0]!.id, role.rows[0]!.id]);
+  await database.pool.query(`
+    INSERT INTO access_grant_branch_scopes (access_grant_id, branch_id)
+    VALUES ($1,$2)
+  `, [grant.rows[0]!.id, fixture.branchId]);
+  await database.pool.query(`
+    INSERT INTO access_grant_cashbox_scopes (access_grant_id, cashbox_id)
+    VALUES ($1,$2)
+  `, [grant.rows[0]!.id, randomUUID()]);
+  const token = `scoped-${randomUUID()}`;
+  await database.pool.query(`
+    INSERT INTO auth_sessions (
+      identity_account_id, token_digest, xsrf_digest, authenticated_at,
+      last_rotated_at, idle_expires_at, absolute_expires_at, assurance, device_label
+    ) VALUES (
+      $1,$2,$3,now(),now(),now() + interval '15 minutes',
+      now() + interval '8 hours','PASSWORD_TOTP','scoped-admin-device'
+    )
+  `, [account.rows[0]!.id, digest(token), digest('scoped-xsrf')]);
+  return { token };
 }
 
 async function step(

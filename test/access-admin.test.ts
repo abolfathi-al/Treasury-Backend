@@ -46,6 +46,18 @@ test('Grant scope rejects explicit empty objects and invalid amount-currency com
     }),
     (error) => problem(error, 'TRS-GEN-001', 422),
   );
+  assert.throws(
+    () => canonicalScope({
+      amountCeiling: { amount: '1234567890123456789012345678901', currency: 'USD' },
+    }),
+    (error) => problem(error, 'TRS-GEN-001', 422),
+  );
+  assert.throws(
+    () => canonicalScope({
+      amountCeiling: { amount: '1.123456789', currency: 'USD' },
+    }),
+    (error) => problem(error, 'TRS-GEN-001', 422),
+  );
 });
 
 test('one grant must satisfy every dimension without cross-grant restriction mixing', () => {

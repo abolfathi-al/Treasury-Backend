@@ -61,6 +61,7 @@ export interface SessionRow {
   authorized_epoch: string;
   account_authorization_epoch: string;
   permissions: string[];
+  organization_permissions: string[];
 }
 
 export interface ThrottleRow {
@@ -468,7 +469,8 @@ export class AuthRepository {
              ur.organization_id, ur.id AS user_ref_id, ur.display_name,
              (p.id = tail.id AND tail.token_digest = $1) AS matched_current,
              ia.authorization_epoch AS account_authorization_epoch,
-             permission_set.permissions
+             permission_set.permissions,
+             permission_set.organization_permissions
       FROM presented p
       JOIN tail ON true
       JOIN identity_accounts ia ON ia.id = tail.identity_account_id AND ia.state = 'ACTIVE'
@@ -477,7 +479,21 @@ export class AuthRepository {
         SELECT COALESCE(
           array_agg(DISTINCT rp.permission) FILTER (WHERE rp.permission IS NOT NULL),
           '{}'
-        ) AS permissions
+        ) AS permissions,
+        COALESCE(
+          array_agg(DISTINCT rp.permission) FILTER (
+            WHERE rp.permission IS NOT NULL
+              AND ag.amount_ceiling IS NULL
+              AND NOT EXISTS (SELECT 1 FROM access_grant_branch_scopes s WHERE s.access_grant_id = ag.id)
+              AND NOT EXISTS (SELECT 1 FROM access_grant_treasury_unit_scopes s WHERE s.access_grant_id = ag.id)
+              AND NOT EXISTS (SELECT 1 FROM access_grant_cashbox_scopes s WHERE s.access_grant_id = ag.id)
+              AND NOT EXISTS (SELECT 1 FROM access_grant_bank_account_scopes s WHERE s.access_grant_id = ag.id)
+              AND NOT EXISTS (SELECT 1 FROM access_grant_document_type_scopes s WHERE s.access_grant_id = ag.id)
+              AND NOT EXISTS (SELECT 1 FROM access_grant_method_category_scopes s WHERE s.access_grant_id = ag.id)
+              AND NOT EXISTS (SELECT 1 FROM access_grant_currency_scopes s WHERE s.access_grant_id = ag.id)
+          ),
+          '{}'
+        ) AS organization_permissions
         FROM access_grants ag
         JOIN roles r ON r.id = ag.role_id AND r.state = 'ACTIVE'
         JOIN role_permissions rp ON rp.role_id = r.id
@@ -681,8 +697,9 @@ export class AuthRepository {
           AND c.http_path = $4
           AND c.request_body_digest = $5
           AND c.idempotency_key = $6
+          AND p.expires_at > now()
           AND (
-            (p.consumed_at IS NULL AND p.expires_at > now())
+            p.consumed_at IS NULL
             OR EXISTS (
               SELECT 1
               FROM idempotency_records i

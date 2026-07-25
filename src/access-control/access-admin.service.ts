@@ -317,9 +317,7 @@ export function canonicalScope(scope?: GrantScopeDto): CanonicalGrantScope {
   if (
     scope?.amountCeiling
     && (
-      !/^(0\.0*[1-9][0-9]*|[1-9][0-9]*(\.[0-9]{1,12})?)$/u.test(
-        scope.amountCeiling.amount,
-      )
+      !representableAmount(scope.amountCeiling.amount)
       || !/^[A-Z0-9]{3,8}$/u.test(scope.amountCeiling.currency)
     )
   ) {
@@ -341,6 +339,16 @@ export function canonicalScope(scope?: GrantScopeDto): CanonicalGrantScope {
       },
     } : {}),
   };
+}
+
+function representableAmount(value: string): boolean {
+  const match = /^(0|[1-9][0-9]*)(?:\.([0-9]+))?$/u.exec(value);
+  if (!match) return false;
+  const integer = match[1]!;
+  const fraction = match[2] ?? '';
+  return integer.length <= 30
+    && fraction.length <= 8
+    && /[1-9]/u.test(`${integer}${fraction}`);
 }
 
 export function prepareGrant(dto: AccessGrantCreateDto): PreparedAccessGrant {

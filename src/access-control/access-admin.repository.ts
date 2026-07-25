@@ -426,9 +426,8 @@ export class AccessAdminRepository {
       const proof = await client.query<{
         id: string;
         consumed_at: Date | null;
-        expires_at: Date;
       }>(`
-        SELECT p.id, p.consumed_at, p.expires_at
+        SELECT p.id, p.consumed_at
         FROM auth_step_up_proofs p
         JOIN auth_challenges c ON c.id = p.challenge_id
         WHERE p.token_digest = $1
@@ -437,6 +436,7 @@ export class AccessAdminRepository {
           AND c.http_path = $4
           AND c.request_body_digest = $5
           AND c.idempotency_key = $6
+          AND p.expires_at > now()
         FOR UPDATE OF p
       `, [
         command.proofDigest,
@@ -472,7 +472,6 @@ export class AccessAdminRepository {
       }
       if (
         proof.rows[0]!.consumed_at
-        || proof.rows[0]!.expires_at <= new Date()
       ) {
         throw new RangeError('STEP_UP_INVALID');
       }

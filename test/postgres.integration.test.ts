@@ -131,6 +131,28 @@ test('identity command finalizes its exact step-up proof only with the successfu
     assert.ok(finalized.rows[0]!.consumed_at);
     assert.equal(finalized.rows[0]!.request_digest, bodyDigest);
     assert.notEqual(finalized.rows[0]!.request_digest, digest(stableJson(dto)));
+    await database.pool.query(`
+      UPDATE auth_step_up_proofs SET expires_at = now() - interval '1 second'
+      WHERE token_digest = $1
+    `, [digest(fixture.proofId)]);
+    await assert.rejects(
+      identities.createIdentityAccount(
+        fixture.organizationId,
+        dto,
+        dto.login,
+        await credentials.hashPassword(dto.temporaryPassword),
+        fixture.idempotencyKey,
+        bodyDigest,
+        {
+          proofDigest: digest(fixture.proofId),
+          sessionId: fixture.sessionId,
+          method: 'POST',
+          path: '/v1/identity-accounts',
+          bodyDigest,
+        },
+      ),
+      (error) => error instanceof RangeError && error.message === 'STEP_UP_INVALID',
+    );
 
     const auth = new AuthService(new AuthRepository(database), credentials);
     await assert.rejects(

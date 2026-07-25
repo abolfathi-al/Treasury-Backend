@@ -17,6 +17,7 @@ import {
 } from '../common/http';
 import { TreasuryProblem } from '../common/problem';
 import {
+  AUTHORIZATION_OPERATION,
   PUBLIC_OPERATION,
   REQUIRED_PERMISSION,
   STEP_UP_REQUIRED,
@@ -65,7 +66,11 @@ export class AuthGuard implements CanActivate {
       context.getHandler(),
       context.getClass(),
     ]);
-    if (permission && !auth.session.effectivePermissions.includes(permission)) {
+    const operationId = this.reflector.getAllAndOverride<string>(AUTHORIZATION_OPERATION, [
+      context.getHandler(),
+      context.getClass(),
+    ]);
+    if (permission && !operationPermissionGranted(auth, operationId, permission)) {
       throw new TreasuryProblem('TRS-GEN-003', 403);
     }
 
@@ -111,6 +116,25 @@ export class AuthGuard implements CanActivate {
       throw new TreasuryProblem('TRS-AUT-009', 403);
     }
   }
+}
+
+const ORGANIZATION_ONLY_OPERATIONS = new Set([
+  'listIdentityAccounts',
+  'listIdentityAccountSessions',
+  'revokeIdentitySessions',
+  'listRoles',
+  'createRole',
+]);
+
+export function operationPermissionGranted(
+  auth: SessionContext,
+  operationId: string | undefined,
+  permission: string,
+): boolean {
+  const permissions = operationId && ORGANIZATION_ONLY_OPERATIONS.has(operationId)
+    ? auth.organizationPermissions
+    : auth.session.effectivePermissions;
+  return permissions.includes(permission);
 }
 
 export function csrfValid(

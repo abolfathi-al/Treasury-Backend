@@ -27,6 +27,7 @@ export interface SessionContext {
   accountId: string;
   organizationId: string;
   physicalSessionId: string;
+  organizationPermissions: string[];
   session: SessionView;
   xsrfDigest: string;
   presentedTokenDigest: string;
@@ -423,6 +424,7 @@ export class AuthService {
       accountId: row.identity_account_id,
       organizationId: row.organization_id,
       physicalSessionId: row.id,
+      organizationPermissions: [...row.organization_permissions].sort(),
       xsrfDigest: row.xsrf_digest,
       presentedTokenDigest,
       matchedCurrent: row.matched_current,
