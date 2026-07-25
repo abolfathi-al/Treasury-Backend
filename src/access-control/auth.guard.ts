@@ -28,6 +28,7 @@ export interface TreasuryRequest extends Request {
   stepUp?: {
     proofId: string;
     command: {
+      operationId: string;
       method: string;
       path: string;
       bodyDigest: string;
@@ -72,18 +73,20 @@ export class AuthGuard implements CanActivate {
       this.assertCsrf(request, auth, cookies);
     }
 
-    if (this.reflector.getAllAndOverride<boolean>(STEP_UP_REQUIRED, [
+    const stepUpOperationId = this.reflector.getAllAndOverride<string>(STEP_UP_REQUIRED, [
       context.getHandler(),
       context.getClass(),
-    ])) {
+    ]);
+    if (stepUpOperationId) {
       const idempotencyKey = request.header('Idempotency-Key');
       if (!idempotencyKey || idempotencyKey.length < 8 || idempotencyKey.length > 128) {
         throw new TreasuryProblem('TRS-GEN-001', 422, 'Idempotency-Key must contain 8 through 128 characters.');
       }
       const command = {
+        operationId: stepUpOperationId,
         method: request.method,
         path: request.path,
-        bodyDigest: commandDigest('createIdentityAccount', request.body),
+        bodyDigest: commandDigest(stepUpOperationId, request.body),
         idempotencyKey,
       };
       const proofId = request.header('X-Step-Up-Proof');

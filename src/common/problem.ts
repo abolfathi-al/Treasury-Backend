@@ -24,6 +24,7 @@ const titles = {
   'TRS-AUT-008': 'Authentication throttled',
   'TRS-AUT-009': 'CSRF verification failed',
   'TRS-AUT-010': 'Fresh step-up required',
+  'TRS-AUT-012': 'Access-control identity conflict',
   'TRS-MST-001': 'Inactive reference',
   'TRS-MST-002': 'Duplicate master identity',
   'TRS-MST-004': 'Method configuration invalid',

@@ -122,6 +122,7 @@ export const identityAccounts = pgTable('identity_accounts', {
   recoveryVersion: integer('recovery_version').notNull().default(1),
   state: varchar('state', { length: 16 }).notNull().default('ACTIVE'),
   privileged: boolean('privileged').notNull().default(false),
+  authorizationEpoch: bigint('authorization_epoch', { mode: 'number' }).notNull().default(0),
   version: integer('version').notNull().default(0),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
 });
@@ -133,11 +134,18 @@ export const roles = pgTable('roles', {
   name: varchar('name', { length: 160 }).notNull(),
   state: varchar('state', { length: 16 }).notNull().default('ACTIVE'),
   version: integer('version').notNull().default(0),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
 }, (table) => [unique().on(table.organizationId, table.code)]);
+
+export const operationPermissions = pgTable('operation_permissions', {
+  permission: varchar('permission', { length: 128 }).primaryKey(),
+});
 
 export const rolePermissions = pgTable('role_permissions', {
   roleId: uuid('role_id').notNull().references(() => roles.id),
-  permission: varchar('permission', { length: 128 }).notNull(),
+  permission: varchar('permission', { length: 128 }).notNull()
+    .references(() => operationPermissions.permission),
 }, (table) => [primaryKey({ columns: [table.roleId, table.permission] })]);
 
 export const accessGrants = pgTable('access_grants', {
@@ -147,9 +155,73 @@ export const accessGrants = pgTable('access_grants', {
   roleId: uuid('role_id').notNull().references(() => roles.id),
   scopeType: varchar('scope_type', { length: 32 }).notNull().default('ORGANIZATION'),
   scopeId: uuid('scope_id').notNull().references(() => organizations.id),
+  amountCeiling: numeric('amount_ceiling', { precision: 38, scale: 8 }),
+  amountCeilingCurrency: varchar('amount_ceiling_currency', { length: 8 }),
+  validFrom: timestamp('valid_from', { withTimezone: true }).notNull().defaultNow(),
+  validTo: timestamp('valid_to', { withTimezone: true }),
+  reason: varchar('reason', { length: 500 }),
   state: varchar('state', { length: 16 }).notNull().default('ACTIVE'),
   version: integer('version').notNull().default(0),
-}, (table) => [unique().on(table.userRefId, table.roleId, table.scopeType, table.scopeId)]);
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  unique().on(table.organizationId, table.id),
+  foreignKey({
+    columns: [table.organizationId, table.amountCeilingCurrency],
+    foreignColumns: [currencies.organizationId, currencies.code],
+    name: 'access_grants_amount_currency_fk',
+  }),
+  check('access_grants_amount_positive', sql`${table.amountCeiling} IS NULL OR ${table.amountCeiling} > 0`),
+  check('access_grants_valid_interval', sql`${table.validTo} IS NULL OR ${table.validTo} > ${table.validFrom}`),
+]);
+
+export const accessGrantBranchScopes = pgTable('access_grant_branch_scopes', {
+  accessGrantId: uuid('access_grant_id').notNull().references(() => accessGrants.id),
+  branchId: uuid('branch_id').notNull().references(() => branches.id),
+}, (table) => [primaryKey({ columns: [table.accessGrantId, table.branchId] })]);
+
+export const accessGrantTreasuryUnitScopes = pgTable('access_grant_treasury_unit_scopes', {
+  accessGrantId: uuid('access_grant_id').notNull().references(() => accessGrants.id),
+  treasuryUnitId: uuid('treasury_unit_id').notNull().references(() => treasuryUnits.id),
+}, (table) => [primaryKey({ columns: [table.accessGrantId, table.treasuryUnitId] })]);
+
+export const accessGrantCashboxScopes = pgTable('access_grant_cashbox_scopes', {
+  accessGrantId: uuid('access_grant_id').notNull().references(() => accessGrants.id),
+  cashboxId: uuid('cashbox_id').notNull(),
+}, (table) => [primaryKey({ columns: [table.accessGrantId, table.cashboxId] })]);
+
+export const accessGrantBankAccountScopes = pgTable('access_grant_bank_account_scopes', {
+  accessGrantId: uuid('access_grant_id').notNull().references(() => accessGrants.id),
+  bankAccountId: uuid('bank_account_id').notNull(),
+}, (table) => [primaryKey({ columns: [table.accessGrantId, table.bankAccountId] })]);
+
+export const accessGrantDocumentTypeScopes = pgTable('access_grant_document_type_scopes', {
+  accessGrantId: uuid('access_grant_id').notNull().references(() => accessGrants.id),
+  documentType: varchar('document_type', { length: 64 }).notNull(),
+}, (table) => [primaryKey({ columns: [table.accessGrantId, table.documentType] })]);
+
+export const accessGrantMethodCategoryScopes = pgTable('access_grant_method_category_scopes', {
+  accessGrantId: uuid('access_grant_id').notNull().references(() => accessGrants.id),
+  methodCategory: varchar('method_category', { length: 64 }).notNull(),
+}, (table) => [primaryKey({ columns: [table.accessGrantId, table.methodCategory] })]);
+
+export const accessGrantCurrencyScopes = pgTable('access_grant_currency_scopes', {
+  accessGrantId: uuid('access_grant_id').notNull(),
+  organizationId: uuid('organization_id').notNull(),
+  currency: varchar('currency', { length: 8 }).notNull(),
+}, (table) => [
+  primaryKey({ columns: [table.accessGrantId, table.currency] }),
+  foreignKey({
+    columns: [table.organizationId, table.accessGrantId],
+    foreignColumns: [accessGrants.organizationId, accessGrants.id],
+    name: 'access_grant_currency_scopes_grant_fk',
+  }),
+  foreignKey({
+    columns: [table.organizationId, table.currency],
+    foreignColumns: [currencies.organizationId, currencies.code],
+    name: 'access_grant_currency_scopes_currency_fk',
+  }),
+]);
 
 export const authThrottleBuckets = pgTable('auth_throttle_buckets', {
   bucketDigest: char('bucket_digest', { length: 64 }).primaryKey(),
@@ -184,22 +256,43 @@ export const authRecoveryAttempts = pgTable('auth_recovery_attempts', {
   check('auth_recovery_attempts_range', sql`${table.attempts} BETWEEN 0 AND 5`),
 ]);
 
-export const authSessions = pgTable('auth_sessions', {
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export const authSessions: any = pgTable('auth_sessions', {
   id: uuid('id').primaryKey().defaultRandom(),
   identityAccountId: uuid('identity_account_id').notNull().references(() => identityAccounts.id),
+  logicalSessionId: uuid('logical_session_id').notNull(),
+  authorizedEpoch: bigint('authorized_epoch', { mode: 'number' }).notNull().default(0),
   tokenDigest: char('token_digest', { length: 64 }).notNull().unique(),
   previousTokenDigest: char('previous_token_digest', { length: 64 }).unique(),
   previousValidUntil: timestamp('previous_valid_until', { withTimezone: true }),
   xsrfDigest: char('xsrf_digest', { length: 64 }).notNull(),
   previousXsrfDigest: char('previous_xsrf_digest', { length: 64 }),
   authenticatedAt: timestamp('authenticated_at', { withTimezone: true }).notNull(),
+  lastSeenAt: timestamp('last_seen_at', { withTimezone: true }).notNull().defaultNow(),
   lastRotatedAt: timestamp('last_rotated_at', { withTimezone: true }).notNull(),
   idleExpiresAt: timestamp('idle_expires_at', { withTimezone: true }).notNull(),
   absoluteExpiresAt: timestamp('absolute_expires_at', { withTimezone: true }).notNull(),
   assurance: varchar('assurance', { length: 32 }).notNull(),
   deviceLabel: varchar('device_label', { length: 160 }),
+  rotationParentId: uuid('rotation_parent_id'),
+  rotatedAt: timestamp('rotated_at', { withTimezone: true }),
+  predecessorValidUntil: timestamp('predecessor_valid_until', { withTimezone: true }),
   revokedAt: timestamp('revoked_at', { withTimezone: true }),
-});
+  revocationReason: varchar('revocation_reason', { length: 500 }),
+  state: varchar('state', { length: 16 }).notNull().default('ACTIVE'),
+}, (table) => [
+  foreignKey({
+    columns: [table.logicalSessionId],
+    foreignColumns: [table.id],
+    name: 'auth_sessions_logical_session_fk',
+  }),
+  foreignKey({
+    columns: [table.rotationParentId],
+    foreignColumns: [table.id],
+    name: 'auth_sessions_rotation_parent_fk',
+  }),
+  unique().on(table.rotationParentId),
+]);
 
 export const authChallenges = pgTable('auth_challenges', {
   id: uuid('id').primaryKey().defaultRandom(),

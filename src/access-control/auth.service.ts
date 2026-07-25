@@ -26,6 +26,7 @@ export interface SessionView {
 export interface SessionContext {
   accountId: string;
   organizationId: string;
+  physicalSessionId: string;
   session: SessionView;
   xsrfDigest: string;
   presentedTokenDigest: string;
@@ -268,10 +269,17 @@ export class AuthService {
     if (!row) throw new TreasuryProblem('TRS-AUT-003', 401);
     const now = new Date();
     const context = this.sessionContext(row, tokenDigest);
-    if (!row.matched_current) return context;
+    if (!row.matched_current) {
+      await this.repository.touchSession(row.id, now);
+      context.session.idleExpiresAt = new Date(
+        Math.min(now.getTime() + 15 * 60_000, row.absolute_expires_at.getTime()),
+      ).toISOString();
+      return context;
+    }
 
     const rotationDue = now.getTime() - row.last_rotated_at.getTime() >= 15 * 60_000;
-    if (rotationDue) {
+    const epochStale = Number(row.authorized_epoch) !== Number(row.account_authorization_epoch);
+    if (rotationDue || epochStale) {
       const xsrfToken = opaqueToken();
       const nextToken = opaqueToken();
       const rotated = await this.repository.rotateSession(
@@ -282,6 +290,7 @@ export class AuthService {
         now,
       );
       if (rotated) {
+        context.physicalSessionId = rotated;
         context.rotatedSessionToken = nextToken;
         context.refreshedXsrfToken = xsrfToken;
         context.session.idleExpiresAt = new Date(
@@ -290,7 +299,7 @@ export class AuthService {
       }
       return context;
     }
-    await this.repository.touchSession(row.id, tokenDigest, now);
+    await this.repository.touchSession(row.id, now);
     return context;
   }
 
@@ -299,7 +308,7 @@ export class AuthService {
     const xsrfToken = opaqueToken();
     const nextDigest = digest(xsrfToken);
     const refreshed = await this.repository.refreshXsrf(
-      context.session.sessionId,
+      context.physicalSessionId,
       context.presentedTokenDigest,
       context.xsrfDigest,
       nextDigest,
@@ -318,6 +327,7 @@ export class AuthService {
   async issueStepUpChallenge(
     context: SessionContext,
     command: {
+      operationId: string;
       method: string;
       path: string;
       bodyDigest: string;
@@ -329,7 +339,7 @@ export class AuthService {
     await this.repository.transaction(async (client) => {
       await this.repository.createChallenge(client, {
         accountId: context.accountId,
-        sessionId: context.session.sessionId,
+        sessionId: context.physicalSessionId,
         tokenDigest: digest(challengeId),
         kind: 'STEP_UP',
         expiresAt,
@@ -349,6 +359,7 @@ export class AuthService {
     proofId: string,
     context: SessionContext,
     command: {
+      operationId: string;
       method: string;
       path: string;
       bodyDigest: string;
@@ -356,7 +367,8 @@ export class AuthService {
     },
   ): Promise<boolean> {
     return this.repository.validateStepUpProof(digest(proofId), {
-      sessionId: context.session.sessionId,
+      organizationId: context.organizationId,
+      sessionId: context.physicalSessionId,
       ...command,
     });
   }
@@ -410,11 +422,12 @@ export class AuthService {
     return {
       accountId: row.identity_account_id,
       organizationId: row.organization_id,
+      physicalSessionId: row.id,
       xsrfDigest: row.xsrf_digest,
       presentedTokenDigest,
       matchedCurrent: row.matched_current,
       session: {
-        sessionId: row.id,
+        sessionId: row.logical_session_id,
         authenticatedAt: row.authenticated_at.toISOString(),
         idleExpiresAt: row.idle_expires_at.toISOString(),
         absoluteExpiresAt: row.absolute_expires_at.toISOString(),

@@ -43,7 +43,7 @@ export class IdentityController {
 
   @Post('identity-accounts')
   @RequirePermission('identity-account.manage')
-  @RequireStepUp()
+  @RequireStepUp('createIdentityAccount')
   createIdentity(
     @Req() request: TreasuryRequest,
     @Headers('Idempotency-Key') key: string,

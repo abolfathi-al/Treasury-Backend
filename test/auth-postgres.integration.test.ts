@@ -58,7 +58,13 @@ test('PostgreSQL password+TOTP session and saved-code recovery are replay-safe a
     assert.equal(await service.refreshXsrf(predecessor), null);
     assert.equal(await service.refreshXsrf(session), null);
     const persistedXsrf = await database.pool.query<{ xsrf_digest: string }>(
-      'SELECT xsrf_digest FROM auth_sessions WHERE id = $1',
+      `SELECT tail.xsrf_digest
+       FROM auth_sessions tail
+       WHERE tail.logical_session_id = $1
+         AND NOT EXISTS (
+           SELECT 1 FROM auth_sessions successor
+           WHERE successor.rotation_parent_id = tail.id
+         )`,
       [session.session.sessionId],
     );
     assert.equal(persistedXsrf.rows[0]!.xsrf_digest, currentXsrfDigest);
@@ -74,7 +80,7 @@ test('PostgreSQL password+TOTP session and saved-code recovery are replay-safe a
     assert.equal(refreshWinners.length, 1);
     const casState = await database.pool.query<{ xsrf_digest: string }>(
       'SELECT xsrf_digest FROM auth_sessions WHERE id = $1',
-      [currentSession.session.sessionId],
+      [currentSession.physicalSessionId],
     );
     assert.equal(casState.rows[0]!.xsrf_digest, digest(refreshWinners[0]!));
 
@@ -107,7 +113,12 @@ test('PostgreSQL password+TOTP session and saved-code recovery are replay-safe a
       active_challenges: string;
     }>(`
       SELECT ia.recovery_version,
-             (SELECT count(*) FROM auth_sessions s WHERE s.identity_account_id = ia.id AND s.revoked_at IS NULL)::text AS active_sessions,
+             (SELECT count(*) FROM auth_sessions s
+              WHERE s.identity_account_id = ia.id
+                AND s.state = 'ACTIVE'
+                AND s.revoked_at IS NULL
+                AND s.idle_expires_at > now()
+                AND s.absolute_expires_at > now())::text AS active_sessions,
              (SELECT count(*) FROM auth_challenges c WHERE c.identity_account_id = ia.id AND c.consumed_at IS NULL)::text AS active_challenges
       FROM identity_accounts ia WHERE ia.normalized_login = 'admin'
     `);
@@ -427,6 +438,13 @@ async function seedAccount(database: DatabaseService, credentials: CredentialSer
       'auth_throttle_buckets',
       'auth_recovery_attempts',
       'role_permissions',
+      'access_grant_currency_scopes',
+      'access_grant_method_category_scopes',
+      'access_grant_document_type_scopes',
+      'access_grant_bank_account_scopes',
+      'access_grant_cashbox_scopes',
+      'access_grant_treasury_unit_scopes',
+      'access_grant_branch_scopes',
       'access_grants',
       'identity_accounts',
       'roles',

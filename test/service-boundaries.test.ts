@@ -2,6 +2,9 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import type { AuthService, SessionContext } from '../src/access-control/auth.service';
+import type { AccessAdminRepository } from '../src/access-control/access-admin.repository';
+import { AccessAdminService } from '../src/access-control/access-admin.service';
+import { SessionRevokeScope } from '../src/access-control/access-admin.dto';
 import type { CredentialService } from '../src/access-control/credential.service';
 import type { IdentityRepository } from '../src/access-control/identity.repository';
 import { IdentityService } from '../src/access-control/identity.service';
@@ -70,12 +73,64 @@ test('all business create boundaries enforce the OpenAPI Idempotency-Key length'
       {
         proofId: 'proof',
         command: {
+          operationId: 'createIdentityAccount',
           method: 'POST',
           path: '/v1/identity-accounts',
           bodyDigest: 'digest',
           idempotencyKey: 'x',
         },
       },
+    ),
+    shortKeyProblem,
+  );
+
+  const access = new AccessAdminService({
+    listPermissionGrants: async () => [],
+  } as unknown as AccessAdminRepository, auth);
+  const stepUp = {
+    proofId: 'proof',
+    command: {
+      operationId: 'createRole',
+      method: 'POST',
+      path: '/v1/roles',
+      bodyDigest: 'digest',
+      idempotencyKey: 'x',
+    },
+  };
+  await assert.rejects(
+    access.createRole(
+      'org',
+      { code: 'VIEWER', name: 'Viewer', permissions: ['master-data.view'] },
+      'x',
+      'request',
+      {} as SessionContext,
+      stepUp,
+    ),
+    shortKeyProblem,
+  );
+  await assert.rejects(
+    access.createAccessGrant(
+      'org',
+      {
+        userId: '00000000-0000-4000-8000-000000000001',
+        roleId: '00000000-0000-4000-8000-000000000002',
+      },
+      'x',
+      'request',
+      {} as SessionContext,
+      { ...stepUp, command: { ...stepUp.command, operationId: 'createAccessGrant' } },
+    ),
+    shortKeyProblem,
+  );
+  await assert.rejects(
+    access.revokeIdentitySessions(
+      'org',
+      '00000000-0000-4000-8000-000000000003',
+      { reason: 'test', scope: SessionRevokeScope.ALL_FOR_ACCOUNT },
+      'x',
+      'request',
+      {} as SessionContext,
+      { ...stepUp, command: { ...stepUp.command, operationId: 'revokeIdentitySessions' } },
     ),
     shortKeyProblem,
   );

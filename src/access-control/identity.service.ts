@@ -35,7 +35,13 @@ export class IdentityService {
     context: SessionContext,
     stepUp: {
       proofId: string;
-      command: { method: string; path: string; bodyDigest: string; idempotencyKey: string };
+      command: {
+        operationId: string;
+        method: string;
+        path: string;
+        bodyDigest: string;
+        idempotencyKey: string;
+      };
     },
   ) {
     const normalizedLogin = this.credentials.normalizeLogin(dto.login);
@@ -56,7 +62,7 @@ export class IdentityService {
         commandDigest('createIdentityAccount', dto),
         {
           proofDigest: digest(stepUp.proofId),
-          sessionId: context.session.sessionId,
+          sessionId: context.physicalSessionId,
           ...stepUp.command,
         },
       ));

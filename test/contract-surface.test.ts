@@ -5,6 +5,8 @@ import { RequestMethod } from '@nestjs/common';
 import { METHOD_METADATA, PATH_METADATA } from '@nestjs/common/constants';
 
 import { AuthController } from '../src/access-control/auth.controller';
+import { AccessAdminController } from '../src/access-control/access-admin.controller';
+import { STEP_UP_REQUIRED } from '../src/access-control/auth.decorators';
 import { IdentityController } from '../src/access-control/identity.controller';
 import { MasterDataController } from '../src/master-data/master-data.controller';
 
@@ -22,15 +24,27 @@ const expectedOperations = [
   ['GET', 'v1/user-refs'],
   ['POST', 'v1/user-refs'],
   ['POST', 'v1/identity-accounts'],
+  ['GET', 'v1/identity-accounts'],
+  ['GET', 'v1/identity-accounts/:resourceId/sessions'],
+  ['POST', 'v1/identity-accounts/:resourceId/session-revocations'],
+  ['GET', 'v1/roles'],
+  ['POST', 'v1/roles'],
+  ['GET', 'v1/access-grants'],
+  ['POST', 'v1/access-grants'],
   ['GET', 'v1/currencies'],
   ['POST', 'v1/currencies'],
   ['GET', 'v1/method-definitions'],
   ['POST', 'v1/method-definitions'],
 ] as const;
 
-test('all 17 INC-1A operations are present in owner-local controllers', async () => {
+test('all authorized INC-1A and INC-1B operations are present in owner-local controllers', async () => {
   const operations = new Set<string>();
-  for (const controller of [AuthController, IdentityController, MasterDataController]) {
+  for (const controller of [
+    AuthController,
+    IdentityController,
+    AccessAdminController,
+    MasterDataController,
+  ]) {
     const prefix = Reflect.getMetadata(PATH_METADATA, controller) as string;
     for (const name of Object.getOwnPropertyNames(controller.prototype)) {
       const handler = controller.prototype[name as keyof typeof controller.prototype];
@@ -43,6 +57,28 @@ test('all 17 INC-1A operations are present in owner-local controllers', async ()
   for (const [method, path] of expectedOperations) {
     assert.ok(operations.has(`${method} ${path}`), `${method} ${path}`);
   }
+});
+
+test('protected commands bind step-up digests to their exact operation IDs', () => {
+  assert.equal(
+    Reflect.getMetadata(STEP_UP_REQUIRED, IdentityController.prototype.createIdentity),
+    'createIdentityAccount',
+  );
+  assert.equal(
+    Reflect.getMetadata(STEP_UP_REQUIRED, AccessAdminController.prototype.createRole),
+    'createRole',
+  );
+  assert.equal(
+    Reflect.getMetadata(STEP_UP_REQUIRED, AccessAdminController.prototype.createAccessGrant),
+    'createAccessGrant',
+  );
+  assert.equal(
+    Reflect.getMetadata(
+      STEP_UP_REQUIRED,
+      AccessAdminController.prototype.revokeIdentitySessions,
+    ),
+    'revokeIdentitySessions',
+  );
 });
 
 test('migration locks bootstrap, normalized method children, sessions, and idempotency in PostgreSQL', async () => {
@@ -89,6 +125,33 @@ test('Drizzle structure mirrors migration-level singleton, composite, mapping, a
     'auth_password_attempt_reservations_active_idx',
   ]) {
     assert.match(schema, new RegExp(invariant, 'u'));
+  }
+});
+
+test('INC-1B migration normalizes scopes, constrains permissions, and versions session chains', async () => {
+  const migration = await readFile('migrations/0002_access_control.sql', 'utf8');
+  for (const table of [
+    'operation_permissions',
+    'access_grant_branch_scopes',
+    'access_grant_treasury_unit_scopes',
+    'access_grant_cashbox_scopes',
+    'access_grant_bank_account_scopes',
+    'access_grant_document_type_scopes',
+    'access_grant_method_category_scopes',
+    'access_grant_currency_scopes',
+  ]) {
+    assert.match(migration, new RegExp(`CREATE TABLE ${table}`, 'u'));
+  }
+  for (const invariant of [
+    'authorization_epoch',
+    'logical_session_id',
+    'authorized_epoch',
+    'rotation_parent_id',
+    'predecessor_valid_until',
+    'access_grants_valid_interval',
+    'role_permissions_permission_fk',
+  ]) {
+    assert.match(migration, new RegExp(invariant, 'u'));
   }
 });
 

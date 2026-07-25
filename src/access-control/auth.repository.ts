@@ -17,6 +17,7 @@ export interface AccountRow {
   totp_key_version: number | null;
   totp_last_counter: string | null;
   recovery_code_hash: string | null;
+  authorization_epoch: string;
   privileged: boolean;
   state: string;
   permissions: string[];
@@ -38,12 +39,16 @@ export interface ChallengeRow extends AccountRow {
 
 export interface SessionRow {
   id: string;
+  presented_id: string;
+  logical_session_id: string;
   identity_account_id: string;
   organization_id: string;
   user_ref_id: string;
   display_name: string;
   assurance: 'PASSWORD' | 'PASSWORD_TOTP';
+  device_label: string | null;
   authenticated_at: Date;
+  last_seen_at: Date;
   last_rotated_at: Date;
   idle_expires_at: Date;
   absolute_expires_at: Date;
@@ -53,6 +58,8 @@ export interface SessionRow {
   previous_valid_until: Date | null;
   previous_xsrf_digest: string | null;
   matched_current: boolean;
+  authorized_epoch: string;
+  account_authorization_epoch: string;
   permissions: string[];
 }
 
@@ -108,11 +115,16 @@ export class AuthRepository {
       SELECT ia.id, ia.user_ref_id, ur.organization_id, ur.display_name,
              ia.normalized_login, ia.password_hash, ia.password_profile_version,
              ia.totp_ciphertext, ia.totp_iv, ia.totp_auth_tag, ia.totp_key_version,
-             ia.totp_last_counter, ia.recovery_code_hash, ia.privileged, ia.state,
+             ia.totp_last_counter, ia.recovery_code_hash, ia.authorization_epoch,
+             ia.privileged, ia.state,
              COALESCE(array_agg(DISTINCT rp.permission) FILTER (WHERE rp.permission IS NOT NULL), '{}') AS permissions
       FROM identity_accounts ia
       JOIN user_refs ur ON ur.id = ia.user_ref_id
-      LEFT JOIN access_grants ag ON ag.user_ref_id = ur.id AND ag.state = 'ACTIVE'
+      LEFT JOIN access_grants ag ON ag.user_ref_id = ur.id
+        AND ag.organization_id = ur.organization_id
+        AND ag.state = 'ACTIVE'
+        AND ag.valid_from <= now()
+        AND (ag.valid_to IS NULL OR ag.valid_to > now())
       LEFT JOIN roles r ON r.id = ag.role_id AND r.state = 'ACTIVE'
       LEFT JOIN role_permissions rp ON rp.role_id = r.id
       WHERE ia.normalized_login = $1
@@ -335,7 +347,8 @@ export class AuthRepository {
       SELECT ia.id, ia.user_ref_id, ur.organization_id, ur.display_name,
              ia.normalized_login, ia.password_hash, ia.password_profile_version,
              ia.totp_ciphertext, ia.totp_iv, ia.totp_auth_tag, ia.totp_key_version,
-             ia.totp_last_counter, ia.recovery_code_hash, ia.privileged, ia.state,
+             ia.totp_last_counter, ia.recovery_code_hash, ia.authorization_epoch,
+             ia.privileged, ia.state,
              c.id AS challenge_row_id, c.kind AS challenge_kind,
              c.attempts AS challenge_attempts, c.expires_at AS challenge_expires_at,
              c.consumed_at AS challenge_consumed_at, c.session_id AS challenge_session_id,
@@ -344,7 +357,11 @@ export class AuthRepository {
       FROM auth_challenges c
       JOIN identity_accounts ia ON ia.id = c.identity_account_id
       JOIN user_refs ur ON ur.id = ia.user_ref_id
-      LEFT JOIN access_grants ag ON ag.user_ref_id = ur.id AND ag.state = 'ACTIVE'
+      LEFT JOIN access_grants ag ON ag.user_ref_id = ur.id
+        AND ag.organization_id = ur.organization_id
+        AND ag.state = 'ACTIVE'
+        AND ag.valid_from <= now()
+        AND (ag.valid_to IS NULL OR ag.valid_to > now())
       LEFT JOIN roles r ON r.id = ag.role_id AND r.state = 'ACTIVE'
       LEFT JOIN role_permissions rp ON rp.role_id = r.id
       WHERE c.token_digest = $1
@@ -385,11 +402,17 @@ export class AuthRepository {
     },
   ): Promise<string> {
     const result = await client.query<{ id: string }>(`
+      WITH session_id AS (SELECT gen_random_uuid() AS id)
       INSERT INTO auth_sessions (
-        identity_account_id, token_digest, xsrf_digest, authenticated_at, last_rotated_at,
-        idle_expires_at, absolute_expires_at, assurance, device_label
-      ) VALUES ($1,$2,$3,$4,$4,$5,$6,$7,$8)
-      RETURNING id
+        id, identity_account_id, logical_session_id, authorized_epoch,
+        token_digest, xsrf_digest, authenticated_at, last_seen_at, last_rotated_at,
+        idle_expires_at, absolute_expires_at, assurance, device_label, state
+      )
+      SELECT session_id.id, $1, session_id.id, ia.authorization_epoch,
+             $2, $3, $4, $4, $4, $5, $6, $7, $8, 'ACTIVE'
+      FROM session_id
+      JOIN identity_accounts ia ON ia.id = $1
+      RETURNING auth_sessions.id
     `, [
       input.accountId,
       input.tokenDigest,
@@ -405,22 +428,69 @@ export class AuthRepository {
 
   async findSession(tokenDigest: string): Promise<SessionRow | null> {
     const result = await this.database.pool.query<SessionRow>(`
-      SELECT s.*,
-             CASE WHEN s.token_digest = $1 THEN s.xsrf_digest ELSE s.previous_xsrf_digest END AS xsrf_digest,
+      WITH RECURSIVE presented AS (
+        SELECT s.*,
+               CASE
+                 WHEN s.token_digest = $1 THEN s.xsrf_digest
+                 ELSE s.previous_xsrf_digest
+               END AS presented_xsrf_digest
+        FROM auth_sessions s
+        WHERE (
+            s.token_digest = $1
+            OR (s.previous_token_digest = $1 AND s.previous_valid_until > now())
+          )
+          AND s.revoked_at IS NULL
+          AND s.absolute_expires_at > now()
+          AND (
+            (s.state = 'ACTIVE' AND s.idle_expires_at > now())
+            OR (s.state = 'ROTATED' AND s.predecessor_valid_until > now())
+            OR (s.previous_token_digest = $1 AND s.previous_valid_until > now())
+          )
+      ),
+      chain AS (
+        SELECT s.* FROM auth_sessions s JOIN presented p ON p.id = s.id
+        UNION ALL
+        SELECT successor.*
+        FROM auth_sessions successor
+        JOIN chain parent ON successor.rotation_parent_id = parent.id
+      ),
+      tail AS (
+        SELECT c.*
+        FROM chain c
+        WHERE NOT EXISTS (
+          SELECT 1 FROM auth_sessions successor
+          WHERE successor.rotation_parent_id = c.id
+        )
+      )
+      SELECT tail.*,
+             p.id AS presented_id,
+             p.presented_xsrf_digest AS xsrf_digest,
              ur.organization_id, ur.id AS user_ref_id, ur.display_name,
-             (s.token_digest = $1) AS matched_current,
-             COALESCE(array_agg(DISTINCT rp.permission) FILTER (WHERE rp.permission IS NOT NULL), '{}') AS permissions
-      FROM auth_sessions s
-      JOIN identity_accounts ia ON ia.id = s.identity_account_id AND ia.state = 'ACTIVE'
+             (p.id = tail.id AND tail.token_digest = $1) AS matched_current,
+             ia.authorization_epoch AS account_authorization_epoch,
+             permission_set.permissions
+      FROM presented p
+      JOIN tail ON true
+      JOIN identity_accounts ia ON ia.id = tail.identity_account_id AND ia.state = 'ACTIVE'
       JOIN user_refs ur ON ur.id = ia.user_ref_id AND ur.state = 'ACTIVE'
-      LEFT JOIN access_grants ag ON ag.user_ref_id = ur.id AND ag.state = 'ACTIVE'
-      LEFT JOIN roles r ON r.id = ag.role_id AND r.state = 'ACTIVE'
-      LEFT JOIN role_permissions rp ON rp.role_id = r.id
-      WHERE (s.token_digest = $1 OR (s.previous_token_digest = $1 AND s.previous_valid_until > now()))
-        AND s.revoked_at IS NULL
-        AND s.idle_expires_at > now()
-        AND s.absolute_expires_at > now()
-      GROUP BY s.id, ur.id
+      CROSS JOIN LATERAL (
+        SELECT COALESCE(
+          array_agg(DISTINCT rp.permission) FILTER (WHERE rp.permission IS NOT NULL),
+          '{}'
+        ) AS permissions
+        FROM access_grants ag
+        JOIN roles r ON r.id = ag.role_id AND r.state = 'ACTIVE'
+        JOIN role_permissions rp ON rp.role_id = r.id
+        WHERE ag.user_ref_id = ur.id
+          AND ag.organization_id = ur.organization_id
+          AND ag.state = 'ACTIVE'
+          AND ag.valid_from <= now()
+          AND (ag.valid_to IS NULL OR ag.valid_to > now())
+      ) permission_set
+      WHERE tail.state = 'ACTIVE'
+        AND tail.revoked_at IS NULL
+        AND tail.idle_expires_at > now()
+        AND tail.absolute_expires_at > now()
     `, [tokenDigest]);
     return result.rows[0] ?? null;
   }
@@ -431,35 +501,65 @@ export class AuthRepository {
     nextDigest: string,
     nextXsrfDigest: string,
     now: Date,
-  ): Promise<boolean> {
-    const result = await this.database.pool.query(`
-      UPDATE auth_sessions
-      SET previous_token_digest = token_digest,
-          previous_valid_until = $4,
-          previous_xsrf_digest = xsrf_digest,
-          token_digest = $3,
-          xsrf_digest = $5,
-          last_rotated_at = $6,
-          idle_expires_at = LEAST($7, absolute_expires_at)
-      WHERE id = $1 AND token_digest = $2 AND revoked_at IS NULL
-    `, [
-      sessionId,
-      currentDigest,
-      nextDigest,
-      new Date(now.getTime() + 30_000),
-      nextXsrfDigest,
-      now,
-      new Date(now.getTime() + 15 * 60_000),
-    ]);
-    return result.rowCount === 1;
+  ): Promise<string | null> {
+    return this.withTransaction(async (client) => {
+      const current = await client.query<SessionRow>(`
+        SELECT s.*, ia.authorization_epoch AS account_authorization_epoch
+        FROM auth_sessions s
+        JOIN identity_accounts ia ON ia.id = s.identity_account_id
+        WHERE s.id = $1
+          AND s.token_digest = $2
+          AND s.state = 'ACTIVE'
+          AND s.revoked_at IS NULL
+          AND s.idle_expires_at > $3
+          AND s.absolute_expires_at > $3
+          AND NOT EXISTS (
+            SELECT 1 FROM auth_sessions successor
+            WHERE successor.rotation_parent_id = s.id
+          )
+        FOR UPDATE OF s, ia
+      `, [sessionId, currentDigest, now]);
+      if (!current.rowCount) return null;
+      const row = current.rows[0]!;
+      const successor = await client.query<{ id: string }>(`
+        INSERT INTO auth_sessions (
+          identity_account_id, logical_session_id, authorized_epoch,
+          token_digest, xsrf_digest, authenticated_at, last_seen_at, last_rotated_at,
+          idle_expires_at, absolute_expires_at, assurance, device_label,
+          rotation_parent_id, state
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$7,$8,$9,$10,$11,$12,'ACTIVE')
+        RETURNING id
+      `, [
+        row.identity_account_id,
+        row.logical_session_id,
+        row.account_authorization_epoch,
+        nextDigest,
+        nextXsrfDigest,
+        row.authenticated_at,
+        now,
+        new Date(Math.min(now.getTime() + 15 * 60_000, row.absolute_expires_at.getTime())),
+        row.absolute_expires_at,
+        row.assurance,
+        row.device_label,
+        row.id,
+      ]);
+      await client.query(`
+        UPDATE auth_sessions
+        SET state = 'ROTATED', rotated_at = $2, predecessor_valid_until = $3,
+            previous_token_digest = NULL, previous_valid_until = NULL,
+            previous_xsrf_digest = NULL
+        WHERE id = $1
+      `, [row.id, now, new Date(now.getTime() + 30_000)]);
+      return successor.rows[0]!.id;
+    });
   }
 
-  async touchSession(sessionId: string, currentDigest: string, now: Date): Promise<boolean> {
+  async touchSession(sessionId: string, now: Date): Promise<boolean> {
     const result = await this.database.pool.query(`
       UPDATE auth_sessions
-      SET idle_expires_at = LEAST($3, absolute_expires_at)
-      WHERE id = $1 AND token_digest = $2 AND revoked_at IS NULL
-    `, [sessionId, currentDigest, new Date(now.getTime() + 15 * 60_000)]);
+      SET last_seen_at = $2, idle_expires_at = LEAST($3, absolute_expires_at)
+      WHERE id = $1 AND state = 'ACTIVE' AND revoked_at IS NULL
+    `, [sessionId, now, new Date(now.getTime() + 15 * 60_000)]);
     return result.rowCount === 1;
   }
 
@@ -472,29 +572,54 @@ export class AuthRepository {
   ): Promise<boolean> {
     const result = await this.database.pool.query(`
       UPDATE auth_sessions
-      SET xsrf_digest = $4, idle_expires_at = LEAST($5, absolute_expires_at)
+      SET xsrf_digest = $4, last_seen_at = $5,
+          idle_expires_at = LEAST($6, absolute_expires_at)
       WHERE id = $1
         AND token_digest = $2
         AND xsrf_digest = $3
+        AND state = 'ACTIVE'
         AND revoked_at IS NULL
+        AND NOT EXISTS (
+          SELECT 1 FROM auth_sessions successor
+          WHERE successor.rotation_parent_id = auth_sessions.id
+        )
     `, [
       sessionId,
       currentDigest,
       previousXsrfDigest,
       xsrfDigest,
+      now,
       new Date(now.getTime() + 15 * 60_000),
     ]);
     return result.rowCount === 1;
   }
 
-  async revokeSession(sessionId: string, accountId: string): Promise<void> {
+  async revokeSession(logicalSessionId: string, accountId: string): Promise<void> {
     await this.database.pool.query(`
-      UPDATE auth_sessions SET revoked_at = now() WHERE id = $1 AND identity_account_id = $2 AND revoked_at IS NULL
-    `, [sessionId, accountId]);
+      UPDATE auth_sessions
+      SET revoked_at = now(), revocation_reason = 'LOGOUT', state = 'REVOKED',
+          rotated_at = NULL, predecessor_valid_until = NULL
+      WHERE logical_session_id = $1
+        AND identity_account_id = $2
+        AND revoked_at IS NULL
+        AND (
+          state = 'ACTIVE'
+          OR (state = 'ROTATED' AND predecessor_valid_until > now())
+        )
+    `, [logicalSessionId, accountId]);
   }
 
   async revokeAllAccountSecrets(client: PoolClient, accountId: string): Promise<void> {
-    await client.query('UPDATE auth_sessions SET revoked_at = now() WHERE identity_account_id = $1 AND revoked_at IS NULL', [accountId]);
+    await client.query(`
+      UPDATE auth_sessions
+      SET revoked_at = now(), revocation_reason = 'PASSWORD_RECOVERY', state = 'REVOKED',
+          rotated_at = NULL, predecessor_valid_until = NULL
+      WHERE identity_account_id = $1 AND revoked_at IS NULL
+        AND (
+          state = 'ACTIVE'
+          OR (state = 'ROTATED' AND predecessor_valid_until > now())
+        )
+    `, [accountId]);
     await client.query('UPDATE auth_challenges SET consumed_at = now() WHERE identity_account_id = $1 AND consumed_at IS NULL', [accountId]);
     await client.query(`
       UPDATE auth_step_up_proofs p SET consumed_at = now()
@@ -537,6 +662,8 @@ export class AuthRepository {
   async validateStepUpProof(
     tokenDigest: string,
     expected: {
+      organizationId: string;
+      operationId: string;
       sessionId: string;
       method: string;
       path: string;
@@ -549,13 +676,23 @@ export class AuthRepository {
         FROM auth_step_up_proofs p
         JOIN auth_challenges c ON c.id = p.challenge_id
         WHERE p.token_digest = $1
-          AND p.consumed_at IS NULL
-          AND p.expires_at > now()
           AND c.session_id = $2
           AND c.http_method = $3
           AND c.http_path = $4
           AND c.request_body_digest = $5
           AND c.idempotency_key = $6
+          AND (
+            (p.consumed_at IS NULL AND p.expires_at > now())
+            OR EXISTS (
+              SELECT 1
+              FROM idempotency_records i
+              WHERE i.organization_id = $7
+                AND i.scope = $8
+                AND i.idempotency_key = $6
+                AND i.request_digest = $5
+                AND i.response_body IS NOT NULL
+            )
+          )
       `, [
         tokenDigest,
         expected.sessionId,
@@ -563,6 +700,8 @@ export class AuthRepository {
         expected.path,
         expected.bodyDigest,
         expected.idempotencyKey,
+        expected.organizationId,
+        expected.operationId,
       ]);
     return result.rowCount === 1;
   }
