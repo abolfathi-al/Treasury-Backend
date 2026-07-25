@@ -22,7 +22,7 @@ export class IdentityController {
   constructor(@Inject(IdentityService) private readonly service: IdentityService) {}
 
   @Get('user-refs')
-  @RequirePermission('access-control.view')
+  @RequirePermission('access-control.view', 'listUserRefs', 'ORGANIZATION_WIDE')
   list(
     @Req() request: TreasuryRequest,
     @Query('limit') limit?: string,
@@ -32,7 +32,7 @@ export class IdentityController {
   }
 
   @Post('user-refs')
-  @RequirePermission('identity-account.manage')
+  @RequirePermission('identity-account.manage', 'createUserRef', 'ORGANIZATION_WIDE')
   createUser(
     @Req() request: TreasuryRequest,
     @Headers('Idempotency-Key') key: string,
@@ -42,7 +42,7 @@ export class IdentityController {
   }
 
   @Post('identity-accounts')
-  @RequirePermission('identity-account.manage')
+  @RequirePermission('identity-account.manage', 'createIdentityAccount', 'ORGANIZATION_WIDE')
   @RequireStepUp('createIdentityAccount')
   createIdentity(
     @Req() request: TreasuryRequest,

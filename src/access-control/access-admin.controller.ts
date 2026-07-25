@@ -26,7 +26,7 @@ export class AccessAdminController {
   constructor(@Inject(AccessAdminService) private readonly service: AccessAdminService) {}
 
   @Get('identity-accounts')
-  @RequirePermission('identity-account.manage', 'listIdentityAccounts')
+  @RequirePermission('identity-account.manage', 'listIdentityAccounts', 'ORGANIZATION_WIDE')
   listIdentityAccounts(
     @Req() request: TreasuryRequest,
     @Query('limit') limit?: string,
@@ -36,7 +36,7 @@ export class AccessAdminController {
   }
 
   @Get('identity-accounts/:resourceId/sessions')
-  @RequirePermission('identity-account.manage', 'listIdentityAccountSessions')
+  @RequirePermission('identity-account.manage', 'listIdentityAccountSessions', 'ORGANIZATION_WIDE')
   listIdentityAccountSessions(
     @Req() request: TreasuryRequest,
     @Param('resourceId') resourceId: string,
@@ -53,7 +53,7 @@ export class AccessAdminController {
   }
 
   @Post('identity-accounts/:resourceId/session-revocations')
-  @RequirePermission('identity-account.manage', 'revokeIdentitySessions')
+  @RequirePermission('identity-account.manage', 'revokeIdentitySessions', 'ORGANIZATION_WIDE')
   @RequireStepUp('revokeIdentitySessions')
   @HttpCode(200)
   revokeIdentitySessions(
@@ -74,7 +74,7 @@ export class AccessAdminController {
   }
 
   @Get('roles')
-  @RequirePermission('access-control.view', 'listRoles')
+  @RequirePermission('access-control.view', 'listRoles', 'ORGANIZATION_WIDE')
   listRoles(
     @Req() request: TreasuryRequest,
     @Query('limit') limit?: string,
@@ -84,7 +84,7 @@ export class AccessAdminController {
   }
 
   @Post('roles')
-  @RequirePermission('role.manage', 'createRole')
+  @RequirePermission('role.manage', 'createRole', 'ORGANIZATION_WIDE')
   @RequireStepUp('createRole')
   createRole(
     @Req() request: TreasuryRequest,
@@ -102,7 +102,7 @@ export class AccessAdminController {
   }
 
   @Get('access-grants')
-  @RequirePermission('access-control.view', 'listAccessGrants')
+  @RequirePermission('access-control.view', 'listAccessGrants', 'ONE_GRANT_RESOURCE')
   listAccessGrants(
     @Req() request: TreasuryRequest,
     @Query('limit') limit?: string,
@@ -117,7 +117,7 @@ export class AccessAdminController {
   }
 
   @Post('access-grants')
-  @RequirePermission('access-grant.manage', 'createAccessGrant')
+  @RequirePermission('access-grant.manage', 'createAccessGrant', 'ONE_GRANT_RESOURCE')
   @RequireStepUp('createAccessGrant')
   createAccessGrant(
     @Req() request: TreasuryRequest,

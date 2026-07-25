@@ -18,6 +18,8 @@ import {
 import { TreasuryProblem } from '../common/problem';
 import {
   AUTHORIZATION_OPERATION,
+  PermissionScopeMode,
+  PERMISSION_SCOPE_MODE,
   PUBLIC_OPERATION,
   REQUIRED_PERMISSION,
   STEP_UP_REQUIRED,
@@ -70,7 +72,11 @@ export class AuthGuard implements CanActivate {
       context.getHandler(),
       context.getClass(),
     ]);
-    if (permission && !operationPermissionGranted(auth, operationId, permission)) {
+    const scopeMode = this.reflector.getAllAndOverride<PermissionScopeMode>(
+      PERMISSION_SCOPE_MODE,
+      [context.getHandler(), context.getClass()],
+    );
+    if (permission && !operationPermissionGranted(auth, operationId, permission, scopeMode)) {
       throw new TreasuryProblem('TRS-GEN-003', 403);
     }
 
@@ -118,20 +124,14 @@ export class AuthGuard implements CanActivate {
   }
 }
 
-const ORGANIZATION_ONLY_OPERATIONS = new Set([
-  'listIdentityAccounts',
-  'listIdentityAccountSessions',
-  'revokeIdentitySessions',
-  'listRoles',
-  'createRole',
-]);
-
 export function operationPermissionGranted(
   auth: SessionContext,
   operationId: string | undefined,
   permission: string,
+  scopeMode: PermissionScopeMode | undefined,
 ): boolean {
-  const permissions = operationId && ORGANIZATION_ONLY_OPERATIONS.has(operationId)
+  if (!operationId || !scopeMode) return false;
+  const permissions = scopeMode === 'ORGANIZATION_WIDE'
     ? auth.organizationPermissions
     : auth.session.effectivePermissions;
   return permissions.includes(permission);

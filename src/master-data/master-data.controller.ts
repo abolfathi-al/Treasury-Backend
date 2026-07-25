@@ -24,13 +24,13 @@ export class MasterDataController {
   constructor(@Inject(MasterDataService) private readonly service: MasterDataService) {}
 
   @Get('organization')
-  @RequirePermission('master-data.view')
+  @RequirePermission('master-data.view', 'getOrganization', 'ORGANIZATION_WIDE')
   organization(@Req() request: TreasuryRequest) {
     return this.service.organization(request.auth!.organizationId);
   }
 
   @Get('branches')
-  @RequirePermission('master-data.view')
+  @RequirePermission('master-data.view', 'listBranches', 'ORGANIZATION_WIDE')
   branches(
     @Req() request: TreasuryRequest,
     @Query('limit') limit?: string,
@@ -40,7 +40,7 @@ export class MasterDataController {
   }
 
   @Post('branches')
-  @RequirePermission('master-data.manage')
+  @RequirePermission('master-data.manage', 'createBranch', 'ORGANIZATION_WIDE')
   createBranch(
     @Req() request: TreasuryRequest,
     @Headers('Idempotency-Key') key: string,
@@ -50,7 +50,7 @@ export class MasterDataController {
   }
 
   @Get('treasury-units')
-  @RequirePermission('master-data.view')
+  @RequirePermission('master-data.view', 'listTreasuryUnits', 'ORGANIZATION_WIDE')
   treasuryUnits(
     @Req() request: TreasuryRequest,
     @Query('limit') limit?: string,
@@ -60,7 +60,7 @@ export class MasterDataController {
   }
 
   @Post('treasury-units')
-  @RequirePermission('master-data.manage')
+  @RequirePermission('master-data.manage', 'createTreasuryUnit', 'ORGANIZATION_WIDE')
   createTreasuryUnit(
     @Req() request: TreasuryRequest,
     @Headers('Idempotency-Key') key: string,
@@ -70,7 +70,7 @@ export class MasterDataController {
   }
 
   @Get('currencies')
-  @RequirePermission('master-data.view')
+  @RequirePermission('master-data.view', 'listCurrencies', 'ORGANIZATION_WIDE')
   currencies(
     @Req() request: TreasuryRequest,
     @Query('limit') limit?: string,
@@ -80,7 +80,7 @@ export class MasterDataController {
   }
 
   @Post('currencies')
-  @RequirePermission('master-data.manage')
+  @RequirePermission('master-data.manage', 'createCurrency', 'ORGANIZATION_WIDE')
   createCurrency(
     @Req() request: TreasuryRequest,
     @Headers('Idempotency-Key') key: string,
@@ -90,7 +90,7 @@ export class MasterDataController {
   }
 
   @Get('method-definitions')
-  @RequirePermission('master-data.view')
+  @RequirePermission('master-data.view', 'listMethodDefinitions', 'ORGANIZATION_WIDE')
   methods(
     @Req() request: TreasuryRequest,
     @Query('limit') limit?: string,
@@ -100,7 +100,7 @@ export class MasterDataController {
   }
 
   @Post('method-definitions')
-  @RequirePermission('master-data.manage')
+  @RequirePermission('master-data.manage', 'createMethodDefinition', 'ORGANIZATION_WIDE')
   createMethod(
     @Req() request: TreasuryRequest,
     @Headers('Idempotency-Key') key: string,

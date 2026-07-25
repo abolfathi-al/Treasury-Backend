@@ -66,7 +66,7 @@ export class AuthController {
   }
 
   @Delete('sessions/:resourceId')
-  @RequirePermission('auth.logout')
+  @RequirePermission('auth.logout', 'logout', 'ORGANIZATION_WIDE')
   @HttpCode(204)
   async logout(
     @Param('resourceId') resourceId: string,

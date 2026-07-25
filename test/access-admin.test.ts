@@ -12,6 +12,8 @@ import {
   grantContains,
   prepareGrant,
 } from '../src/access-control/access-admin.service';
+import { operationPermissionGranted } from '../src/access-control/auth.guard';
+import type { SessionContext } from '../src/access-control/auth.service';
 import { TreasuryProblem } from '../src/common/problem';
 
 const id = (suffix: number) => `00000000-0000-4000-8000-${String(suffix).padStart(12, '0')}`;
@@ -32,6 +34,21 @@ test('Role permission admission is the exact Canon vocabulary including conditio
     'role.manage',
     'settlement.reverse',
   ]);
+});
+
+test('permission scope metadata is mandatory and missing context fails closed', () => {
+  const auth = {
+    organizationPermissions: ['access-control.view'],
+    session: { effectivePermissions: ['access-control.view'] },
+  } as SessionContext;
+  assert.equal(
+    operationPermissionGranted(auth, undefined, 'access-control.view', 'ORGANIZATION_WIDE'),
+    false,
+  );
+  assert.equal(
+    operationPermissionGranted(auth, 'listUserRefs', 'access-control.view', undefined),
+    false,
+  );
 });
 
 test('Grant scope rejects explicit empty objects and invalid amount-currency combinations', () => {

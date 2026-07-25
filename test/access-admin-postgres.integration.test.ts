@@ -36,20 +36,45 @@ test('INC-1B PostgreSQL commands are scoped, replay-safe, atomic, and session-ch
     assert.ok(scopedAuth.session.effectivePermissions.includes('role.manage'));
     assert.deepEqual(scopedAuth.organizationPermissions, []);
     for (const [operationId, permission] of [
+      ['listUserRefs', 'access-control.view'],
+      ['createUserRef', 'identity-account.manage'],
+      ['createIdentityAccount', 'identity-account.manage'],
       ['listIdentityAccounts', 'identity-account.manage'],
       ['listIdentityAccountSessions', 'identity-account.manage'],
       ['revokeIdentitySessions', 'identity-account.manage'],
       ['listRoles', 'access-control.view'],
       ['createRole', 'role.manage'],
     ] as const) {
-      assert.equal(operationPermissionGranted(scopedAuth, operationId, permission), false);
+      assert.equal(
+        operationPermissionGranted(
+          scopedAuth,
+          operationId,
+          permission,
+          'ORGANIZATION_WIDE',
+        ),
+        false,
+      );
+      assert.equal(
+        operationPermissionGranted(actor, operationId, permission, 'ORGANIZATION_WIDE'),
+        true,
+      );
     }
     assert.equal(
-      operationPermissionGranted(scopedAuth, 'listAccessGrants', 'access-control.view'),
+      operationPermissionGranted(
+        scopedAuth,
+        'listAccessGrants',
+        'access-control.view',
+        'ONE_GRANT_RESOURCE',
+      ),
       true,
     );
     assert.equal(
-      operationPermissionGranted(scopedAuth, 'createAccessGrant', 'access-grant.manage'),
+      operationPermissionGranted(
+        scopedAuth,
+        'createAccessGrant',
+        'access-grant.manage',
+        'ONE_GRANT_RESOURCE',
+      ),
       true,
     );
 
