@@ -1,6 +1,6 @@
 # Treasury Backend
 
-NestJS modular monolith through the owner-approved `INC-1D-CASHBOX-BASE-DATA` increment.
+NestJS modular monolith through the owner-approved `INC-1E-BANKING-BASE-DATA` increment.
 The exact governed source is pinned in `canon-revision.json`.
 
 ## Runtime
@@ -51,7 +51,12 @@ locked transaction; then displays the single recovery code once.
   and idempotent creation;
 - typed, scope-filtered Cashbox list/create and counted handover initiation with
   strong version checks, idempotency, and unchanged custody;
+- Bank Type, Bank, Bank Branch, Bank Account, POS Terminal, and Payment Gateway
+  list/create operations with semantic views, resource-scoped authorization,
+  active same-organization references, keyset pagination, replay authorization,
+  and database-enforced account/collection-endpoint invariants;
 - command-bound TOTP step-up for `createIdentityAccount`.
 
 There are no JWTs, generic repositories, CQRS buses, microservices, queues,
-caches, or runtime Method activation paths in this increment.
+caches, direct bank/provider connectivity, credential-storage fields, or
+runtime Method activation paths in this increment.

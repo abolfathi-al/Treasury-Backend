@@ -144,14 +144,14 @@ test('cashbox scope is admitted after the Cashbox owner table is authorized', ()
   );
 });
 
-test('bank-account scope fails closed while the BankAccount owner table is absent', () => {
-  assert.throws(
-    () => prepareGrant({
+test('bank-account scope is admitted after the BankAccount owner table is authorized', () => {
+  assert.deepEqual(
+    prepareGrant({
       userId: id(1),
       roleId: id(2),
       scope: { bankAccountIds: [id(3)] },
-    }),
-    (error) => problem(error, 'TRS-GEN-004', 404),
+    }).scope.bankAccountIds,
+    [id(3)],
   );
 });
 

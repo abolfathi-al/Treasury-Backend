@@ -30,6 +30,7 @@ const titles = {
   'TRS-MST-002': 'Duplicate master identity',
   'TRS-MST-004': 'Method configuration invalid',
   'TRS-MST-005': 'Base currency locked',
+  'TRS-BNK-001': 'Bank account unavailable',
   'TRS-CSH-002': 'Cashbox custody conflict',
 } as const;
 

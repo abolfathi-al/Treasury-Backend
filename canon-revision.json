@@ -1,6 +1,6 @@
 {
   "repository": "Treasury-Canon",
-  "revision": "8ec3df37f9f1f6d2a3b7c42ea0d28b6d8f8caa04",
+  "revision": "21801f0f9ecf574e18b0db8d0b831bb7039635e0",
   "canon_root": "canon-v4",
-  "authorized_delivery_slice": "INC-1D-CASHBOX-BASE-DATA"
+  "authorized_delivery_slice": "INC-1E-BANKING-BASE-DATA"
 }

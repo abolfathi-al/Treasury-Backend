@@ -3,6 +3,7 @@ import {
   boolean,
   char,
   check,
+  date,
   foreignKey,
   index,
   integer,
@@ -202,10 +203,19 @@ export const accessGrantCashboxScopes: any = pgTable('access_grant_cashbox_scope
   }),
 ]);
 
-export const accessGrantBankAccountScopes = pgTable('access_grant_bank_account_scopes', {
+// The Banking owner table is declared later in this one-file Drizzle mirror.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export const accessGrantBankAccountScopes: any = pgTable('access_grant_bank_account_scopes', {
   accessGrantId: uuid('access_grant_id').notNull().references(() => accessGrants.id),
   bankAccountId: uuid('bank_account_id').notNull(),
-}, (table) => [primaryKey({ columns: [table.accessGrantId, table.bankAccountId] })]);
+}, (table) => [
+  primaryKey({ columns: [table.accessGrantId, table.bankAccountId] }),
+  foreignKey({
+    columns: [table.bankAccountId],
+    foreignColumns: [bankAccounts.id],
+    name: 'access_grant_bank_account_scopes_account_fk',
+  }),
+]);
 
 export const accessGrantDocumentTypeScopes = pgTable('access_grant_document_type_scopes', {
   accessGrantId: uuid('access_grant_id').notNull().references(() => accessGrants.id),
@@ -702,5 +712,308 @@ export const cashboxHandoverInstruments = pgTable('cashbox_handover_instruments'
   check(
     'cashbox_handover_instruments_reference',
     sql`char_length(btrim(${table.reference})) > 0`,
+  ),
+]);
+
+export const bankTypes = pgTable('bank_types', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  organizationId: uuid('organization_id').notNull().references(() => organizations.id),
+  code: varchar('code', { length: 32 }).notNull(),
+  displayName: varchar('display_name', { length: 160 }).notNull(),
+  description: varchar('description', { length: 500 }),
+  state: varchar('state', { length: 16 }).notNull().default('ACTIVE'),
+  version: bigint('version', { mode: 'number' }).notNull().default(0),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  unique().on(table.organizationId, table.code),
+  unique().on(table.organizationId, table.id),
+  check('bank_types_code_format', sql`${table.code} ~ '^[A-Z0-9][A-Z0-9_-]{1,31}$'`),
+  check('bank_types_state_check', sql`${table.state} IN ('ACTIVE', 'INACTIVE')`),
+  check('bank_types_version_nonnegative', sql`${table.version} >= 0`),
+  index('bank_types_list_idx').on(table.organizationId, table.code, table.id),
+]);
+
+export const banks = pgTable('banks', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  organizationId: uuid('organization_id').notNull().references(() => organizations.id),
+  bankTypeId: uuid('bank_type_id').notNull(),
+  code: varchar('code', { length: 32 }).notNull(),
+  displayName: varchar('display_name', { length: 200 }).notNull(),
+  englishName: varchar('english_name', { length: 200 }),
+  countryCode: char('country_code', { length: 2 }).notNull(),
+  nationalBankCode: varchar('national_bank_code', { length: 32 }),
+  swiftCode: varchar('swift_code', { length: 11 }),
+  logoRef: varchar('logo_ref', { length: 256 }),
+  state: varchar('state', { length: 16 }).notNull().default('ACTIVE'),
+  version: bigint('version', { mode: 'number' }).notNull().default(0),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  unique().on(table.organizationId, table.code),
+  unique().on(table.organizationId, table.id),
+  foreignKey({
+    columns: [table.organizationId, table.bankTypeId],
+    foreignColumns: [bankTypes.organizationId, bankTypes.id],
+    name: 'banks_bank_type_fk',
+  }),
+  check('banks_code_format', sql`${table.code} ~ '^[A-Z0-9][A-Z0-9_-]{1,31}$'`),
+  check('banks_country_code_format', sql`${table.countryCode} ~ '^[A-Z]{2}$'`),
+  check(
+    'banks_national_code_format',
+    sql`${table.nationalBankCode} IS NULL
+      OR ${table.nationalBankCode} ~ '^[A-Z0-9][A-Z0-9._-]{0,31}$'`,
+  ),
+  check(
+    'banks_swift_code_format',
+    sql`${table.swiftCode} IS NULL OR ${table.swiftCode} ~ '^[A-Z0-9]{8}([A-Z0-9]{3})?$'`,
+  ),
+  check('banks_state_check', sql`${table.state} IN ('ACTIVE', 'INACTIVE')`),
+  check('banks_version_nonnegative', sql`${table.version} >= 0`),
+  index('banks_list_idx').on(table.organizationId, table.code, table.id),
+]);
+
+export const bankBranches = pgTable('bank_branches', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  organizationId: uuid('organization_id').notNull().references(() => organizations.id),
+  bankId: uuid('bank_id').notNull(),
+  code: varchar('code', { length: 32 }).notNull(),
+  name: varchar('name', { length: 200 }).notNull(),
+  city: varchar('city', { length: 100 }),
+  address: varchar('address', { length: 500 }),
+  contactReference: varchar('contact_reference', { length: 256 }),
+  state: varchar('state', { length: 16 }).notNull().default('ACTIVE'),
+  version: bigint('version', { mode: 'number' }).notNull().default(0),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  unique().on(table.bankId, table.code),
+  unique().on(table.organizationId, table.id),
+  unique().on(table.organizationId, table.bankId, table.id),
+  foreignKey({
+    columns: [table.organizationId, table.bankId],
+    foreignColumns: [banks.organizationId, banks.id],
+    name: 'bank_branches_bank_fk',
+  }),
+  check('bank_branches_code_format', sql`${table.code} ~ '^[A-Z0-9][A-Z0-9_-]{0,31}$'`),
+  check('bank_branches_state_check', sql`${table.state} IN ('ACTIVE', 'INACTIVE')`),
+  check('bank_branches_version_nonnegative', sql`${table.version} >= 0`),
+  index('bank_branches_list_idx').on(
+    table.organizationId,
+    table.bankId,
+    table.code,
+    table.id,
+  ),
+]);
+
+// Explicit annotations break the AccessGrant/BankAccount scope FK cycle.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export const bankAccounts: any = pgTable('bank_accounts', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  organizationId: uuid('organization_id').notNull().references(() => organizations.id),
+  bankId: uuid('bank_id').notNull(),
+  bankBranchId: uuid('bank_branch_id'),
+  organizationBranchId: uuid('organization_branch_id'),
+  treasuryUnitId: uuid('treasury_unit_id'),
+  accountType: varchar('account_type', { length: 32 }).notNull(),
+  accountNumber: varchar('account_number', { length: 64 }).notNull(),
+  iban: varchar('iban', { length: 64 }),
+  maskedCardNumber: varchar('masked_card_number', { length: 32 }),
+  currency: varchar('currency', { length: 8 }).notNull(),
+  legalOwnerName: varchar('legal_owner_name', { length: 200 }).notNull(),
+  openingDate: date('opening_date').notNull(),
+  closingDate: date('closing_date'),
+  chequeEnabled: boolean('cheque_enabled').notNull().default(false),
+  canReceive: boolean('can_receive').notNull(),
+  canPay: boolean('can_pay').notNull(),
+  canTransfer: boolean('can_transfer').notNull(),
+  withdrawalCeiling: numeric('withdrawal_ceiling', { precision: 38, scale: 8 }),
+  withdrawalCeilingCurrency: varchar('withdrawal_ceiling_currency', { length: 8 }),
+  accountingDimensions: jsonb('accounting_dimensions').$type<Record<string, string>>(),
+  state: varchar('state', { length: 16 }).notNull().default('DRAFT'),
+  version: bigint('version', { mode: 'number' }).notNull().default(0),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  unique().on(table.organizationId, table.bankId, table.accountNumber),
+  unique().on(table.organizationId, table.iban),
+  unique().on(table.organizationId, table.id),
+  foreignKey({
+    columns: [table.organizationId, table.bankId],
+    foreignColumns: [banks.organizationId, banks.id],
+    name: 'bank_accounts_bank_fk',
+  }),
+  foreignKey({
+    columns: [table.organizationId, table.bankId, table.bankBranchId],
+    foreignColumns: [
+      bankBranches.organizationId,
+      bankBranches.bankId,
+      bankBranches.id,
+    ],
+    name: 'bank_accounts_bank_branch_fk',
+  }),
+  foreignKey({
+    columns: [table.organizationId, table.organizationBranchId],
+    foreignColumns: [branches.organizationId, branches.id],
+    name: 'bank_accounts_organization_branch_fk',
+  }),
+  foreignKey({
+    columns: [table.organizationId, table.treasuryUnitId],
+    foreignColumns: [treasuryUnits.organizationId, treasuryUnits.id],
+    name: 'bank_accounts_treasury_unit_fk',
+  }),
+  foreignKey({
+    columns: [table.organizationId, table.currency],
+    foreignColumns: [currencies.organizationId, currencies.code],
+    name: 'bank_accounts_currency_fk',
+  }),
+  foreignKey({
+    columns: [table.organizationId, table.withdrawalCeilingCurrency],
+    foreignColumns: [currencies.organizationId, currencies.code],
+    name: 'bank_accounts_withdrawal_currency_fk',
+  }),
+  check(
+    'bank_accounts_type_check',
+    sql`${table.accountType} IN (
+      'CURRENT', 'SAVINGS', 'SHORT_TERM', 'LONG_TERM', 'FOREIGN_CURRENCY',
+      'DEPOSIT', 'INTERMEDIARY', 'FUNDS_IN_TRANSIT', 'FACILITY_REFERENCE',
+      'GUARANTEE_REFERENCE'
+    )`,
+  ),
+  check(
+    'bank_accounts_state_check',
+    sql`${table.state} IN ('DRAFT', 'ACTIVE', 'SUSPENDED', 'CLOSED')`,
+  ),
+  check(
+    'bank_accounts_closing_state',
+    sql`(${table.state} = 'CLOSED') = (${table.closingDate} IS NOT NULL)`,
+  ),
+  check(
+    'bank_accounts_closing_date',
+    sql`${table.closingDate} IS NULL OR ${table.closingDate} >= ${table.openingDate}`,
+  ),
+  check(
+    'bank_accounts_masked_card',
+    sql`${table.maskedCardNumber} IS NULL
+      OR ${table.maskedCardNumber} ~ '^[*Xx][*Xx -]*[0-9]{4}$'`,
+  ),
+  check(
+    'bank_accounts_cheque_eligibility',
+    sql`NOT ${table.chequeEnabled} OR ${table.accountType} = 'CURRENT'`,
+  ),
+  check(
+    'bank_accounts_withdrawal_ceiling',
+    sql`(${table.withdrawalCeiling} IS NULL AND ${table.withdrawalCeilingCurrency} IS NULL)
+      OR (
+        ${table.withdrawalCeiling} IS NOT NULL
+        AND ${table.withdrawalCeilingCurrency} IS NOT NULL
+        AND ${table.withdrawalCeiling} >= 0
+        AND ${table.withdrawalCeilingCurrency} = ${table.currency}
+      )`,
+  ),
+  check('bank_accounts_version_nonnegative', sql`${table.version} >= 0`),
+  index('bank_accounts_list_idx').on(
+    table.organizationId,
+    table.bankId,
+    table.accountNumber,
+    table.id,
+  ),
+  index('bank_accounts_scope_idx').on(
+    table.organizationId,
+    table.organizationBranchId,
+    table.treasuryUnitId,
+    table.currency,
+    table.state,
+  ),
+]);
+
+export const posTerminals = pgTable('pos_terminals', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  organizationId: uuid('organization_id').notNull().references(() => organizations.id),
+  bankAccountId: uuid('bank_account_id').notNull(),
+  treasuryUnitId: uuid('treasury_unit_id').notNull(),
+  terminalNumber: varchar('terminal_number', { length: 64 }).notNull(),
+  merchantNumber: varchar('merchant_number', { length: 64 }).notNull(),
+  providerLabel: varchar('provider_label', { length: 160 }),
+  currency: varchar('currency', { length: 8 }).notNull(),
+  settlementCycle: varchar('settlement_cycle', { length: 64 }).notNull(),
+  feeRuleRef: varchar('fee_rule_ref', { length: 128 }),
+  state: varchar('state', { length: 16 }).notNull().default('ACTIVE'),
+  version: bigint('version', { mode: 'number' }).notNull().default(0),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  unique().on(table.organizationId, table.terminalNumber),
+  unique().on(table.organizationId, table.id),
+  foreignKey({
+    columns: [table.organizationId, table.bankAccountId],
+    foreignColumns: [bankAccounts.organizationId, bankAccounts.id],
+    name: 'pos_terminals_bank_account_fk',
+  }),
+  foreignKey({
+    columns: [table.organizationId, table.treasuryUnitId],
+    foreignColumns: [treasuryUnits.organizationId, treasuryUnits.id],
+    name: 'pos_terminals_treasury_unit_fk',
+  }),
+  foreignKey({
+    columns: [table.organizationId, table.currency],
+    foreignColumns: [currencies.organizationId, currencies.code],
+    name: 'pos_terminals_currency_fk',
+  }),
+  check('pos_terminals_state_check', sql`${table.state} IN ('ACTIVE', 'SUSPENDED', 'CLOSED')`),
+  check('pos_terminals_version_nonnegative', sql`${table.version} >= 0`),
+  index('pos_terminals_list_idx').on(table.organizationId, table.terminalNumber, table.id),
+]);
+
+export const paymentGateways = pgTable('payment_gateways', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  organizationId: uuid('organization_id').notNull().references(() => organizations.id),
+  bankAccountId: uuid('bank_account_id').notNull(),
+  treasuryUnitId: uuid('treasury_unit_id').notNull(),
+  providerCode: varchar('provider_code', { length: 64 }).notNull(),
+  merchantId: varchar('merchant_id', { length: 128 }).notNull(),
+  terminalId: varchar('terminal_id', { length: 128 }).notNull(),
+  currency: varchar('currency', { length: 8 }).notNull(),
+  settlementCycle: varchar('settlement_cycle', { length: 64 }).notNull(),
+  feeRuleRef: varchar('fee_rule_ref', { length: 128 }),
+  fundsInTransitMappingRef: varchar('funds_in_transit_mapping_ref', { length: 128 }),
+  feeMappingRef: varchar('fee_mapping_ref', { length: 128 }),
+  state: varchar('state', { length: 16 }).notNull().default('ACTIVE'),
+  version: bigint('version', { mode: 'number' }).notNull().default(0),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  unique().on(table.organizationId, table.providerCode, table.merchantId, table.terminalId),
+  unique().on(table.organizationId, table.id),
+  foreignKey({
+    columns: [table.organizationId, table.bankAccountId],
+    foreignColumns: [bankAccounts.organizationId, bankAccounts.id],
+    name: 'payment_gateways_bank_account_fk',
+  }),
+  foreignKey({
+    columns: [table.organizationId, table.treasuryUnitId],
+    foreignColumns: [treasuryUnits.organizationId, treasuryUnits.id],
+    name: 'payment_gateways_treasury_unit_fk',
+  }),
+  foreignKey({
+    columns: [table.organizationId, table.currency],
+    foreignColumns: [currencies.organizationId, currencies.code],
+    name: 'payment_gateways_currency_fk',
+  }),
+  check(
+    'payment_gateways_provider_code_format',
+    sql`${table.providerCode} ~ '^[A-Z0-9][A-Z0-9._-]{0,63}$'`,
+  ),
+  check(
+    'payment_gateways_state_check',
+    sql`${table.state} IN ('ACTIVE', 'SUSPENDED', 'CLOSED')`,
+  ),
+  check('payment_gateways_version_nonnegative', sql`${table.version} >= 0`),
+  index('payment_gateways_list_idx').on(
+    table.organizationId,
+    table.providerCode,
+    table.merchantId,
+    table.terminalId,
+    table.id,
   ),
 ]);

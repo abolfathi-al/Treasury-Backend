@@ -353,9 +353,6 @@ function representableAmount(value: string): boolean {
 
 export function prepareGrant(dto: AccessGrantCreateDto): PreparedAccessGrant {
   const scope = canonicalScope(dto.scope);
-  if (scope.bankAccountIds.length) {
-    throw new TreasuryProblem('TRS-GEN-004', 404);
-  }
   const validFrom = dto.validFrom ? new Date(dto.validFrom) : new Date();
   const validTo = dto.validTo ? new Date(dto.validTo) : null;
   if (

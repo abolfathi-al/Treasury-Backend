@@ -13,6 +13,7 @@ import {
   STEP_UP_REQUIRED,
 } from '../src/access-control/auth.decorators';
 import { IdentityController } from '../src/access-control/identity.controller';
+import { BankingController } from '../src/banking/banking.controller';
 import { CashboxController } from '../src/cashbox-and-custody/cashbox.controller';
 import { MasterDataController } from '../src/master-data/master-data.controller';
 
@@ -46,9 +47,21 @@ const expectedOperations = [
   ['GET', 'v1/cashboxes'],
   ['POST', 'v1/cashboxes'],
   ['POST', 'v1/cashboxes/:cashboxId/handovers'],
+  ['GET', 'v1/bank-types'],
+  ['POST', 'v1/bank-types'],
+  ['GET', 'v1/banks'],
+  ['POST', 'v1/banks'],
+  ['GET', 'v1/bank-branches'],
+  ['POST', 'v1/bank-branches'],
+  ['GET', 'v1/bank-accounts'],
+  ['POST', 'v1/bank-accounts'],
+  ['GET', 'v1/pos-terminals'],
+  ['POST', 'v1/pos-terminals'],
+  ['GET', 'v1/payment-gateways'],
+  ['POST', 'v1/payment-gateways'],
 ] as const;
 
-test('all authorized operations through INC-1D are present in owner-local controllers', async () => {
+test('all authorized operations through INC-1E are present in owner-local controllers', async () => {
   const operations = new Set<string>();
   for (const controller of [
     AuthController,
@@ -56,6 +69,7 @@ test('all authorized operations through INC-1D are present in owner-local contro
     AccessAdminController,
     MasterDataController,
     CashboxController,
+    BankingController,
   ]) {
     const prefix = Reflect.getMetadata(PATH_METADATA, controller) as string;
     for (const name of Object.getOwnPropertyNames(controller.prototype)) {
@@ -68,6 +82,27 @@ test('all authorized operations through INC-1D are present in owner-local contro
   }
   for (const [method, path] of expectedOperations) {
     assert.ok(operations.has(`${method} ${path}`), `${method} ${path}`);
+  }
+});
+
+test('Banking operations use exact permissions, operation IDs, and scope modes', () => {
+  for (const [handler, permission, operationId, scope] of [
+    [BankingController.prototype.listBankTypes, 'bank-type.view', 'listBankTypes', 'ORGANIZATION_WIDE'],
+    [BankingController.prototype.createBankType, 'bank-type.manage', 'createBankType', 'ORGANIZATION_WIDE'],
+    [BankingController.prototype.listBanks, 'bank.view', 'listBanks', 'ORGANIZATION_WIDE'],
+    [BankingController.prototype.createBank, 'bank.manage', 'createBank', 'ORGANIZATION_WIDE'],
+    [BankingController.prototype.listBankBranches, 'bank-branch.view', 'listBankBranches', 'ORGANIZATION_WIDE'],
+    [BankingController.prototype.createBankBranch, 'bank-branch.manage', 'createBankBranch', 'ORGANIZATION_WIDE'],
+    [BankingController.prototype.listBankAccounts, 'bank-account.view', 'listBankAccounts', 'ONE_GRANT_RESOURCE'],
+    [BankingController.prototype.createBankAccount, 'bank-account.manage', 'createBankAccount', 'ONE_GRANT_RESOURCE'],
+    [BankingController.prototype.listPosTerminals, 'pos-terminal.view', 'listPosTerminals', 'ONE_GRANT_RESOURCE'],
+    [BankingController.prototype.createPosTerminal, 'pos-terminal.manage', 'createPosTerminal', 'ONE_GRANT_RESOURCE'],
+    [BankingController.prototype.listPaymentGateways, 'payment-gateway.view', 'listPaymentGateways', 'ONE_GRANT_RESOURCE'],
+    [BankingController.prototype.createPaymentGateway, 'payment-gateway.manage', 'createPaymentGateway', 'ONE_GRANT_RESOURCE'],
+  ] as const) {
+    assert.equal(Reflect.getMetadata(REQUIRED_PERMISSION, handler), permission);
+    assert.equal(Reflect.getMetadata(AUTHORIZATION_OPERATION, handler), operationId);
+    assert.equal(Reflect.getMetadata(PERMISSION_SCOPE_MODE, handler), scope);
   }
 });
 
@@ -230,6 +265,35 @@ test('INC-1D migration and Drizzle schema constrain Cashbox custody and handover
   assert.match(migration, /enforce_treasury_unit_cashbox_branches/u);
   assert.match(migration, /variance_amount = counted_amount - book_amount/u);
   assert.match(migration, /created_by_user_id = outgoing_user_id/u);
+});
+
+test('INC-1E migration and Drizzle schema constrain Banking Base Data', async () => {
+  const migration = await readFile('migrations/0005_banking_base_data.sql', 'utf8');
+  const schema = await readFile('src/database/schema.ts', 'utf8');
+  for (const source of [migration, schema]) {
+    for (const invariant of [
+      'bank_types',
+      'banks',
+      'bank_branches',
+      'bank_accounts',
+      'pos_terminals',
+      'payment_gateways',
+      'bank_accounts_cheque_eligibility',
+      'bank_accounts_withdrawal_ceiling',
+      'access_grant_bank_account_scopes_account_fk',
+    ]) assert.match(source, new RegExp(invariant, 'u'));
+  }
+  for (const invariant of [
+    'enforce_banking_institution_availability',
+    'enforce_bank_account_references',
+    'enforce_collection_endpoint_references',
+  ]) {
+    assert.match(migration, new RegExp(invariant, 'u'));
+  }
+  assert.match(
+    await readFile('src/banking/banking.repository.ts', 'utf8'),
+    /SET state = 'ACTIVE', version = version \+ 1/u,
+  );
 });
 
 test('operator bootstrap is local-only, advisory-locked, and transactional', async () => {
