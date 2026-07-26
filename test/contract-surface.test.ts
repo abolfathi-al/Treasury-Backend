@@ -6,7 +6,12 @@ import { METHOD_METADATA, PATH_METADATA } from '@nestjs/common/constants';
 
 import { AuthController } from '../src/access-control/auth.controller';
 import { AccessAdminController } from '../src/access-control/access-admin.controller';
-import { STEP_UP_REQUIRED } from '../src/access-control/auth.decorators';
+import {
+  AUTHORIZATION_OPERATION,
+  PERMISSION_SCOPE_MODE,
+  REQUIRED_PERMISSION,
+  STEP_UP_REQUIRED,
+} from '../src/access-control/auth.decorators';
 import { IdentityController } from '../src/access-control/identity.controller';
 import { MasterDataController } from '../src/master-data/master-data.controller';
 
@@ -33,11 +38,13 @@ const expectedOperations = [
   ['POST', 'v1/access-grants'],
   ['GET', 'v1/currencies'],
   ['POST', 'v1/currencies'],
+  ['GET', 'v1/parties'],
+  ['POST', 'v1/parties'],
   ['GET', 'v1/method-definitions'],
   ['POST', 'v1/method-definitions'],
 ] as const;
 
-test('all authorized INC-1A and INC-1B operations are present in owner-local controllers', async () => {
+test('all authorized operations through INC-1C are present in owner-local controllers', async () => {
   const operations = new Set<string>();
   for (const controller of [
     AuthController,
@@ -56,6 +63,17 @@ test('all authorized INC-1A and INC-1B operations are present in owner-local con
   }
   for (const [method, path] of expectedOperations) {
     assert.ok(operations.has(`${method} ${path}`), `${method} ${path}`);
+  }
+});
+
+test('Party operations use exact organization-wide permissions and operation IDs', () => {
+  for (const [handler, permission, operationId] of [
+    [MasterDataController.prototype.parties, 'party.view', 'listParties'],
+    [MasterDataController.prototype.createParty, 'party.manage', 'createParty'],
+  ] as const) {
+    assert.equal(Reflect.getMetadata(REQUIRED_PERMISSION, handler), permission);
+    assert.equal(Reflect.getMetadata(AUTHORIZATION_OPERATION, handler), operationId);
+    assert.equal(Reflect.getMetadata(PERMISSION_SCOPE_MODE, handler), 'ORGANIZATION_WIDE');
   }
 });
 
@@ -153,6 +171,22 @@ test('INC-1B migration normalizes scopes, constrains permissions, and versions s
   ]) {
     assert.match(migration, new RegExp(invariant, 'u'));
   }
+});
+
+test('INC-1C migration and Drizzle schema normalize organization-scoped Party kinds', async () => {
+  const migration = await readFile('migrations/0003_party_directory.sql', 'utf8');
+  const schema = await readFile('src/database/schema.ts', 'utf8');
+  for (const source of [migration, schema]) {
+    assert.match(source, /parties/u);
+    assert.match(source, /party_kinds/u);
+    assert.match(source, /CUSTOMER/u);
+    assert.match(source, /LEGAL_PERSON/u);
+  }
+  assert.match(migration, /UNIQUE \(organization_id, code\)/u);
+  assert.match(migration, /PRIMARY KEY \(party_id, party_kind\)/u);
+  assert.doesNotMatch(migration, /party_kind varchar\(32\).*\[\]/u);
+  assert.doesNotMatch(migration, /accounting/u);
+  assert.doesNotMatch(schema, /accessGrantParty/u);
 });
 
 test('operator bootstrap is local-only, advisory-locked, and transactional', async () => {

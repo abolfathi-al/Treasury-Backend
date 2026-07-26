@@ -1,6 +1,6 @@
 # Treasury Backend
 
-NestJS modular monolith for the owner-approved `INC-1A-AUTH-METHODS` increment.
+NestJS modular monolith through the owner-approved `INC-1C-PARTY-DIRECTORY` increment.
 The exact governed source is pinned in `canon-revision.json`.
 
 ## Runtime
@@ -47,6 +47,8 @@ locked transaction; then displays the single recovery code once.
 - Method Definition list/create with normalized references/currencies/limits,
   category-specific anchors, tracking requirements, positive per-currency
   limits, and idempotent creation;
+- typed organization-scoped Party list/create with normalized multi-role kinds
+  and idempotent creation;
 - command-bound TOTP step-up for `createIdentityAccount`.
 
 There are no JWTs, generic repositories, CQRS buses, microservices, queues,

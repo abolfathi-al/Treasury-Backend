@@ -4,6 +4,7 @@ import {
   ArrayUnique,
   IsArray,
   IsBoolean,
+  IsEmail,
   IsEnum,
   IsInt,
   IsOptional,
@@ -35,6 +36,47 @@ export class CurrencyCreateDto {
   @IsOptional() @IsString() @MaxLength(16) symbol?: string;
   @IsInt() @Min(0) @Max(8) decimalPlaces!: number;
   @IsOptional() @IsBoolean() baseCurrency?: boolean;
+}
+
+export enum PartyKind {
+  CUSTOMER = 'CUSTOMER',
+  SUPPLIER = 'SUPPLIER',
+  EMPLOYEE = 'EMPLOYEE',
+  SHAREHOLDER = 'SHAREHOLDER',
+  REPRESENTATIVE = 'REPRESENTATIVE',
+  BANK = 'BANK',
+  COMPANY = 'COMPANY',
+  ORGANIZATION = 'ORGANIZATION',
+  NATURAL_PERSON = 'NATURAL_PERSON',
+  LEGAL_PERSON = 'LEGAL_PERSON',
+  OTHER = 'OTHER',
+}
+
+export class PartyCreateDto {
+  @IsString() @MinLength(1) @MaxLength(64) code!: string;
+  @IsArray() @ArrayMinSize(1) @ArrayUnique() @IsEnum(PartyKind, { each: true })
+  partyKinds!: PartyKind[];
+  @IsString() @MinLength(1) @MaxLength(200) displayName!: string;
+  @IsOptional() @IsString() @MaxLength(200) legalName?: string;
+  @IsOptional() @IsString() @MaxLength(64) nationalId?: string;
+  @IsOptional() @IsString() @MaxLength(64) registrationId?: string;
+  @IsOptional() @IsString() @MaxLength(64) phone?: string;
+  @IsOptional() @IsEmail() @MaxLength(254) email?: string;
+  @IsOptional() @IsString() @MaxLength(1000) notes?: string;
+}
+
+export interface PartyView extends PartyCreateDto {
+  id: string;
+  organizationId: string;
+  state: 'ACTIVE';
+  version: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface PartyPage {
+  items: PartyView[];
+  page: { limit: number; hasMore: boolean; nextCursor?: string; asOf: string };
 }
 
 export enum MethodDirection {

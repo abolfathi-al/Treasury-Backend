@@ -330,6 +330,45 @@ export const securityAuditEvents = pgTable('security_audit_events', {
   occurredAt: timestamp('occurred_at', { withTimezone: true }).notNull().defaultNow(),
 });
 
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export const parties: any = pgTable('parties', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  organizationId: uuid('organization_id').notNull().references(() => organizations.id),
+  code: varchar('code', { length: 64 }).notNull(),
+  displayName: varchar('display_name', { length: 200 }).notNull(),
+  legalName: varchar('legal_name', { length: 200 }),
+  nationalId: varchar('national_id', { length: 64 }),
+  registrationId: varchar('registration_id', { length: 64 }),
+  phone: varchar('phone', { length: 64 }),
+  email: varchar('email', { length: 254 }),
+  notes: varchar('notes', { length: 1000 }),
+  state: varchar('state', { length: 16 }).notNull().default('ACTIVE'),
+  mergedIntoPartyId: uuid('merged_into_party_id'),
+  version: integer('version').notNull().default(0),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  unique().on(table.organizationId, table.code),
+  index('parties_organization_id_id_idx').on(table.organizationId, table.id),
+  foreignKey({
+    columns: [table.mergedIntoPartyId],
+    foreignColumns: [table.id],
+    name: 'parties_merged_into_party_fk',
+  }),
+  check('parties_state_check', sql`${table.state} IN ('ACTIVE', 'INACTIVE', 'MERGED')`),
+]);
+
+export const partyKinds = pgTable('party_kinds', {
+  partyId: uuid('party_id').notNull().references(() => parties.id),
+  partyKind: varchar('party_kind', { length: 32 }).notNull(),
+}, (table) => [
+  primaryKey({ columns: [table.partyId, table.partyKind] }),
+  check('party_kinds_value_check', sql`${table.partyKind} IN (
+    'CUSTOMER', 'SUPPLIER', 'EMPLOYEE', 'SHAREHOLDER', 'REPRESENTATIVE',
+    'BANK', 'COMPANY', 'ORGANIZATION', 'NATURAL_PERSON', 'LEGAL_PERSON', 'OTHER'
+  )`),
+]);
+
 export const methodDefinitions = pgTable('method_definitions', {
   id: uuid('id').primaryKey().defaultRandom(),
   organizationId: uuid('organization_id').notNull().references(() => organizations.id),

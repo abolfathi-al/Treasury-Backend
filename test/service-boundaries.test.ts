@@ -13,6 +13,7 @@ import {
   MethodBehaviorCategory,
   MethodDirection,
   MethodReference,
+  PartyKind,
 } from '../src/master-data/master-data.dto';
 import type { MasterDataRepository } from '../src/master-data/master-data.repository';
 import { MasterDataService } from '../src/master-data/master-data.service';
@@ -42,6 +43,11 @@ test('all business create boundaries enforce the OpenAPI Idempotency-Key length'
       createsFundsInTransit: true,
       requiresApproval: true,
       allowedCurrencies: ['USD'],
+    }, 'x'), shortKeyProblem),
+    assert.rejects(master.createParty('org', {
+      code: 'P-1',
+      displayName: 'Party',
+      partyKinds: [PartyKind.CUSTOMER],
     }, 'x'), shortKeyProblem),
   ]);
 
@@ -142,6 +148,7 @@ test('malformed opaque cursors fail as typed 422 boundaries before PostgreSQL ca
     () => master.listBranches('org', undefined, 'not-a-uuid'),
     () => master.listTreasuryUnits('org', undefined, 'not-a-uuid'),
     () => master.listMethods('org', undefined, 'not-a-uuid'),
+    () => master.listParties('org', undefined, 'not-a-uuid'),
     () => master.listCurrencies('org', undefined, '%broken'),
   ]) {
     assert.throws(call, shortKeyProblem);
@@ -152,4 +159,50 @@ test('malformed opaque cursors fail as typed 422 boundaries before PostgreSQL ca
     {} as AuthService,
   );
   assert.throws(() => identity.list('org', undefined, 'not-a-uuid'), shortKeyProblem);
+});
+
+test('Party service rejects invalid kinds and maps stable create conflicts', async () => {
+  process.env.COMMAND_DIGEST_HMAC_KEY_BASE64 = Buffer.alloc(32, 7).toString('base64');
+  const invalid = new MasterDataService({} as MasterDataRepository);
+  for (const partyKinds of [
+    [],
+    [PartyKind.CUSTOMER, PartyKind.CUSTOMER],
+    ['UNKNOWN' as PartyKind],
+  ]) {
+    assert.throws(
+      () => invalid.createParty('org', {
+        code: 'P-1',
+        displayName: 'Party',
+        partyKinds,
+      }, 'party-key'),
+      shortKeyProblem,
+    );
+  }
+
+  const command = {
+    code: 'P-1',
+    displayName: 'Party',
+    partyKinds: [PartyKind.CUSTOMER],
+  };
+  const idempotencyConflict = new MasterDataService({
+    createParty: async () => {
+      throw new SyntaxError('IDEMPOTENCY_CONFLICT');
+    },
+  } as unknown as MasterDataRepository);
+  await assert.rejects(
+    idempotencyConflict.createParty('org', command, 'party-key'),
+    (error) => error instanceof TreasuryProblem
+      && (error.getResponse() as { code?: string }).code === 'TRS-GEN-007',
+  );
+
+  const duplicate = new MasterDataService({
+    createParty: async () => {
+      throw { code: '23505' };
+    },
+  } as unknown as MasterDataRepository);
+  await assert.rejects(
+    duplicate.createParty('org', command, 'another-key'),
+    (error) => error instanceof TreasuryProblem
+      && (error.getResponse() as { code?: string }).code === 'TRS-MST-002',
+  );
 });

@@ -15,6 +15,7 @@ import {
   BranchCreateDto,
   CurrencyCreateDto,
   MethodCreateDto,
+  PartyCreateDto,
   TreasuryUnitCreateDto,
 } from './master-data.dto';
 import { MasterDataService } from './master-data.service';
@@ -87,6 +88,26 @@ export class MasterDataController {
     @Body() body: CurrencyCreateDto,
   ) {
     return this.service.createCurrency(request.auth!.organizationId, body, key);
+  }
+
+  @Get('parties')
+  @RequirePermission('party.view', 'listParties', 'ORGANIZATION_WIDE')
+  parties(
+    @Req() request: TreasuryRequest,
+    @Query('limit') limit?: string,
+    @Query('cursor') cursor?: string,
+  ) {
+    return this.service.listParties(request.auth!.organizationId, limit, cursor);
+  }
+
+  @Post('parties')
+  @RequirePermission('party.manage', 'createParty', 'ORGANIZATION_WIDE')
+  createParty(
+    @Req() request: TreasuryRequest,
+    @Headers('Idempotency-Key') key: string,
+    @Body() body: PartyCreateDto,
+  ) {
+    return this.service.createParty(request.auth!.organizationId, body, key);
   }
 
   @Get('method-definitions')

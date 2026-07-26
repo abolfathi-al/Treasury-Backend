@@ -1,16 +1,19 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import test from 'node:test';
+import { NestFactory } from '@nestjs/core';
 
 import { AuthRepository } from '../src/access-control/auth.repository';
-import { AuthService } from '../src/access-control/auth.service';
+import { AuthService, SessionContext } from '../src/access-control/auth.service';
 import { CredentialService } from '../src/access-control/credential.service';
 import { IdentityRepository } from '../src/access-control/identity.repository';
+import { AppModule } from '../src/app.module';
 import { DatabaseService } from '../src/database/database.service';
 import {
   MethodBehaviorCategory,
   MethodDirection,
   MethodReference,
+  PartyKind,
 } from '../src/master-data/master-data.dto';
 import { MasterDataRepository } from '../src/master-data/master-data.repository';
 import { commandDigest, digest, stableJson } from '../src/common/http';
@@ -18,6 +21,181 @@ import { MasterDataService } from '../src/master-data/master-data.service';
 import { TreasuryProblem } from '../src/common/problem';
 
 const connectionString = process.env.TEST_DATABASE_URL;
+
+test('Party HTTP guard denies missing and cross-organization permission before persistence', {
+  skip: connectionString ? false : 'TEST_DATABASE_URL is not configured',
+}, async (t) => {
+  process.env.DATABASE_URL = connectionString;
+  const database = new DatabaseService();
+  const organizationId = await seedOrganization(database);
+  const crossOrganizationId = randomUUID();
+  const app = await NestFactory.create(AppModule, { logger: false });
+  const auth = app.get(AuthService);
+  auth.authenticateSession = async (token) => token === 'missing-permission'
+    ? partySession(organizationId, [], [])
+    : partySession(crossOrganizationId, [], ['party.manage']);
+  try {
+    try {
+      await app.listen(0, '127.0.0.1');
+    } catch (error) {
+      if ((error as { code?: string }).code === 'EPERM') {
+        t.skip('sandbox does not allow loopback listeners');
+        return;
+      }
+      throw error;
+    }
+    const before = await database.pool.query<{
+      parties: number;
+      kinds: number;
+    }>(`
+      SELECT
+        (SELECT count(*)::int FROM parties) AS parties,
+        (SELECT count(*)::int FROM party_kinds) AS kinds
+    `);
+    const address = app.getHttpServer().address() as { port: number };
+    for (const token of ['missing-permission', 'cross-organization']) {
+      const response = await fetch(`http://127.0.0.1:${address.port}/v1/parties`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Cookie: `__Host-treasury_session=${token}`,
+          'Idempotency-Key': `party-${token}`,
+        },
+        body: JSON.stringify({
+          code: `DENIED-${token}`,
+          displayName: 'Denied Party',
+          partyKinds: [PartyKind.CUSTOMER],
+        }),
+      });
+      assert.equal(response.status, 403);
+      assert.equal((await response.json() as { code: string }).code, 'TRS-GEN-003');
+    }
+    const after = await database.pool.query<{
+      parties: number;
+      kinds: number;
+    }>(`
+      SELECT
+        (SELECT count(*)::int FROM parties) AS parties,
+        (SELECT count(*)::int FROM party_kinds) AS kinds
+    `);
+    assert.deepEqual(after.rows[0], before.rows[0]);
+  } finally {
+    await app.close();
+    await database.onModuleDestroy();
+  }
+});
+
+test('PostgreSQL Party create/list is normalized, organization-scoped, and idempotent', {
+  skip: connectionString ? false : 'TEST_DATABASE_URL is not configured',
+}, async () => {
+  process.env.DATABASE_URL = connectionString;
+  process.env.COMMAND_DIGEST_HMAC_KEY_BASE64 = Buffer.alloc(32, 4).toString('base64');
+  const database = new DatabaseService();
+  const repository = new MasterDataRepository(database);
+  const service = new MasterDataService(repository);
+  try {
+    const organizationId = await seedOrganization(database);
+    const command = {
+      code: 'PARTY-1',
+      partyKinds: [PartyKind.SUPPLIER, PartyKind.CUSTOMER],
+      displayName: 'Example Party',
+      legalName: 'Example Party LLC',
+      nationalId: 'N-1',
+      registrationId: 'R-1',
+      phone: '+1-555-0100',
+      email: 'party@example.test',
+      notes: 'Local counterparty',
+    };
+    const first = await service.createParty(organizationId, command, 'party-key');
+    const replay = await service.createParty(organizationId, command, 'party-key');
+    assert.deepEqual(replay, first);
+    assert.deepEqual(first.partyKinds, [PartyKind.CUSTOMER, PartyKind.SUPPLIER]);
+    assert.equal(first.state, 'ACTIVE');
+    assert.equal(first.version, 0);
+    assert.match(first.createdAt, /Z$/u);
+
+    const kinds = await database.pool.query<{ party_kind: string }>(`
+      SELECT party_kind FROM party_kinds WHERE party_id = $1 ORDER BY party_kind
+    `, [first.id]);
+    assert.deepEqual(kinds.rows.map(({ party_kind }) => party_kind), [
+      PartyKind.CUSTOMER,
+      PartyKind.SUPPLIER,
+    ]);
+
+    const listed = await service.listParties(organizationId);
+    assert.deepEqual(listed.items, [first]);
+    assert.deepEqual((await service.listParties(randomUUID())).items, []);
+
+    await assert.rejects(
+      service.createParty(
+        organizationId,
+        { ...command, displayName: 'Changed' },
+        'party-key',
+      ),
+      (error) => error instanceof TreasuryProblem
+        && (error.getResponse() as { code?: string }).code === 'TRS-GEN-007',
+    );
+    await assert.rejects(
+      service.createParty(organizationId, command, 'different-key'),
+      (error) => error instanceof TreasuryProblem
+        && (error.getResponse() as { code?: string }).code === 'TRS-MST-002',
+    );
+    assert.equal(
+      (await database.pool.query('SELECT 1 FROM parties WHERE organization_id = $1', [organizationId])).rowCount,
+      1,
+    );
+
+    await service.createParty(organizationId, {
+      code: 'PARTY-2',
+      partyKinds: [PartyKind.OTHER],
+      displayName: 'Another Party',
+    }, 'second-party-key');
+    const firstPage = await service.listParties(organizationId, '1');
+    assert.equal(firstPage.items.length, 1);
+    assert.equal(firstPage.page.hasMore, true);
+    assert.ok(firstPage.page.nextCursor);
+    const secondPage = await service.listParties(
+      organizationId,
+      '1',
+      firstPage.page.nextCursor,
+    );
+    assert.equal(secondPage.items.length, 1);
+    assert.equal(secondPage.page.hasMore, false);
+    assert.deepEqual(
+      [firstPage.items[0]!.code, secondPage.items[0]!.code].sort(),
+      ['PARTY-1', 'PARTY-2'],
+    );
+  } finally {
+    await database.onModuleDestroy();
+  }
+});
+
+function partySession(
+  organizationId: string,
+  organizationPermissions: string[],
+  effectivePermissions: string[],
+): SessionContext {
+  const now = new Date();
+  return {
+    accountId: randomUUID(),
+    organizationId,
+    physicalSessionId: randomUUID(),
+    organizationPermissions,
+    xsrfDigest: digest('denied-xsrf'),
+    presentedTokenDigest: digest('denied-session'),
+    matchedCurrent: true,
+    session: {
+      sessionId: randomUUID(),
+      authenticatedAt: now.toISOString(),
+      idleExpiresAt: new Date(now.getTime() + 15 * 60_000).toISOString(),
+      absoluteExpiresAt: new Date(now.getTime() + 8 * 60 * 60_000).toISOString(),
+      assurance: 'PASSWORD',
+      userId: randomUUID(),
+      userDisplayName: 'Denied actor',
+      effectivePermissions,
+    },
+  };
+}
 
 test('PostgreSQL idempotency serializes concurrent Method creation and replays one result', {
   skip: connectionString ? false : 'TEST_DATABASE_URL is not configured',
@@ -220,6 +398,8 @@ async function seedOrganization(database: DatabaseService): Promise<string> {
       'roles',
       'user_refs',
       'idempotency_records',
+      'party_kinds',
+      'parties',
       'method_amount_limits',
       'method_allowed_currencies',
       'method_required_references',
