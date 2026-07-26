@@ -85,6 +85,7 @@ export const treasuryUnits = pgTable('treasury_units', {
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
 }, (table) => [
   unique().on(table.organizationId, table.code),
+  unique().on(table.organizationId, table.id),
   foreignKey({
     columns: [table.organizationId, table.branchId],
     foreignColumns: [branches.organizationId, branches.id],
@@ -105,7 +106,10 @@ export const userRefs = pgTable('user_refs', {
   state: varchar('state', { length: 16 }).notNull().default('ACTIVE'),
   version: integer('version').notNull().default(0),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
-}, (table) => [unique().on(table.organizationId, table.subjectKey)]);
+}, (table) => [
+  unique().on(table.organizationId, table.subjectKey),
+  unique().on(table.organizationId, table.id),
+]);
 
 export const identityAccounts = pgTable('identity_accounts', {
   id: uuid('id').primaryKey().defaultRandom(),
@@ -185,10 +189,18 @@ export const accessGrantTreasuryUnitScopes = pgTable('access_grant_treasury_unit
   treasuryUnitId: uuid('treasury_unit_id').notNull().references(() => treasuryUnits.id),
 }, (table) => [primaryKey({ columns: [table.accessGrantId, table.treasuryUnitId] })]);
 
-export const accessGrantCashboxScopes = pgTable('access_grant_cashbox_scopes', {
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export const accessGrantCashboxScopes: any = pgTable('access_grant_cashbox_scopes', {
   accessGrantId: uuid('access_grant_id').notNull().references(() => accessGrants.id),
   cashboxId: uuid('cashbox_id').notNull(),
-}, (table) => [primaryKey({ columns: [table.accessGrantId, table.cashboxId] })]);
+}, (table) => [
+  primaryKey({ columns: [table.accessGrantId, table.cashboxId] }),
+  foreignKey({
+    columns: [table.cashboxId],
+    foreignColumns: [cashboxes.id],
+    name: 'access_grant_cashbox_scopes_cashbox_fk',
+  }),
+]);
 
 export const accessGrantBankAccountScopes = pgTable('access_grant_bank_account_scopes', {
   accessGrantId: uuid('access_grant_id').notNull().references(() => accessGrants.id),
@@ -437,3 +449,258 @@ export const idempotencyRecords = pgTable('idempotency_records', {
   responseBody: jsonb('response_body').$type<Record<string, unknown>>(),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
 }, (table) => [unique().on(table.organizationId, table.scope, table.idempotencyKey)]);
+
+// Explicit annotations break the intentional Cashbox/main-control FK cycle.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export const cashboxes: any = pgTable('cashboxes', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  organizationId: uuid('organization_id').notNull().references(() => organizations.id),
+  branchId: uuid('branch_id'),
+  treasuryUnitId: uuid('treasury_unit_id').notNull(),
+  code: varchar('code', { length: 64 }).notNull(),
+  name: varchar('name', { length: 160 }).notNull(),
+  cashboxType: varchar('cashbox_type', { length: 32 }).notNull(),
+  mainCurrency: varchar('main_currency', { length: 8 }).notNull(),
+  canReceive: boolean('can_receive').notNull(),
+  canPay: boolean('can_pay').notNull(),
+  canTransfer: boolean('can_transfer').notNull(),
+  requiresApproval: boolean('requires_approval').notNull(),
+  accountingDimensions: jsonb('accounting_dimensions').$type<Record<string, string>>(),
+  activeFrom: timestamp('active_from', { withTimezone: true }).notNull(),
+  activeTo: timestamp('active_to', { withTimezone: true }),
+  state: varchar('state', { length: 16 }).notNull().default('ACTIVE'),
+  version: bigint('version', { mode: 'number' }).notNull().default(0),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  unique().on(table.organizationId, table.code),
+  unique().on(table.organizationId, table.id),
+  foreignKey({
+    columns: [table.organizationId, table.branchId],
+    foreignColumns: [branches.organizationId, branches.id],
+    name: 'cashboxes_branch_fk',
+  }),
+  foreignKey({
+    columns: [table.organizationId, table.treasuryUnitId],
+    foreignColumns: [treasuryUnits.organizationId, treasuryUnits.id],
+    name: 'cashboxes_treasury_unit_fk',
+  }),
+  foreignKey({
+    columns: [table.organizationId, table.mainCurrency],
+    foreignColumns: [currencies.organizationId, currencies.code],
+    name: 'cashboxes_main_currency_fk',
+  }),
+  foreignKey({
+    columns: [table.id, table.mainCurrency],
+    foreignColumns: [cashboxCurrencyControls.cashboxId, cashboxCurrencyControls.currency],
+    name: 'cashboxes_main_currency_control_fk',
+  }),
+  check(
+    'cashboxes_type_check',
+    sql`${table.cashboxType} IN (
+      'CASH', 'FOREIGN_CURRENCY', 'SALES', 'BRANCH', 'TEMPORARY', 'VIRTUAL',
+      'INSTRUMENT', 'CHEQUE', 'COLLECTION', 'CUSTODIAL', 'PETTY_CASH'
+    )`,
+  ),
+  check('cashboxes_state_check', sql`${table.state} IN ('DRAFT', 'ACTIVE', 'SUSPENDED', 'CLOSED')`),
+  check('cashboxes_version_nonnegative', sql`${table.version} >= 0`),
+  check('cashboxes_active_interval', sql`${table.activeTo} IS NULL OR ${table.activeTo} > ${table.activeFrom}`),
+  index('cashboxes_list_idx').on(table.organizationId, table.code, table.id),
+]);
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export const cashboxCurrencyControls: any = pgTable('cashbox_currency_controls', {
+  cashboxId: uuid('cashbox_id').notNull(),
+  organizationId: uuid('organization_id').notNull(),
+  currency: varchar('currency', { length: 8 }).notNull(),
+  transactionCeiling: numeric('transaction_ceiling', { precision: 38, scale: 8 }),
+  minimumPosition: numeric('minimum_position', { precision: 38, scale: 8 }),
+  maximumHolding: numeric('maximum_holding', { precision: 38, scale: 8 }),
+  allowNegative: boolean('allow_negative').notNull().default(false),
+}, (table) => [
+  primaryKey({ columns: [table.cashboxId, table.currency] }),
+  foreignKey({
+    columns: [table.organizationId, table.cashboxId],
+    foreignColumns: [cashboxes.organizationId, cashboxes.id],
+    name: 'cashbox_currency_controls_cashbox_fk',
+  }),
+  foreignKey({
+    columns: [table.organizationId, table.currency],
+    foreignColumns: [currencies.organizationId, currencies.code],
+    name: 'cashbox_currency_controls_currency_fk',
+  }),
+  check(
+    'cashbox_currency_controls_transaction_nonnegative',
+    sql`${table.transactionCeiling} IS NULL OR ${table.transactionCeiling} >= 0`,
+  ),
+  check(
+    'cashbox_currency_controls_maximum_nonnegative',
+    sql`${table.maximumHolding} IS NULL OR ${table.maximumHolding} >= 0`,
+  ),
+  check(
+    'cashbox_currency_controls_minimum_maximum',
+    sql`${table.minimumPosition} IS NULL OR ${table.maximumHolding} IS NULL
+      OR ${table.minimumPosition} <= ${table.maximumHolding}`,
+  ),
+  check(
+    'cashbox_currency_controls_negative_permission',
+    sql`${table.minimumPosition} IS NULL OR ${table.minimumPosition} >= 0 OR ${table.allowNegative}`,
+  ),
+]);
+
+export const cashboxAssignments = pgTable('cashbox_assignments', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  organizationId: uuid('organization_id').notNull().references(() => organizations.id),
+  cashboxId: uuid('cashbox_id').notNull(),
+  userId: uuid('user_id').notNull(),
+  assignmentType: varchar('assignment_type', { length: 16 }).notNull(),
+  effectiveFrom: timestamp('effective_from', { withTimezone: true }).notNull(),
+  effectiveTo: timestamp('effective_to', { withTimezone: true }),
+  state: varchar('state', { length: 16 }).notNull(),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  unique().on(table.organizationId, table.id),
+  unique().on(table.organizationId, table.cashboxId, table.id),
+  foreignKey({
+    columns: [table.organizationId, table.cashboxId],
+    foreignColumns: [cashboxes.organizationId, cashboxes.id],
+    name: 'cashbox_assignments_cashbox_fk',
+  }),
+  foreignKey({
+    columns: [table.organizationId, table.userId],
+    foreignColumns: [userRefs.organizationId, userRefs.id],
+    name: 'cashbox_assignments_user_fk',
+  }),
+  uniqueIndex('cashbox_current_primary_assignment_unique').on(table.cashboxId)
+    .where(sql`${table.assignmentType} = 'PRIMARY' AND ${table.state} = 'ACTIVE'`),
+  check(
+    'cashbox_assignments_type_check',
+    sql`${table.assignmentType} IN ('PRIMARY', 'SUBSTITUTE')`,
+  ),
+  check(
+    'cashbox_assignments_state_check',
+    sql`${table.state} IN ('SCHEDULED', 'ACTIVE', 'ENDED', 'CANCELLED')`,
+  ),
+  check(
+    'cashbox_assignments_interval',
+    sql`${table.effectiveTo} IS NULL OR ${table.effectiveTo} > ${table.effectiveFrom}`,
+  ),
+]);
+
+export const cashboxHandovers = pgTable('cashbox_handovers', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  organizationId: uuid('organization_id').notNull().references(() => organizations.id),
+  cashboxId: uuid('cashbox_id').notNull(),
+  currentAssignmentId: uuid('current_assignment_id').notNull(),
+  handoverNumber: varchar('handover_number', { length: 64 }).notNull(),
+  outgoingUserId: uuid('outgoing_user_id').notNull(),
+  incomingUserId: uuid('incoming_user_id').notNull(),
+  bookSnapshotDigest: varchar('book_snapshot_digest', { length: 128 }).notNull(),
+  hasDiscrepancy: boolean('has_discrepancy').notNull(),
+  reason: varchar('reason', { length: 500 }),
+  state: varchar('state', { length: 24 }).notNull(),
+  version: bigint('version', { mode: 'number' }).notNull().default(0),
+  createdByUserId: uuid('created_by_user_id').notNull(),
+  requestId: varchar('request_id', { length: 128 }).notNull(),
+  countedAt: timestamp('counted_at', { withTimezone: true }).notNull(),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  completedAt: timestamp('completed_at', { withTimezone: true }),
+}, (table) => [
+  unique().on(table.cashboxId, table.handoverNumber),
+  unique().on(table.organizationId, table.id),
+  foreignKey({
+    columns: [table.organizationId, table.cashboxId],
+    foreignColumns: [cashboxes.organizationId, cashboxes.id],
+    name: 'cashbox_handovers_cashbox_fk',
+  }),
+  foreignKey({
+    columns: [table.organizationId, table.cashboxId, table.currentAssignmentId],
+    foreignColumns: [
+      cashboxAssignments.organizationId,
+      cashboxAssignments.cashboxId,
+      cashboxAssignments.id,
+    ],
+    name: 'cashbox_handovers_assignment_fk',
+  }),
+  foreignKey({
+    columns: [table.organizationId, table.outgoingUserId],
+    foreignColumns: [userRefs.organizationId, userRefs.id],
+    name: 'cashbox_handovers_outgoing_user_fk',
+  }),
+  foreignKey({
+    columns: [table.organizationId, table.incomingUserId],
+    foreignColumns: [userRefs.organizationId, userRefs.id],
+    name: 'cashbox_handovers_incoming_user_fk',
+  }),
+  foreignKey({
+    columns: [table.organizationId, table.createdByUserId],
+    foreignColumns: [userRefs.organizationId, userRefs.id],
+    name: 'cashbox_handovers_actor_user_fk',
+  }),
+  uniqueIndex('cashbox_nonterminal_handover_unique').on(table.cashboxId)
+    .where(sql`${table.state} NOT IN ('COMPLETED', 'REJECTED', 'CANCELLED')`),
+  check(
+    'cashbox_handovers_state_check',
+    sql`${table.state} IN (
+      'DRAFT', 'COUNTED', 'OFFERED', 'ACCEPTED', 'APPROVED', 'COMPLETED',
+      'REJECTED', 'CANCELLED'
+    )`,
+  ),
+  check('cashbox_handovers_version_nonnegative', sql`${table.version} >= 0`),
+  check('cashbox_handovers_distinct_users', sql`${table.outgoingUserId} <> ${table.incomingUserId}`),
+  check('cashbox_handovers_actor_is_outgoing', sql`${table.createdByUserId} = ${table.outgoingUserId}`),
+  check(
+    'cashbox_handovers_discrepancy_reason',
+    sql`NOT ${table.hasDiscrepancy}
+      OR (${table.reason} IS NOT NULL AND char_length(btrim(${table.reason})) > 0)`,
+  ),
+  check(
+    'cashbox_handovers_completion_time',
+    sql`(${table.state} = 'COMPLETED' AND ${table.completedAt} IS NOT NULL)
+      OR (${table.state} <> 'COMPLETED' AND ${table.completedAt} IS NULL)`,
+  ),
+]);
+
+export const cashboxHandoverMoney = pgTable('cashbox_handover_money', {
+  handoverId: uuid('handover_id').notNull(),
+  organizationId: uuid('organization_id').notNull(),
+  currency: varchar('currency', { length: 8 }).notNull(),
+  bookAmount: numeric('book_amount', { precision: 38, scale: 8 }).notNull(),
+  countedAmount: numeric('counted_amount', { precision: 38, scale: 8 }).notNull(),
+  varianceAmount: numeric('variance_amount', { precision: 38, scale: 8 }).notNull(),
+}, (table) => [
+  primaryKey({ columns: [table.handoverId, table.currency] }),
+  foreignKey({
+    columns: [table.organizationId, table.handoverId],
+    foreignColumns: [cashboxHandovers.organizationId, cashboxHandovers.id],
+    name: 'cashbox_handover_money_handover_fk',
+  }),
+  foreignKey({
+    columns: [table.organizationId, table.currency],
+    foreignColumns: [currencies.organizationId, currencies.code],
+    name: 'cashbox_handover_money_currency_fk',
+  }),
+  check(
+    'cashbox_handover_money_variance',
+    sql`${table.varianceAmount} = ${table.countedAmount} - ${table.bookAmount}`,
+  ),
+]);
+
+export const cashboxHandoverInstruments = pgTable('cashbox_handover_instruments', {
+  handoverId: uuid('handover_id').notNull().references(() => cashboxHandovers.id),
+  instrumentId: varchar('instrument_id', { length: 128 }).notNull(),
+  instrumentType: varchar('instrument_type', { length: 16 }).notNull(),
+  reference: varchar('reference', { length: 200 }).notNull(),
+  observed: boolean('observed').notNull(),
+}, (table) => [
+  primaryKey({ columns: [table.handoverId, table.instrumentId] }),
+  check(
+    'cashbox_handover_instruments_type',
+    sql`${table.instrumentType} IN ('CHEQUE', 'DOCUMENT', 'OTHER')`,
+  ),
+  check(
+    'cashbox_handover_instruments_reference',
+    sql`char_length(btrim(${table.reference})) > 0`,
+  ),
+]);

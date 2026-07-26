@@ -1,6 +1,6 @@
 # Treasury Backend
 
-NestJS modular monolith through the owner-approved `INC-1C-PARTY-DIRECTORY` increment.
+NestJS modular monolith through the owner-approved `INC-1D-CASHBOX-BASE-DATA` increment.
 The exact governed source is pinned in `canon-revision.json`.
 
 ## Runtime
@@ -49,6 +49,8 @@ locked transaction; then displays the single recovery code once.
   limits, and idempotent creation;
 - typed organization-scoped Party list/create with normalized multi-role kinds
   and idempotent creation;
+- typed, scope-filtered Cashbox list/create and counted handover initiation with
+  strong version checks, idempotency, and unchanged custody;
 - command-bound TOTP step-up for `createIdentityAccount`.
 
 There are no JWTs, generic repositories, CQRS buses, microservices, queues,

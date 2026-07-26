@@ -39,3 +39,5 @@ Use only package scripts committed by the authorized scaffold. Every
 non-trivial change must include the smallest relevant tests plus contract,
 authorization-denial, transaction, and concurrency checks required by its
 delivery packet.
+
+@RTK.md

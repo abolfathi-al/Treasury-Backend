@@ -16,6 +16,7 @@ const bootstrapPermissions = [
   'bank-type.view',
   'bank.manage',
   'bank.view',
+  'cashbox.handover',
   'cashbox.manage',
   'cashbox.view',
   'cheque-book.manage',

@@ -14,6 +14,7 @@ const titles = {
   'TRS-GEN-003': 'Permission denied',
   'TRS-GEN-004': 'Resource not found',
   'TRS-GEN-005': 'State conflict',
+  'TRS-GEN-006': 'Stale version',
   'TRS-GEN-007': 'Idempotency key conflict',
   'TRS-AUT-001': 'Authentication failed',
   'TRS-AUT-002': 'TOTP required or invalid',
@@ -29,11 +30,17 @@ const titles = {
   'TRS-MST-002': 'Duplicate master identity',
   'TRS-MST-004': 'Method configuration invalid',
   'TRS-MST-005': 'Base currency locked',
+  'TRS-CSH-002': 'Cashbox custody conflict',
 } as const;
 
 export type ProblemCode = keyof typeof titles;
 
-const retryable = new Set<ProblemCode>(['TRS-AUT-008', 'TRS-AUT-010']);
+const retryable = new Set<ProblemCode>([
+  'TRS-GEN-006',
+  'TRS-AUT-008',
+  'TRS-AUT-010',
+  'TRS-CSH-002',
+]);
 
 export class TreasuryProblem extends HttpException {
   constructor(

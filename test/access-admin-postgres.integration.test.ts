@@ -632,10 +632,6 @@ async function seedScopedAdmin(
     INSERT INTO access_grant_branch_scopes (access_grant_id, branch_id)
     VALUES ($1,$2)
   `, [grant.rows[0]!.id, fixture.branchId]);
-  await database.pool.query(`
-    INSERT INTO access_grant_cashbox_scopes (access_grant_id, cashbox_id)
-    VALUES ($1,$2)
-  `, [grant.rows[0]!.id, randomUUID()]);
   const token = `scoped-${randomUUID()}`;
   await database.pool.query(`
     INSERT INTO auth_sessions (

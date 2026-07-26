@@ -516,11 +516,12 @@ export class AccessAdminRepository {
     organizationId: string,
     scope: CanonicalGrantScope,
   ): Promise<void> {
-    if (scope.cashboxIds.length || scope.bankAccountIds.length) {
+    if (scope.bankAccountIds.length) {
       throw new ReferenceError('RESOURCE_HIDDEN');
     }
     await this.validateUuidReferences(client, 'branches', scope.branchIds, organizationId);
     await this.validateUuidReferences(client, 'treasury_units', scope.treasuryUnitIds, organizationId);
+    await this.validateUuidReferences(client, 'cashboxes', scope.cashboxIds, organizationId);
     const currencies = [...new Set([
       ...scope.currencies,
       ...(scope.amountCeiling ? [scope.amountCeiling.currency] : []),
@@ -542,7 +543,7 @@ export class AccessAdminRepository {
 
   private async validateUuidReferences(
     client: PoolClient,
-    table: 'branches' | 'treasury_units',
+    table: 'branches' | 'treasury_units' | 'cashboxes',
     ids: string[],
     organizationId: string,
   ): Promise<void> {

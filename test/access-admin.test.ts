@@ -133,14 +133,14 @@ test('organization-wide omission, validity, and exact decimal ceilings fail clos
   }), false);
 });
 
-test('cashbox scope fails closed while the Cashbox owner table is absent', () => {
-  assert.throws(
-    () => prepareGrant({
+test('cashbox scope is admitted after the Cashbox owner table is authorized', () => {
+  assert.deepEqual(
+    prepareGrant({
       userId: id(1),
       roleId: id(2),
       scope: { cashboxIds: [id(3)] },
-    }),
-    (error) => problem(error, 'TRS-GEN-004', 404),
+    }).scope.cashboxIds,
+    [id(3)],
   );
 });
 

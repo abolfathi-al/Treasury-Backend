@@ -13,6 +13,7 @@ import {
   STEP_UP_REQUIRED,
 } from '../src/access-control/auth.decorators';
 import { IdentityController } from '../src/access-control/identity.controller';
+import { CashboxController } from '../src/cashbox-and-custody/cashbox.controller';
 import { MasterDataController } from '../src/master-data/master-data.controller';
 
 const expectedOperations = [
@@ -42,15 +43,19 @@ const expectedOperations = [
   ['POST', 'v1/parties'],
   ['GET', 'v1/method-definitions'],
   ['POST', 'v1/method-definitions'],
+  ['GET', 'v1/cashboxes'],
+  ['POST', 'v1/cashboxes'],
+  ['POST', 'v1/cashboxes/:cashboxId/handovers'],
 ] as const;
 
-test('all authorized operations through INC-1C are present in owner-local controllers', async () => {
+test('all authorized operations through INC-1D are present in owner-local controllers', async () => {
   const operations = new Set<string>();
   for (const controller of [
     AuthController,
     IdentityController,
     AccessAdminController,
     MasterDataController,
+    CashboxController,
   ]) {
     const prefix = Reflect.getMetadata(PATH_METADATA, controller) as string;
     for (const name of Object.getOwnPropertyNames(controller.prototype)) {
@@ -63,6 +68,22 @@ test('all authorized operations through INC-1C are present in owner-local contro
   }
   for (const [method, path] of expectedOperations) {
     assert.ok(operations.has(`${method} ${path}`), `${method} ${path}`);
+  }
+});
+
+test('Cashbox operations use exact scoped permissions and operation IDs', () => {
+  for (const [handler, permission, operationId] of [
+    [CashboxController.prototype.list, 'cashbox.view', 'listCashboxes'],
+    [CashboxController.prototype.create, 'cashbox.manage', 'createCashbox'],
+    [
+      CashboxController.prototype.createHandover,
+      'cashbox.handover',
+      'createCashboxHandover',
+    ],
+  ] as const) {
+    assert.equal(Reflect.getMetadata(REQUIRED_PERMISSION, handler), permission);
+    assert.equal(Reflect.getMetadata(AUTHORIZATION_OPERATION, handler), operationId);
+    assert.equal(Reflect.getMetadata(PERMISSION_SCOPE_MODE, handler), 'ONE_GRANT_RESOURCE');
   }
 });
 
@@ -189,6 +210,28 @@ test('INC-1C migration and Drizzle schema normalize organization-scoped Party ki
   assert.doesNotMatch(schema, /accessGrantParty/u);
 });
 
+test('INC-1D migration and Drizzle schema constrain Cashbox custody and handover', async () => {
+  const migration = await readFile('migrations/0004_cashbox_base_data.sql', 'utf8');
+  const schema = await readFile('src/database/schema.ts', 'utf8');
+  for (const source of [migration, schema]) {
+    for (const invariant of [
+      'cashboxes',
+      'cashbox_currency_controls',
+      'cashbox_assignments',
+      'cashbox_handovers',
+      'cashbox_handover_money',
+      'cashbox_handover_instruments',
+      'cashbox_current_primary_assignment_unique',
+      'cashbox_nonterminal_handover_unique',
+      'cashboxes_main_currency_control_fk',
+    ]) assert.match(source, new RegExp(invariant, 'u'));
+  }
+  assert.match(migration, /enforce_cashbox_treasury_unit_branch/u);
+  assert.match(migration, /enforce_treasury_unit_cashbox_branches/u);
+  assert.match(migration, /variance_amount = counted_amount - book_amount/u);
+  assert.match(migration, /created_by_user_id = outgoing_user_id/u);
+});
+
 test('operator bootstrap is local-only, advisory-locked, and transactional', async () => {
   const bootstrap = await readFile('scripts/bootstrap.ts', 'utf8');
   assert.match(bootstrap, /process\.stdin\.isTTY/u);
@@ -198,4 +241,5 @@ test('operator bootstrap is local-only, advisory-locked, and transactional', asy
   assert.match(bootstrap, /await client\.query\('ROLLBACK'\)/u);
   assert.match(bootstrap, /const secondCounter = await requireTotp/u);
   assert.match(bootstrap, /totp_last_counter/u);
+  assert.match(bootstrap, /'cashbox\.handover'/u);
 });
