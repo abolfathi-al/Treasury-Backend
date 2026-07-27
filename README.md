@@ -39,8 +39,8 @@ locked transaction; then displays the single recovery code once.
 ## Implemented contract
 
 - opaque, digest-at-rest `__Host-treasury_session` sessions;
-- password login, RFC 6238 SHA-256 TOTP, current session, logout, and saved-code
-  plus current-TOTP password recovery;
+- password login, RFC 6238 SHA-256 TOTP, current session, logout, and password
+  recovery with either a saved recovery code or the connected authenticator;
 - exact-Origin and session-bound Angular XSRF double-submit checks;
 - organization, Branch, Treasury Unit, User Reference, Identity Account, and
   Currency foundation operations;

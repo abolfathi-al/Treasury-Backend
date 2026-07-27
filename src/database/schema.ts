@@ -360,6 +360,7 @@ export const totpEnrollmentChallenges = pgTable('totp_enrollment_challenges', {
   pendingSecretIv: text('pending_secret_iv'),
   pendingSecretAuthTag: text('pending_secret_auth_tag'),
   pendingSecretKeyVersion: integer('pending_secret_key_version'),
+  pendingPasswordHash: text('pending_password_hash'),
   accountVersion: integer('account_version').notNull(),
   attemptCount: integer('attempt_count').notNull().default(0),
   expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
@@ -406,6 +407,7 @@ export const totpEnrollmentChallenges = pgTable('totp_enrollment_challenges', {
       AND ${table.pendingSecretIv} IS NULL
       AND ${table.pendingSecretAuthTag} IS NULL
       AND ${table.pendingSecretKeyVersion} IS NULL
+      AND ${table.pendingPasswordHash} IS NULL
     )
   )`),
 ]);

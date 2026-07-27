@@ -130,8 +130,8 @@ test('recovery HTTP responses are explicit 200 and RFC problem responses use the
         {
           login: 'admin',
           newPassword: 'short',
+          method: 'RECOVERY_CODE',
           recoveryCode: 'saved-code',
-          totpCode: '123456',
         },
         422,
         'TRS-AUT-007',
@@ -141,8 +141,20 @@ test('recovery HTTP responses are explicit 200 and RFC problem responses use the
         {
           login: 'admin',
           newPassword: 'a sufficiently long new password',
-          recoveryCode: 'saved-code',
+          method: 'AUTHENTICATOR',
           totpCode: '12345',
+        },
+        401,
+        'TRS-AUT-006',
+      ],
+      [
+        'password-recoveries',
+        {
+          login: 'admin',
+          newPassword: 'a sufficiently long new password',
+          method: 'AUTHENTICATOR',
+          recoveryCode: 'saved-code',
+          totpCode: '123456',
         },
         401,
         'TRS-AUT-006',
@@ -167,8 +179,8 @@ test('recovery HTTP responses are explicit 200 and RFC problem responses use the
       body: JSON.stringify({
         login: 'admin',
         newPassword: 'a sufficiently long new password',
+        method: 'RECOVERY_CODE',
         recoveryCode: 'saved-code',
-        totpCode: '123456',
       }),
     });
     assert.equal(throttled.status, 429);
@@ -186,8 +198,8 @@ test('recovery HTTP responses are explicit 200 and RFC problem responses use the
       body: JSON.stringify({
         login: 'admin',
         newPassword: 'a sufficiently long new password',
+        method: 'RECOVERY_CODE',
         recoveryCode: 'saved-code',
-        totpCode: '123456',
       }),
     });
     assert.equal(success.status, 200);
@@ -252,6 +264,25 @@ test('recovery HTTP responses are explicit 200 and RFC problem responses use the
       (await invalidEnrollmentCodes.json() as { code: string }).code,
       'TRS-AUT-002',
     );
+
+    const unexpectedCompletionPassword = await fetch(
+      `${base}/v1/auth/totp-enrollment-completions`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          enrollmentId: 'a'.repeat(43),
+          firstCode: '123456',
+          secondCode: '654321',
+          newPassword: 'a password that must not be accepted here',
+        }),
+      },
+    );
+    assert.equal(unexpectedCompletionPassword.status, 401);
+    assert.equal(
+      (await unexpectedCompletionPassword.json() as { code: string }).code,
+      'TRS-AUT-002',
+    );
   } finally {
     await app.close();
   }
@@ -285,6 +316,13 @@ test('auth validation failures map only to operation-declared Canon codes', () =
       ['totpCode must match /^[0-9]{6}$/ regular expression'],
     ),
     { status: 401, code: 'TRS-AUT-006' },
+  );
+  assert.deepEqual(
+    filteredValidationProblem(
+      '/v1/auth/totp-enrollment-completions',
+      ['property newPassword should not exist'],
+    ),
+    { status: 401, code: 'TRS-AUT-002' },
   );
 });
 

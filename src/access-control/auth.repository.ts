@@ -1,4 +1,10 @@
-import { Inject, Injectable } from '@nestjs/common';
+import {
+  Inject,
+  Injectable,
+  Logger,
+  OnModuleDestroy,
+  OnModuleInit,
+} from '@nestjs/common';
 import type { PoolClient } from 'pg';
 
 import { DatabaseService } from '../database/database.service';
@@ -89,11 +95,46 @@ export interface TotpEnrollmentRow extends AccountRow {
   pending_secret_iv: string | null;
   pending_secret_auth_tag: string | null;
   pending_secret_key_version: number | null;
+  pending_password_hash: string | null;
 }
 
 @Injectable()
-export class AuthRepository {
+export class AuthRepository implements OnModuleInit, OnModuleDestroy {
+  private readonly logger = new Logger(AuthRepository.name);
+  private enrollmentCleanupTimer?: ReturnType<typeof setInterval>;
+
   constructor(@Inject(DatabaseService) private readonly database: DatabaseService) {}
+
+  onModuleInit(): void {
+    this.enrollmentCleanupTimer = setInterval(() => {
+      void this.sweepExpiredTotpEnrollments().catch((error: unknown) => {
+        this.logger.error(
+          'Failed to clear expired TOTP enrollment material',
+          error instanceof Error ? error.stack : String(error),
+        );
+      });
+    }, 30_000);
+    this.enrollmentCleanupTimer.unref();
+  }
+
+  onModuleDestroy(): void {
+    if (this.enrollmentCleanupTimer) clearInterval(this.enrollmentCleanupTimer);
+  }
+
+  async sweepExpiredTotpEnrollments(): Promise<void> {
+    await this.database.pool.query(`
+      UPDATE totp_enrollment_challenges
+      SET state = 'EXPIRED',
+          closed_at = now(),
+          updated_at = now(),
+          pending_secret_ciphertext = NULL,
+          pending_secret_iv = NULL,
+          pending_secret_auth_tag = NULL,
+          pending_secret_key_version = NULL,
+          pending_password_hash = NULL
+      WHERE state = 'OPEN' AND expires_at <= now()
+    `);
+  }
 
   transaction<T>(work: (client: PoolClient) => Promise<T>): Promise<T> {
     return this.withTransaction(work);
@@ -337,7 +378,7 @@ export class AuthRepository {
     input: {
       accountId: string;
       expectedVersion: number;
-      passwordHash: string;
+      pendingPasswordHash: string | null;
       enrollmentIdDigest: string;
       encrypted: {
         ciphertext: string;
@@ -348,11 +389,9 @@ export class AuthRepository {
       expiresAt: Date;
     },
   ): Promise<number> {
-    const updated = await client.query<{ version: number }>(`
-      UPDATE identity_accounts
-      SET password_hash = $3,
-          password_profile_version = password_profile_version + 1,
-          version = version + 1
+    const eligible = await client.query<{ version: number }>(`
+      SELECT version
+      FROM identity_accounts
       WHERE id = $1
         AND version = $2
         AND state IN ('INVITED', 'ACTIVE')
@@ -360,9 +399,8 @@ export class AuthRepository {
         AND totp_iv IS NULL
         AND totp_auth_tag IS NULL
         AND totp_key_version IS NULL
-      RETURNING version
-    `, [input.accountId, input.expectedVersion, input.passwordHash]);
-    if (!updated.rowCount) throw new RangeError('TOTP_ENROLLMENT_INELIGIBLE');
+    `, [input.accountId, input.expectedVersion]);
+    if (!eligible.rowCount) throw new RangeError('TOTP_ENROLLMENT_INELIGIBLE');
 
     await client.query(`
       UPDATE totp_enrollment_challenges
@@ -372,16 +410,17 @@ export class AuthRepository {
           pending_secret_ciphertext = NULL,
           pending_secret_iv = NULL,
           pending_secret_auth_tag = NULL,
-          pending_secret_key_version = NULL
+          pending_secret_key_version = NULL,
+          pending_password_hash = NULL
       WHERE identity_account_id = $1 AND state = 'OPEN'
     `, [input.accountId]);
     await client.query(`
       INSERT INTO totp_enrollment_challenges (
         organization_id, identity_account_id, user_ref_id, enrollment_id_digest,
         pending_secret_ciphertext, pending_secret_iv, pending_secret_auth_tag,
-        pending_secret_key_version, account_version, expires_at
+        pending_secret_key_version, pending_password_hash, account_version, expires_at
       )
-      SELECT ur.organization_id, ia.id, ia.user_ref_id, $2, $3, $4, $5, $6, $7, $8
+      SELECT ur.organization_id, ia.id, ia.user_ref_id, $2, $3, $4, $5, $6, $7, $8, $9
       FROM identity_accounts ia
       JOIN user_refs ur ON ur.id = ia.user_ref_id
       WHERE ia.id = $1
@@ -392,10 +431,11 @@ export class AuthRepository {
       input.encrypted.iv,
       input.encrypted.authTag,
       input.encrypted.keyVersion,
-      updated.rows[0]!.version,
+      input.pendingPasswordHash,
+      eligible.rows[0]!.version,
       input.expiresAt,
     ]);
-    return updated.rows[0]!.version;
+    return eligible.rows[0]!.version;
   }
 
   async findTotpEnrollmentForUpdate(
@@ -436,7 +476,8 @@ export class AuthRepository {
              e.expires_at AS enrollment_expires_at,
              e.account_version AS enrollment_account_version,
              e.pending_secret_ciphertext, e.pending_secret_iv,
-             e.pending_secret_auth_tag, e.pending_secret_key_version
+             e.pending_secret_auth_tag, e.pending_secret_key_version,
+             e.pending_password_hash
       FROM totp_enrollment_challenges e
       JOIN identity_accounts ia ON ia.id = e.identity_account_id
         AND ia.user_ref_id = e.user_ref_id
@@ -463,7 +504,8 @@ export class AuthRepository {
           pending_secret_ciphertext = NULL,
           pending_secret_iv = NULL,
           pending_secret_auth_tag = NULL,
-          pending_secret_key_version = NULL
+          pending_secret_key_version = NULL,
+          pending_password_hash = NULL
       WHERE id = $1 AND state = 'OPEN'
     `, [enrollmentRowId, state, attempts ?? null]);
   }
@@ -501,6 +543,14 @@ export class AuthRepository {
           recovery_code_hash = $8,
           recovery_version = recovery_version + 1,
           authorization_epoch = authorization_epoch + 1,
+          password_hash = CASE
+            WHEN state = 'INVITED' THEN $9::text
+            ELSE password_hash
+          END,
+          password_profile_version = CASE
+            WHEN state = 'INVITED' THEN password_profile_version + 1
+            ELSE password_profile_version
+          END,
           state = CASE WHEN state = 'INVITED' THEN 'ACTIVE' ELSE state END,
           version = version + 1
       WHERE id = $1
@@ -510,6 +560,10 @@ export class AuthRepository {
         AND totp_iv IS NULL
         AND totp_auth_tag IS NULL
         AND totp_key_version IS NULL
+        AND (
+          (state = 'INVITED' AND $9::text IS NOT NULL)
+          OR (state = 'ACTIVE' AND $9::text IS NULL)
+        )
     `, [
       enrollment.id,
       enrollment.enrollment_account_version,
@@ -519,6 +573,7 @@ export class AuthRepository {
       enrollment.pending_secret_key_version,
       counter,
       recoveryCodeHash,
+      enrollment.pending_password_hash,
     ]);
     if (!updated.rowCount) throw new RangeError('TOTP_ENROLLMENT_STALE');
 
@@ -530,7 +585,8 @@ export class AuthRepository {
           pending_secret_ciphertext = NULL,
           pending_secret_iv = NULL,
           pending_secret_auth_tag = NULL,
-          pending_secret_key_version = NULL
+          pending_secret_key_version = NULL,
+          pending_password_hash = NULL
       WHERE id = $1 AND state = 'OPEN'
     `, [enrollment.enrollment_row_id]);
     await client.query(`
@@ -966,6 +1022,18 @@ export class AuthRepository {
     `, [accountId]);
     await client.query('UPDATE auth_challenges SET consumed_at = now() WHERE identity_account_id = $1 AND consumed_at IS NULL', [accountId]);
     await client.query(`
+      UPDATE totp_enrollment_challenges
+      SET state = 'EXPIRED',
+          closed_at = now(),
+          updated_at = now(),
+          pending_secret_ciphertext = NULL,
+          pending_secret_iv = NULL,
+          pending_secret_auth_tag = NULL,
+          pending_secret_key_version = NULL,
+          pending_password_hash = NULL
+      WHERE identity_account_id = $1 AND state = 'OPEN'
+    `, [accountId]);
+    await client.query(`
       UPDATE auth_step_up_proofs p SET consumed_at = now()
       FROM auth_challenges c
       WHERE p.challenge_id = c.id AND c.identity_account_id = $1 AND p.consumed_at IS NULL
@@ -977,7 +1045,7 @@ export class AuthRepository {
     accountId: string,
     passwordHash: string,
     recoveryHash: string,
-    counter: number,
+    counter: number | null,
   ): Promise<void> {
     await client.query(`
       UPDATE identity_accounts
@@ -985,7 +1053,7 @@ export class AuthRepository {
           password_profile_version = password_profile_version + 1,
           recovery_code_hash = $3,
           recovery_version = recovery_version + 1,
-          totp_last_counter = $4,
+          totp_last_counter = COALESCE($4, totp_last_counter),
           version = version + 1
       WHERE id = $1
     `, [accountId, passwordHash, recoveryHash, counter]);

@@ -81,7 +81,7 @@ test('password recovery accepts only the current TOTP time step', async () => {
       _accountId: string,
       _passwordHash: string,
       _recoveryHash: string,
-      counter: number,
+      counter: number | null,
     ) => {
       acceptedCounter = counter;
     },
@@ -108,7 +108,7 @@ test('password recovery accepts only the current TOTP time step', async () => {
       service.recoverPassword({
         login: fixture.account.normalized_login,
         newPassword: 'safe rejected recovery password 2026',
-        recoveryCode: fixture.recoveryCode,
+        method: 'AUTHENTICATOR',
         totpCode: credentials.totp(fixture.secret, counter - 1),
       }, 'previous-totp-recovery'),
       (error) => error instanceof TreasuryProblem
@@ -117,11 +117,33 @@ test('password recovery accepts only the current TOTP time step', async () => {
     const recovered = await service.recoverPassword({
       login: fixture.account.normalized_login,
       newPassword: 'safe accepted recovery password 2026',
-      recoveryCode: fixture.recoveryCode,
+      method: 'AUTHENTICATOR',
       totpCode: credentials.totp(fixture.secret, counter),
     }, 'current-totp-recovery');
     assert.equal(recovered.outcome, 'PASSWORD_RESET');
     assert.equal(acceptedCounter, counter);
+
+    acceptedCounter = counter;
+    const savedCodeRecovered = await service.recoverPassword({
+      login: fixture.account.normalized_login,
+      newPassword: 'safe saved code recovery password 2026',
+      method: 'RECOVERY_CODE',
+      recoveryCode: fixture.recoveryCode,
+    }, 'saved-code-recovery');
+    assert.equal(savedCodeRecovered.outcome, 'PASSWORD_RESET');
+    assert.equal(acceptedCounter, null);
+
+    await assert.rejects(
+      service.recoverPassword({
+        login: fixture.account.normalized_login,
+        newPassword: 'safe ambiguous recovery password 2026',
+        method: 'AUTHENTICATOR',
+        totpCode: credentials.totp(fixture.secret, counter),
+        recoveryCode: fixture.recoveryCode,
+      }, 'ambiguous-recovery'),
+      (error) => error instanceof TreasuryProblem
+        && (error.getResponse() as { code?: string }).code === 'TRS-AUT-006',
+    );
   } finally {
     Date.now = originalNow;
   }
@@ -236,7 +258,7 @@ test('non-ACTIVE UserRef is rejected throughout pre-session authentication', asy
     service.recoverPassword({
       login: fixture.account.normalized_login,
       newPassword: 'safe suspended recovery password 2026',
-      recoveryCode: fixture.recoveryCode,
+      method: 'AUTHENTICATOR',
       totpCode: credentials.totp(fixture.secret, counter),
     }, 'suspended-recovery'),
     (error) => error instanceof TreasuryProblem

@@ -254,7 +254,14 @@ export class AuthService {
     otpauthUri: string;
     expiresAt: string;
   }> {
-    if (typeof dto.newPassword !== 'string') {
+    if (
+      dto.newPassword !== undefined
+      && (
+        typeof dto.newPassword !== 'string'
+        || [...dto.newPassword].length < 15
+        || [...dto.newPassword].length > 128
+      )
+    ) {
       throw new TreasuryProblem('TRS-AUT-007', 422);
     }
     if (
@@ -269,8 +276,10 @@ export class AuthService {
     }
     const normalizedLogin = this.credentials.normalizeLogin(dto.login);
     const currentPassword = dto.currentOrTemporaryPassword.normalize('NFC');
-    const newPassword = this.credentials.validatePassword(dto.newPassword, [normalizedLogin]);
-    if (newPassword === currentPassword) {
+    const newPassword = dto.newPassword === undefined
+      ? undefined
+      : this.credentials.validatePassword(dto.newPassword, [normalizedLogin]);
+    if (newPassword !== undefined && newPassword === currentPassword) {
       throw new TreasuryProblem('TRS-AUT-007', 422, 'The new password must differ from the current password.');
     }
     const bucket = this.throttleBucket(`password:${normalizedLogin}`);
@@ -294,8 +303,14 @@ export class AuthService {
       if (retryAfter > 0) throw this.throttled(retryAfter);
       throw new TreasuryProblem('TRS-AUT-001', 401);
     }
+    if (!this.enrollmentPasswordModeValid(account, newPassword)) {
+      await this.releasePasswordAttempt(bucket, reservation);
+      throw new TreasuryProblem('TRS-AUT-007', 422);
+    }
 
-    const passwordHash = await this.credentials.hashPassword(newPassword);
+    const pendingPasswordHash = newPassword === undefined
+      ? null
+      : await this.credentials.hashPassword(newPassword);
     const secret = this.credentials.generateTotpSecret();
     const key = this.credentials.currentTotpKey();
     const encrypted = this.credentials.encryptTotpSecret(secret, key.key, key.version);
@@ -313,10 +328,13 @@ export class AuthService {
         ) {
           throw new RangeError('TOTP_ENROLLMENT_INELIGIBLE');
         }
+        if (!this.enrollmentPasswordModeValid(locked, newPassword)) {
+          throw new RangeError('TOTP_ENROLLMENT_PASSWORD_MODE');
+        }
         await this.repository.startTotpEnrollment(client, {
           accountId: locked.id,
           expectedVersion: locked.version,
-          passwordHash,
+          pendingPasswordHash,
           enrollmentIdDigest: this.credentials.enrollmentIdDigest(enrollmentId),
           encrypted,
           expiresAt,
@@ -335,6 +353,9 @@ export class AuthService {
       await this.releasePasswordAttempt(bucket, reservation);
       if (error instanceof RangeError && error.message === 'TOTP_ENROLLMENT_INELIGIBLE') {
         throw new TreasuryProblem('TRS-AUT-001', 401);
+      }
+      if (error instanceof RangeError && error.message === 'TOTP_ENROLLMENT_PASSWORD_MODE') {
+        throw new TreasuryProblem('TRS-AUT-007', 422);
       }
       throw error;
     }
@@ -355,6 +376,9 @@ export class AuthService {
     dto: TotpEnrollmentCompleteDto,
     requestId: string,
   ): Promise<{ outcome: 'TOTP_ENROLLED'; recoveryCode: string }> {
+    if ('newPassword' in dto) {
+      throw new TreasuryProblem('TRS-AUT-002', 401);
+    }
     if (
       typeof dto.enrollmentId !== 'string'
       || !/^[A-Za-z0-9_-]{43}$/u.test(dto.enrollmentId)
@@ -398,6 +422,11 @@ export class AuthService {
         || !enrollment.pending_secret_iv
         || !enrollment.pending_secret_auth_tag
         || !enrollment.pending_secret_key_version
+        || (
+          enrollment.state === 'INVITED'
+            ? !enrollment.pending_password_hash
+            : enrollment.pending_password_hash !== null
+        )
       ) {
         if (enrollment.enrollment_state === 'OPEN') {
           await this.repository.closeTotpEnrollment(client, enrollment.enrollment_row_id, 'EXPIRED');
@@ -466,11 +495,29 @@ export class AuthService {
       typeof dto.login !== 'string'
       || dto.login.length < 1
       || dto.login.length > 254
-      || typeof dto.recoveryCode !== 'string'
-      || dto.recoveryCode.length < 1
-      || dto.recoveryCode.length > 256
-      || typeof dto.totpCode !== 'string'
-      || !/^[0-9]{6}$/u.test(dto.totpCode)
+      || !['AUTHENTICATOR', 'RECOVERY_CODE'].includes(dto.method)
+    ) {
+      throw new TreasuryProblem('TRS-AUT-006', 401);
+    }
+    const authenticatorRecovery = dto.method === 'AUTHENTICATOR';
+    if (
+      (
+        authenticatorRecovery
+        && (
+          typeof dto.totpCode !== 'string'
+          || !/^[0-9]{6}$/u.test(dto.totpCode)
+          || dto.recoveryCode !== undefined
+        )
+      )
+      || (
+        !authenticatorRecovery
+        && (
+          typeof dto.recoveryCode !== 'string'
+          || dto.recoveryCode.length < 1
+          || dto.recoveryCode.length > 256
+          || dto.totpCode !== undefined
+        )
+      )
     ) {
       throw new TreasuryProblem('TRS-AUT-006', 401);
     }
@@ -484,29 +531,34 @@ export class AuthService {
       | { failure: 'INVALID_RECOVERY' }
     >(async (client) => {
       const account = await this.repository.findAccountByLogin(normalizedLogin, client, true);
-      const recoveryValid = await this.credentials.verifyRecoveryCode(
-        account?.recovery_code_hash ?? await this.dummyRecoveryHash,
-        dto.recoveryCode,
-      );
-      const now = Date.now();
-      const currentCounter = Math.floor(now / 30_000);
-      const lastAcceptedCounter = account?.totp_last_counter === null
-        || account?.totp_last_counter === undefined
-        ? null
-        : Number(account.totp_last_counter);
-      const totpCounter = this.credentials.verifyTotp(
-        account && this.hasTotp(account) ? this.decryptTotp(account) : this.dummyTotpSecret,
-        dto.totpCode,
-        Math.max(currentCounter - 1, lastAcceptedCounter ?? currentCounter - 1),
-        now,
-      );
+      let proofValid: boolean;
+      let totpCounter: number | null = null;
+      if (authenticatorRecovery) {
+        const now = Date.now();
+        const currentCounter = Math.floor(now / 30_000);
+        const lastAcceptedCounter = account?.totp_last_counter === null
+          || account?.totp_last_counter === undefined
+          ? null
+          : Number(account.totp_last_counter);
+        totpCounter = this.credentials.verifyTotp(
+          account && this.hasTotp(account) ? this.decryptTotp(account) : this.dummyTotpSecret,
+          dto.totpCode!,
+          Math.max(currentCounter - 1, lastAcceptedCounter ?? currentCounter - 1),
+          now,
+        );
+        proofValid = totpCounter !== null;
+      } else {
+        proofValid = await this.credentials.verifyRecoveryCode(
+          account?.recovery_code_hash ?? await this.dummyRecoveryHash,
+          dto.recoveryCode!,
+        );
+      }
 
       if (
         !account
         || account.state !== 'ACTIVE'
         || account.user_ref_state !== 'ACTIVE'
-        || !recoveryValid
-        || totpCounter === null
+        || !proofValid
       ) {
         return { failure: 'INVALID_RECOVERY' };
       }
@@ -528,7 +580,10 @@ export class AuthService {
         requestId,
         eventType: 'AUTH_PASSWORD_RECOVERED',
         outcome: 'SUCCEEDED',
-        details: { recoveryVersionIncremented: true },
+        details: {
+          recoveryMethod: dto.method,
+          recoveryVersionIncremented: true,
+        },
       });
       return { outcome: 'PASSWORD_RESET', replacementRecoveryCode };
     });
@@ -756,6 +811,15 @@ export class AuthService {
       && !account.totp_iv
       && !account.totp_auth_tag
       && !account.totp_key_version;
+  }
+
+  private enrollmentPasswordModeValid(
+    account: AccountRow,
+    newPassword: string | undefined,
+  ): boolean {
+    return account.state === 'INVITED'
+      ? newPassword !== undefined
+      : account.state === 'ACTIVE' && newPassword === undefined;
   }
 
   private decryptTotp(account: AccountRow): Buffer {

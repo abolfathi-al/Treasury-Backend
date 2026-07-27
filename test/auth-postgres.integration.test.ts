@@ -188,7 +188,7 @@ test('PostgreSQL pre-session proofs reject a SUSPENDED UserRef consistently', {
       service.recoverPassword({
         login: 'admin',
         newPassword: 'safe suspended recovery password 2026',
-        recoveryCode: fixture.recoveryCode,
+        method: 'AUTHENTICATOR',
         totpCode: credentials.totp(fixture.secret, Math.floor(Date.now() / 30_000)),
       }, 'suspended-recovery'),
       (error) => error instanceof TreasuryProblem
@@ -199,7 +199,7 @@ test('PostgreSQL pre-session proofs reject a SUSPENDED UserRef consistently', {
   }
 });
 
-test('PostgreSQL password+TOTP session and saved-code recovery are replay-safe and atomic', {
+test('PostgreSQL password+TOTP session and authenticator recovery are replay-safe and atomic', {
   skip: connectionString ? false : 'TEST_DATABASE_URL is not configured',
 }, async () => {
   process.env.DATABASE_URL = connectionString;
@@ -276,7 +276,7 @@ test('PostgreSQL password+TOTP session and saved-code recovery are replay-safe a
     const recovered = await service.recoverPassword({
       login: 'admin',
       newPassword: 'a different safe recovery password 2026',
-      recoveryCode: fixture.recoveryCode,
+      method: 'AUTHENTICATOR',
       totpCode: credentials.totp(fixture.secret, previousCounter + 1),
     }, 'request-recovery');
     assert.equal(recovered.outcome, 'PASSWORD_RESET');
@@ -290,7 +290,7 @@ test('PostgreSQL password+TOTP session and saved-code recovery are replay-safe a
       service.recoverPassword({
         login: 'admin',
         newPassword: 'yet another safe recovery password 2026',
-        recoveryCode: fixture.recoveryCode,
+        method: 'AUTHENTICATOR',
         totpCode: credentials.totp(fixture.secret, previousCounter + 1),
       }, 'request-replay'),
       (error) => error instanceof TreasuryProblem && error.getStatus() === 401,
@@ -320,8 +320,8 @@ test('PostgreSQL password+TOTP session and saved-code recovery are replay-safe a
         service.recoverPassword({
           login: 'missing-account',
           newPassword: 'safe unknown recovery password 2026',
+          method: 'RECOVERY_CODE',
           recoveryCode: 'unknown-code',
-          totpCode: '000000',
         }, `unknown-recovery-${attempt}`),
         (error) => error instanceof TreasuryProblem
           && error.getStatus() === (attempt === 5 ? 429 : 401),
@@ -359,6 +359,81 @@ test('PostgreSQL password+TOTP session and saved-code recovery are replay-safe a
         },
       );
     }
+  } finally {
+    await database.onModuleDestroy();
+  }
+});
+
+test('saved recovery code rotates itself without advancing the TOTP counter', {
+  skip: connectionString ? false : 'TEST_DATABASE_URL is not configured',
+}, async () => {
+  process.env.DATABASE_URL = connectionString;
+  process.env.LOGIN_THROTTLE_HMAC_KEY_BASE64 = Buffer.alloc(32, 11).toString('base64');
+  process.env.COMMAND_DIGEST_HMAC_KEY_BASE64 = Buffer.alloc(32, 12).toString('base64');
+  process.env.TOTP_ENCRYPTION_KEY_BASE64 = Buffer.alloc(32, 13).toString('base64');
+  process.env.TOTP_KEY_VERSION = '1';
+  const database = new DatabaseService();
+  const credentials = new CredentialService();
+  const service = new AuthService(new AuthRepository(database), credentials);
+  const replacementPassword = 'saved code recovery password 2026';
+  try {
+    const fixture = await seedAccount(database, credentials);
+    await database.pool.query(
+      'UPDATE identity_accounts SET totp_last_counter = $2 WHERE id = $1',
+      [fixture.accountId, 424_242],
+    );
+
+    const recovered = await service.recoverPassword({
+      login: 'admin',
+      newPassword: replacementPassword,
+      method: 'RECOVERY_CODE',
+      recoveryCode: fixture.recoveryCode,
+    }, 'saved-code-only-recovery');
+    assert.equal(recovered.outcome, 'PASSWORD_RESET');
+    assert.notEqual(recovered.replacementRecoveryCode, fixture.recoveryCode);
+
+    const state = await database.pool.query<{
+      password_hash: string;
+      recovery_code_hash: string;
+      recovery_version: number;
+      totp_last_counter: string;
+    }>(`
+      SELECT password_hash, recovery_code_hash, recovery_version,
+             totp_last_counter::text
+      FROM identity_accounts
+      WHERE id = $1
+    `, [fixture.accountId]);
+    assert.equal(state.rows[0]!.totp_last_counter, '424242');
+    assert.equal(state.rows[0]!.recovery_version, 2);
+    assert.equal(
+      await credentials.verifyPassword(state.rows[0]!.password_hash, replacementPassword),
+      true,
+    );
+    assert.equal(
+      await credentials.verifyRecoveryCode(
+        state.rows[0]!.recovery_code_hash,
+        recovered.replacementRecoveryCode,
+      ),
+      true,
+    );
+    assert.equal(
+      await credentials.verifyRecoveryCode(
+        state.rows[0]!.recovery_code_hash,
+        fixture.recoveryCode,
+      ),
+      false,
+    );
+
+    await assert.rejects(
+      service.recoverPassword({
+        login: 'admin',
+        newPassword: 'another saved code recovery password 2026',
+        method: 'RECOVERY_CODE',
+        recoveryCode: fixture.recoveryCode,
+      }, 'saved-code-replay'),
+      (error) => error instanceof TreasuryProblem
+        && (error.getResponse() as { code?: string }).code === 'TRS-AUT-006',
+    );
   } finally {
     await database.onModuleDestroy();
   }
@@ -549,15 +624,107 @@ test('recovery admission rejects synchronized attempts 6+ before either proof ch
       Array.from({ length: 7 }, (_, index) => service.recoverPassword({
         login: 'unknown-account',
         newPassword: 'safe synchronized recovery password 2026',
+        method: 'RECOVERY_CODE',
         recoveryCode: `unknown-${index}`,
-        totpCode: '000000',
       }, `synchronized-recovery-${index}`)),
     );
     assert.equal(recoveryProofCalls, 5);
-    assert.equal(totpProofCalls, 5);
+    assert.equal(totpProofCalls, 0);
     assert.ok(attempts.every((result) => (
       result.status === 'rejected' && result.reason instanceof TreasuryProblem
     )));
+  } finally {
+    await database.onModuleDestroy();
+  }
+});
+
+test('password recovery closes enrollment challenges and clears pending secrets', {
+  skip: connectionString ? false : 'TEST_DATABASE_URL is not configured',
+}, async () => {
+  process.env.DATABASE_URL = connectionString;
+  process.env.LOGIN_THROTTLE_HMAC_KEY_BASE64 = Buffer.alloc(32, 1).toString('base64');
+  process.env.COMMAND_DIGEST_HMAC_KEY_BASE64 = Buffer.alloc(32, 3).toString('base64');
+  process.env.TOTP_ENCRYPTION_KEY_BASE64 = Buffer.alloc(32, 2).toString('base64');
+  const database = new DatabaseService();
+  const repository = new AuthRepository(database);
+  try {
+    const fixture = await seedAccount(database, new CredentialService());
+    await database.pool.query(`
+      INSERT INTO totp_enrollment_challenges (
+        organization_id, identity_account_id, user_ref_id, enrollment_id_digest,
+        pending_secret_ciphertext, pending_secret_iv, pending_secret_auth_tag,
+        pending_secret_key_version, pending_password_hash, account_version, expires_at
+      )
+      SELECT ur.organization_id, ia.id, ia.user_ref_id, repeat('a', 64),
+             'ciphertext', 'iv', 'auth-tag', 1, 'pending-password', ia.version,
+             now() + interval '5 minutes'
+      FROM identity_accounts ia
+      JOIN user_refs ur ON ur.id = ia.user_ref_id
+      WHERE ia.id = $1
+    `, [fixture.accountId]);
+
+    await repository.transaction((client) =>
+      repository.revokeAllAccountSecrets(client, fixture.accountId),
+    );
+
+    const challenge = await database.pool.query<{
+      state: string;
+      closed_at: Date | null;
+      pending_secret_ciphertext: string | null;
+      pending_password_hash: string | null;
+    }>(`
+      SELECT state, closed_at, pending_secret_ciphertext, pending_password_hash
+      FROM totp_enrollment_challenges
+      WHERE identity_account_id = $1
+    `, [fixture.accountId]);
+    assert.equal(challenge.rows[0]!.state, 'EXPIRED');
+    assert.ok(challenge.rows[0]!.closed_at);
+    assert.equal(challenge.rows[0]!.pending_secret_ciphertext, null);
+    assert.equal(challenge.rows[0]!.pending_password_hash, null);
+  } finally {
+    await database.onModuleDestroy();
+  }
+});
+
+test('expired enrollment cleanup clears abandoned pending material', {
+  skip: connectionString ? false : 'TEST_DATABASE_URL is not configured',
+}, async () => {
+  process.env.DATABASE_URL = connectionString;
+  process.env.TOTP_ENCRYPTION_KEY_BASE64 = Buffer.alloc(32, 2).toString('base64');
+  const database = new DatabaseService();
+  const repository = new AuthRepository(database);
+  try {
+    const fixture = await seedAccount(database, new CredentialService());
+    await database.pool.query(`
+      INSERT INTO totp_enrollment_challenges (
+        organization_id, identity_account_id, user_ref_id, enrollment_id_digest,
+        pending_secret_ciphertext, pending_secret_iv, pending_secret_auth_tag,
+        pending_secret_key_version, pending_password_hash, account_version,
+        expires_at, created_at, updated_at
+      )
+      SELECT ur.organization_id, ia.id, ia.user_ref_id, repeat('b', 64),
+             'ciphertext', 'iv', 'auth-tag', 1, 'pending-password', ia.version,
+             now() - interval '1 minute', now() - interval '6 minutes',
+             now() - interval '6 minutes'
+      FROM identity_accounts ia
+      JOIN user_refs ur ON ur.id = ia.user_ref_id
+      WHERE ia.id = $1
+    `, [fixture.accountId]);
+
+    await repository.sweepExpiredTotpEnrollments();
+
+    const challenge = await database.pool.query<{
+      state: string;
+      pending_secret_ciphertext: string | null;
+      pending_password_hash: string | null;
+    }>(`
+      SELECT state, pending_secret_ciphertext, pending_password_hash
+      FROM totp_enrollment_challenges
+      WHERE identity_account_id = $1
+    `, [fixture.accountId]);
+    assert.equal(challenge.rows[0]!.state, 'EXPIRED');
+    assert.equal(challenge.rows[0]!.pending_secret_ciphertext, null);
+    assert.equal(challenge.rows[0]!.pending_password_hash, null);
   } finally {
     await database.onModuleDestroy();
   }
@@ -590,7 +757,7 @@ test('concurrent TOTP verification and recovery share identity-first lock order 
       service.recoverPassword({
         login: 'admin',
         newPassword: 'deadlock safe replacement password 2026',
-        recoveryCode: fixture.recoveryCode,
+        method: 'AUTHENTICATOR',
         totpCode: credentials.totp(fixture.secret, counter),
       }, 'deadlock-recovery'),
     ]);

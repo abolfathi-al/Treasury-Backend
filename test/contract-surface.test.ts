@@ -264,6 +264,21 @@ test('Auth hardening migration and Drizzle schema reject partial TOTP secret tup
   assert.match(schema, /table\.totpKeyVersion/u);
 });
 
+test('TOTP enrollment stores an INVITED password verifier only in the pending challenge', async () => {
+  const migration = await readFile(
+    'migrations/0010_auth_recovery_enrollment_methods.sql',
+    'utf8',
+  );
+  const schema = await readFile('src/database/schema.ts', 'utf8');
+  const repository = await readFile('src/access-control/auth.repository.ts', 'utf8');
+  assert.match(migration, /ADD COLUMN pending_password_hash text/u);
+  assert.match(migration, /WHERE state = 'OPEN'/u);
+  assert.match(migration, /pending_password_hash = NULL/u);
+  assert.match(schema, /pendingPasswordHash: text\('pending_password_hash'\)/u);
+  assert.match(repository, /WHEN state = 'INVITED' THEN \$9::text/u);
+  assert.match(repository, /enrollment\.pending_password_hash/u);
+});
+
 test('Drizzle structure mirrors migration-level singleton, composite, mapping, and session invariants', async () => {
   await import('../src/database/schema');
   const schema = await readFile('src/database/schema.ts', 'utf8');

@@ -69,6 +69,15 @@ test('TOTP enrollment start and completion use one-time encrypted material and c
   assert.ok(pending);
   assert.notEqual(pending.enrollmentIdDigest, started.enrollmentId);
   assert.notEqual(pending.encrypted.ciphertext, started.secret);
+  assert.equal(account.version, 0);
+  assert.ok(pending.pendingPasswordHash);
+  assert.equal(
+    await credentials.verifyPassword(
+      pending.pendingPasswordHash,
+      'a distinct safe replacement phrase 2026',
+    ),
+    true,
+  );
 
   const secret = credentials.decryptTotpSecret(
     pending.encrypted,
@@ -78,18 +87,20 @@ test('TOTP enrollment start and completion use one-time encrypted material and c
   const counter = Math.floor(fixedNow / 30_000);
   const enrollment: TotpEnrollmentRow = {
     ...account,
-    version: 1,
+    version: 0,
     enrollment_row_id: '00000000-0000-4000-8000-000000000004',
     enrollment_state: 'OPEN',
     enrollment_attempt_count: 0,
     enrollment_expires_at: new Date(fixedNow + 5 * 60_000),
-    enrollment_account_version: 1,
+    enrollment_account_version: 0,
     pending_secret_ciphertext: pending.encrypted.ciphertext,
     pending_secret_iv: pending.encrypted.iv,
     pending_secret_auth_tag: pending.encrypted.authTag,
     pending_secret_key_version: pending.encrypted.keyVersion,
+    pending_password_hash: pending.pendingPasswordHash,
   };
   let acceptedCounter: number | undefined;
+  let acceptedEnrollment: TotpEnrollmentRow | undefined;
   const completionRepository = {
     transaction: async (work: (client: never) => Promise<unknown>) => work({} as never),
     findTotpEnrollmentForUpdate: async (enrollmentIdDigest: string) => {
@@ -101,6 +112,7 @@ test('TOTP enrollment start and completion use one-time encrypted material and c
       _enrollment: TotpEnrollmentRow,
       value: number,
     ) => {
+      acceptedEnrollment = _enrollment;
       acceptedCounter = value;
     },
   } as unknown as AuthRepository;
@@ -115,7 +127,61 @@ test('TOTP enrollment start and completion use one-time encrypted material and c
   });
   assert.equal(completed.outcome, 'TOTP_ENROLLED');
   assert.equal(acceptedCounter, counter);
+  assert.equal(acceptedEnrollment?.pending_password_hash, pending.pendingPasswordHash);
   assert.ok(completed.recoveryCode.length > 0);
+});
+
+test('ACTIVE TOTP enrollment omits password material', async () => {
+  process.env.LOGIN_THROTTLE_HMAC_KEY_BASE64 = Buffer.alloc(32, 53).toString('base64');
+  process.env.TOTP_ENCRYPTION_KEY_BASE64 = Buffer.alloc(32, 54).toString('base64');
+  process.env.TOTP_KEY_VERSION = '1';
+  const credentials = new CredentialService();
+  const password = 'safe active enrollment password 2026';
+  const account: AccountRow = {
+    id: '00000000-0000-4000-8000-000000000021',
+    user_ref_id: '00000000-0000-4000-8000-000000000022',
+    organization_id: '00000000-0000-4000-8000-000000000023',
+    organization_code: 'TEST',
+    display_name: 'Active Enrollment User',
+    user_ref_state: 'ACTIVE',
+    normalized_login: 'active.enrollment.user',
+    password_hash: await credentials.hashPassword(password),
+    password_profile_version: 1,
+    totp_ciphertext: null,
+    totp_iv: null,
+    totp_auth_tag: null,
+    totp_key_version: null,
+    totp_last_counter: null,
+    recovery_code_hash: null,
+    authorization_epoch: '0',
+    privileged: false,
+    state: 'ACTIVE',
+    version: 0,
+    permissions: [],
+  };
+  let pending: Parameters<AuthRepository['startTotpEnrollment']>[1] | undefined;
+  const repository = {
+    transaction: async (work: (client: never) => Promise<unknown>) => work({} as never),
+    lockAuthBucket: async () => undefined,
+    findThrottle: async () => null,
+    setThrottle: async () => undefined,
+    discardStalePasswordReservations: async () => undefined,
+    activePasswordReservations: async () => ({ count: 0, earliestExpiresAt: null }),
+    createPasswordReservation: async () => undefined,
+    findAccountByLogin: async () => account,
+    startTotpEnrollment: async (_client: unknown, input: typeof pending) => {
+      pending = input;
+      return 0;
+    },
+    clearThrottle: async () => undefined,
+    audit: async () => undefined,
+  } as unknown as AuthRepository;
+  await new AuthService(repository, credentials).startTotpEnrollment({
+    login: account.normalized_login,
+    currentOrTemporaryPassword: password,
+  }, 'active-enrollment-start');
+  assert.ok(pending);
+  assert.equal(pending.pendingPasswordHash, null);
 });
 
 test('invalid completion proof is rejected before recovery-code hashing', async () => {

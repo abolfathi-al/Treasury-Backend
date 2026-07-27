@@ -1,4 +1,5 @@
 import {
+  IsIn,
   IsOptional,
   IsString,
   Length,
@@ -46,13 +47,18 @@ export class PasswordRecoveryDto {
   @MaxLength(128)
   newPassword!: string;
 
+  @IsIn(['AUTHENTICATOR', 'RECOVERY_CODE'])
+  method!: 'AUTHENTICATOR' | 'RECOVERY_CODE';
+
+  @IsOptional()
   @IsString()
   @Length(1, 256)
-  recoveryCode!: string;
+  recoveryCode?: string;
 
+  @IsOptional()
   @IsString()
   @Matches(/^[0-9]{6}$/u)
-  totpCode!: string;
+  totpCode?: string;
 }
 
 export class TotpEnrollmentStartDto {
@@ -66,10 +72,11 @@ export class TotpEnrollmentStartDto {
   @MaxLength(128)
   currentOrTemporaryPassword!: string;
 
+  @IsOptional()
   @IsString()
   @MinLength(15)
   @MaxLength(128)
-  newPassword!: string;
+  newPassword?: string;
 }
 
 export class TotpEnrollmentCompleteDto {

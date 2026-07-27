@@ -10,7 +10,7 @@ import { DatabaseService } from '../src/database/database.service';
 
 const connectionString = process.env.TEST_DATABASE_URL;
 
-test('PostgreSQL TOTP enrollment is atomic and closes a concurrent stale login', {
+test('PostgreSQL ACTIVE TOTP enrollment preserves password and revokes prior auth material', {
   skip: connectionString ? false : 'TEST_DATABASE_URL is not configured',
 }, async () => {
   process.env.DATABASE_URL = connectionString;
@@ -23,10 +23,18 @@ test('PostgreSQL TOTP enrollment is atomic and closes a concurrent stale login',
   const credentials = new CredentialService();
   const service = new AuthService(new AuthRepository(database), credentials);
   const currentPassword = 'safe active enrollment password 2026';
-  const newPassword = 'D9!Cobalt-River-Mango-Quartz-742';
 
   try {
     const accountId = await seedNonEnrolledAccount(database, credentials, currentPassword);
+    const accountBefore = await database.pool.query<{
+      password_hash: string;
+      password_profile_version: number;
+      version: number;
+    }>(`
+      SELECT password_hash, password_profile_version, version
+      FROM identity_accounts
+      WHERE id = $1
+    `, [accountId]);
     const existingSession = await service.login({
       login: 'enrollment.admin',
       password: currentPassword,
@@ -54,7 +62,6 @@ test('PostgreSQL TOTP enrollment is atomic and closes a concurrent stale login',
     const started = await service.startTotpEnrollment({
       login: ' Enrollment.Admin ',
       currentOrTemporaryPassword: currentPassword,
-      newPassword,
     }, 'enrollment-start');
 
     const pending = await database.pool.query<{
@@ -64,9 +71,11 @@ test('PostgreSQL TOTP enrollment is atomic and closes a concurrent stale login',
       pending_secret_iv: string;
       pending_secret_auth_tag: string;
       pending_secret_key_version: number;
+      pending_password_hash: string | null;
     }>(`
       SELECT enrollment_id_digest, account_version, pending_secret_ciphertext,
-             pending_secret_iv, pending_secret_auth_tag, pending_secret_key_version
+             pending_secret_iv, pending_secret_auth_tag, pending_secret_key_version,
+             pending_password_hash
       FROM totp_enrollment_challenges
       WHERE identity_account_id = $1 AND state = 'OPEN'
     `, [accountId]);
@@ -75,7 +84,18 @@ test('PostgreSQL TOTP enrollment is atomic and closes a concurrent stale login',
       pending.rows[0]!.enrollment_id_digest,
       credentials.enrollmentIdDigest(started.enrollmentId),
     );
-    assert.equal(pending.rows[0]!.account_version, 1);
+    assert.equal(pending.rows[0]!.account_version, 0);
+    assert.equal(pending.rows[0]!.pending_password_hash, null);
+    const accountAfterStart = await database.pool.query<{
+      password_hash: string;
+      password_profile_version: number;
+      version: number;
+    }>(`
+      SELECT password_hash, password_profile_version, version
+      FROM identity_accounts
+      WHERE id = $1
+    `, [accountId]);
+    assert.deepEqual(accountAfterStart.rows[0], accountBefore.rows[0]);
     const secret = credentials.decryptTotpSecret({
       ciphertext: pending.rows[0]!.pending_secret_ciphertext,
       iv: pending.rows[0]!.pending_secret_iv,
@@ -84,45 +104,18 @@ test('PostgreSQL TOTP enrollment is atomic and closes a concurrent stale login',
     }, credentials.runtimeTotpKey(pending.rows[0]!.pending_secret_key_version));
     assert.equal(credentials.base32(secret), started.secret);
 
-    const originalVerifyPassword = credentials.verifyPassword.bind(credentials);
-    let releaseLogin!: () => void;
-    let loginVerified!: () => void;
-    const loginMayContinue = new Promise<void>((resolve) => {
-      releaseLogin = resolve;
-    });
-    const passwordVerified = new Promise<void>((resolve) => {
-      loginVerified = resolve;
-    });
-    credentials.verifyPassword = async (hash, password) => {
-      const valid = await originalVerifyPassword(hash, password);
-      if (password === newPassword) {
-        loginVerified();
-        await loginMayContinue;
-      }
-      return valid;
-    };
-    const staleLogin = service.login({
-      login: 'enrollment.admin',
-      password: newPassword,
-    }, 'concurrent-login');
-    await passwordVerified;
-
     const counter = Math.floor(Date.now() / 30_000);
     const completed = await service.completeTotpEnrollment({
       enrollmentId: started.enrollmentId,
       firstCode: credentials.totp(secret, counter - 1),
       secondCode: credentials.totp(secret, counter),
     }, 'enrollment-complete');
-    releaseLogin();
-    await assert.rejects(
-      staleLogin,
-      (error) => error instanceof TreasuryProblem
-        && (error.getResponse() as { code?: string }).code === 'TRS-AUT-001',
-    );
 
     const state = await database.pool.query<{
       state: string;
       version: number;
+      password_hash: string;
+      password_profile_version: number;
       recovery_version: number;
       authorization_epoch: string;
       totp_ciphertext: string | null;
@@ -132,8 +125,10 @@ test('PostgreSQL TOTP enrollment is atomic and closes a concurrent stale login',
       open_proofs: string;
       enrollment_state: string;
       pending_secret_ciphertext: string | null;
+      pending_password_hash: string | null;
     }>(`
-      SELECT ia.state, ia.version, ia.recovery_version, ia.authorization_epoch,
+      SELECT ia.state, ia.version, ia.password_hash, ia.password_profile_version,
+             ia.recovery_version, ia.authorization_epoch,
              ia.totp_ciphertext, ia.recovery_code_hash,
              (SELECT count(*) FROM auth_sessions s
               WHERE s.identity_account_id = ia.id AND s.revoked_at IS NULL
@@ -144,15 +139,18 @@ test('PostgreSQL TOTP enrollment is atomic and closes a concurrent stale login',
               WHERE c.identity_account_id = ia.id AND c.consumed_at IS NULL)::text AS open_challenges,
              (SELECT count(*) FROM auth_step_up_proofs p
               JOIN auth_challenges c ON c.id = p.challenge_id
-              WHERE c.identity_account_id = ia.id AND p.consumed_at IS NULL)::text AS open_proofs,
+             WHERE c.identity_account_id = ia.id AND p.consumed_at IS NULL)::text AS open_proofs,
              e.state AS enrollment_state,
-             e.pending_secret_ciphertext
+             e.pending_secret_ciphertext,
+             e.pending_password_hash
       FROM identity_accounts ia
       JOIN totp_enrollment_challenges e ON e.identity_account_id = ia.id
       WHERE ia.id = $1
     `, [accountId]);
     assert.equal(state.rows[0]!.state, 'ACTIVE');
-    assert.equal(state.rows[0]!.version, 2);
+    assert.equal(state.rows[0]!.version, 1);
+    assert.equal(state.rows[0]!.password_hash, accountBefore.rows[0]!.password_hash);
+    assert.equal(state.rows[0]!.password_profile_version, 1);
     assert.equal(state.rows[0]!.recovery_version, 2);
     assert.equal(state.rows[0]!.authorization_epoch, '1');
     assert.ok(state.rows[0]!.totp_ciphertext);
@@ -169,6 +167,13 @@ test('PostgreSQL TOTP enrollment is atomic and closes a concurrent stale login',
     assert.equal(state.rows[0]!.open_proofs, '0');
     assert.equal(state.rows[0]!.enrollment_state, 'CONSUMED');
     assert.equal(state.rows[0]!.pending_secret_ciphertext, null);
+    assert.equal(state.rows[0]!.pending_password_hash, null);
+
+    const relogin = await service.login({
+      login: 'enrollment.admin',
+      password: currentPassword,
+    }, 'post-enrollment-login');
+    assert.equal(relogin.status, 202);
 
     await assert.rejects(
       service.completeTotpEnrollment({
@@ -184,10 +189,126 @@ test('PostgreSQL TOTP enrollment is atomic and closes a concurrent stale login',
   }
 });
 
+test('PostgreSQL INVITED TOTP enrollment defers password activation until completion', {
+  skip: connectionString ? false : 'TEST_DATABASE_URL is not configured',
+}, async () => {
+  process.env.DATABASE_URL = connectionString;
+  process.env.LOGIN_THROTTLE_HMAC_KEY_BASE64 = Buffer.alloc(32, 64).toString('base64');
+  process.env.COMMAND_DIGEST_HMAC_KEY_BASE64 = Buffer.alloc(32, 65).toString('base64');
+  process.env.TOTP_ENCRYPTION_KEY_BASE64 = Buffer.alloc(32, 66).toString('base64');
+  process.env.TOTP_KEY_VERSION = '1';
+
+  const database = new DatabaseService();
+  const credentials = new CredentialService();
+  const service = new AuthService(new AuthRepository(database), credentials);
+  const temporaryPassword = 'safe invited temporary password 2026';
+  const newPassword = 'D9!Cobalt-River-Mango-Quartz-742';
+
+  try {
+    const accountId = await seedNonEnrolledAccount(
+      database,
+      credentials,
+      temporaryPassword,
+      'INVITED',
+    );
+    const before = await database.pool.query<{
+      password_hash: string;
+      password_profile_version: number;
+      version: number;
+      state: string;
+    }>(`
+      SELECT password_hash, password_profile_version, version, state
+      FROM identity_accounts
+      WHERE id = $1
+    `, [accountId]);
+
+    const started = await service.startTotpEnrollment({
+      login: 'enrollment.admin',
+      currentOrTemporaryPassword: temporaryPassword,
+      newPassword,
+    }, 'invited-enrollment-start');
+    const pending = await database.pool.query<{
+      account_version: number;
+      pending_secret_ciphertext: string;
+      pending_secret_iv: string;
+      pending_secret_auth_tag: string;
+      pending_secret_key_version: number;
+      pending_password_hash: string;
+    }>(`
+      SELECT account_version, pending_secret_ciphertext, pending_secret_iv,
+             pending_secret_auth_tag, pending_secret_key_version, pending_password_hash
+      FROM totp_enrollment_challenges
+      WHERE identity_account_id = $1 AND state = 'OPEN'
+    `, [accountId]);
+    assert.equal(pending.rowCount, 1);
+    assert.equal(pending.rows[0]!.account_version, 0);
+    assert.equal(await credentials.verifyPassword(
+      pending.rows[0]!.pending_password_hash,
+      newPassword,
+    ), true);
+
+    const afterStart = await database.pool.query<{
+      password_hash: string;
+      password_profile_version: number;
+      version: number;
+      state: string;
+    }>(`
+      SELECT password_hash, password_profile_version, version, state
+      FROM identity_accounts
+      WHERE id = $1
+    `, [accountId]);
+    assert.deepEqual(afterStart.rows[0], before.rows[0]);
+
+    const secret = credentials.decryptTotpSecret({
+      ciphertext: pending.rows[0]!.pending_secret_ciphertext,
+      iv: pending.rows[0]!.pending_secret_iv,
+      authTag: pending.rows[0]!.pending_secret_auth_tag,
+      keyVersion: pending.rows[0]!.pending_secret_key_version,
+    }, credentials.runtimeTotpKey(pending.rows[0]!.pending_secret_key_version));
+    const counter = Math.floor(Date.now() / 30_000);
+    await service.completeTotpEnrollment({
+      enrollmentId: started.enrollmentId,
+      firstCode: credentials.totp(secret, counter - 1),
+      secondCode: credentials.totp(secret, counter),
+    }, 'invited-enrollment-complete');
+
+    const completed = await database.pool.query<{
+      password_hash: string;
+      password_profile_version: number;
+      version: number;
+      state: string;
+      pending_password_hash: string | null;
+      enrollment_state: string;
+    }>(`
+      SELECT ia.password_hash, ia.password_profile_version, ia.version, ia.state,
+             e.pending_password_hash, e.state AS enrollment_state
+      FROM identity_accounts ia
+      JOIN totp_enrollment_challenges e ON e.identity_account_id = ia.id
+      WHERE ia.id = $1
+    `, [accountId]);
+    assert.equal(completed.rows[0]!.state, 'ACTIVE');
+    assert.equal(completed.rows[0]!.version, 1);
+    assert.equal(completed.rows[0]!.password_profile_version, 2);
+    assert.equal(
+      await credentials.verifyPassword(completed.rows[0]!.password_hash, newPassword),
+      true,
+    );
+    assert.equal(
+      await credentials.verifyPassword(completed.rows[0]!.password_hash, temporaryPassword),
+      false,
+    );
+    assert.equal(completed.rows[0]!.pending_password_hash, null);
+    assert.equal(completed.rows[0]!.enrollment_state, 'CONSUMED');
+  } finally {
+    await database.onModuleDestroy();
+  }
+});
+
 async function seedNonEnrolledAccount(
   database: DatabaseService,
   credentials: CredentialService,
   password: string,
+  state: 'INVITED' | 'ACTIVE' = 'ACTIVE',
 ): Promise<string> {
   const client = await database.pool.connect();
   try {
@@ -209,9 +330,9 @@ async function seedNonEnrolledAccount(
     const account = await client.query<{ id: string }>(`
       INSERT INTO identity_accounts (
         user_ref_id, normalized_login, password_hash, state, privileged
-      ) VALUES ($1, 'enrollment.admin', $2, 'ACTIVE', false)
+      ) VALUES ($1, 'enrollment.admin', $2, $3, false)
       RETURNING id
-    `, [user.rows[0]!.id, await credentials.hashPassword(password)]);
+    `, [user.rows[0]!.id, await credentials.hashPassword(password), state]);
     await client.query('COMMIT');
     return account.rows[0]!.id;
   } catch (error) {
