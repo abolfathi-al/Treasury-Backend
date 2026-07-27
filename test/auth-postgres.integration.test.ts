@@ -10,6 +10,195 @@ import { digest } from '../src/common/http';
 
 const connectionString = process.env.TEST_DATABASE_URL;
 
+test('PostgreSQL rejects partial persisted TOTP secret tuples', {
+  skip: connectionString ? false : 'TEST_DATABASE_URL is not configured',
+}, async () => {
+  process.env.DATABASE_URL = connectionString;
+  process.env.LOGIN_THROTTLE_HMAC_KEY_BASE64 = Buffer.alloc(32, 1).toString('base64');
+  process.env.COMMAND_DIGEST_HMAC_KEY_BASE64 = Buffer.alloc(32, 3).toString('base64');
+  process.env.TOTP_ENCRYPTION_KEY_BASE64 = Buffer.alloc(32, 2).toString('base64');
+  const database = new DatabaseService();
+  const credentials = new CredentialService();
+  try {
+    const fixture = await seedAccount(database, credentials);
+    await assert.rejects(
+      database.pool.query(
+        'UPDATE identity_accounts SET totp_iv = NULL WHERE id = $1',
+        [fixture.accountId],
+      ),
+      (error) => (
+        (error as { code?: string }).code === '23514'
+        && (error as { constraint?: string }).constraint
+          === 'identity_accounts_totp_secret_tuple_check'
+      ),
+    );
+  } finally {
+    await database.onModuleDestroy();
+  }
+});
+
+test('PostgreSQL session touch atomically rejects stale proof and invalid auth state', {
+  skip: connectionString ? false : 'TEST_DATABASE_URL is not configured',
+}, async () => {
+  process.env.DATABASE_URL = connectionString;
+  process.env.LOGIN_THROTTLE_HMAC_KEY_BASE64 = Buffer.alloc(32, 1).toString('base64');
+  process.env.COMMAND_DIGEST_HMAC_KEY_BASE64 = Buffer.alloc(32, 3).toString('base64');
+  process.env.TOTP_ENCRYPTION_KEY_BASE64 = Buffer.alloc(32, 2).toString('base64');
+  const database = new DatabaseService();
+  const credentials = new CredentialService();
+  const repository = new AuthRepository(database);
+  try {
+    const fixture = await seedAccount(database, credentials);
+    const tokenDigest = digest('atomic-touch-proof');
+    const sessionId = await repository.transaction((client) => repository.createSession(client, {
+      accountId: fixture.accountId,
+      tokenDigest,
+      xsrfDigest: digest('atomic-touch-xsrf'),
+      assurance: 'PASSWORD_TOTP',
+      now: new Date(),
+    }));
+
+    assert.equal(
+      await repository.touchSession(sessionId, sessionId, tokenDigest, new Date()),
+      true,
+      'valid current proof must touch the active session',
+    );
+    assert.equal(
+      await repository.touchSession(
+        sessionId,
+        '00000000-0000-4000-8000-000000000999',
+        tokenDigest,
+        new Date(),
+      ),
+      false,
+      'a stale presented session id must fail',
+    );
+    assert.equal(
+      await repository.touchSession(sessionId, sessionId, digest('wrong-proof'), new Date()),
+      false,
+      'a stale presented token digest must fail',
+    );
+
+    await database.pool.query(`
+      UPDATE auth_sessions
+      SET idle_expires_at = now() - interval '1 second'
+      WHERE id = $1
+    `, [sessionId]);
+    assert.equal(
+      await repository.touchSession(sessionId, sessionId, tokenDigest, new Date()),
+      false,
+      'an expired session must fail',
+    );
+    await database.pool.query(`
+      UPDATE auth_sessions
+      SET idle_expires_at = now() + interval '15 minutes',
+          absolute_expires_at = now() + interval '8 hours'
+      WHERE id = $1
+    `, [sessionId]);
+
+    await database.pool.query(
+      `UPDATE identity_accounts SET state = 'SUSPENDED' WHERE id = $1`,
+      [fixture.accountId],
+    );
+    assert.equal(
+      await repository.touchSession(sessionId, sessionId, tokenDigest, new Date()),
+      false,
+      'a non-ACTIVE identity account must fail',
+    );
+    await database.pool.query(
+      `UPDATE identity_accounts SET state = 'ACTIVE' WHERE id = $1`,
+      [fixture.accountId],
+    );
+
+    await database.pool.query(`
+      UPDATE user_refs ur
+      SET state = 'SUSPENDED'
+      FROM identity_accounts ia
+      WHERE ia.user_ref_id = ur.id AND ia.id = $1
+    `, [fixture.accountId]);
+    assert.equal(
+      await repository.touchSession(sessionId, sessionId, tokenDigest, new Date()),
+      false,
+      'a non-ACTIVE UserRef must fail',
+    );
+    await database.pool.query(`
+      UPDATE user_refs ur
+      SET state = 'ACTIVE'
+      FROM identity_accounts ia
+      WHERE ia.user_ref_id = ur.id AND ia.id = $1
+    `, [fixture.accountId]);
+
+    await database.pool.query(`
+      UPDATE auth_sessions
+      SET state = 'REVOKED', revoked_at = now()
+      WHERE id = $1
+    `, [sessionId]);
+    assert.equal(
+      await repository.touchSession(sessionId, sessionId, tokenDigest, new Date()),
+      false,
+      'a revoked session must fail',
+    );
+  } finally {
+    await database.onModuleDestroy();
+  }
+});
+
+test('PostgreSQL pre-session proofs reject a SUSPENDED UserRef consistently', {
+  skip: connectionString ? false : 'TEST_DATABASE_URL is not configured',
+}, async () => {
+  process.env.DATABASE_URL = connectionString;
+  process.env.LOGIN_THROTTLE_HMAC_KEY_BASE64 = Buffer.alloc(32, 1).toString('base64');
+  process.env.COMMAND_DIGEST_HMAC_KEY_BASE64 = Buffer.alloc(32, 3).toString('base64');
+  process.env.TOTP_ENCRYPTION_KEY_BASE64 = Buffer.alloc(32, 2).toString('base64');
+  const database = new DatabaseService();
+  const credentials = new CredentialService();
+  const service = new AuthService(new AuthRepository(database), credentials);
+  try {
+    const fixture = await seedAccount(database, credentials);
+    const login = await service.login({
+      login: 'admin',
+      password: fixture.password,
+    }, 'active-login-before-suspension');
+    assert.equal(login.status, 202);
+    if (login.status !== 202) throw new Error('Expected TOTP challenge');
+    await database.pool.query(`
+      UPDATE user_refs ur
+      SET state = 'SUSPENDED'
+      FROM identity_accounts ia
+      WHERE ia.user_ref_id = ur.id AND ia.id = $1
+    `, [fixture.accountId]);
+
+    await assert.rejects(
+      service.verifyTotp({
+        challengeId: login.body.challengeId,
+        code: credentials.totp(fixture.secret, Math.floor(Date.now() / 30_000)),
+      }, 'suspended-challenge'),
+      (error) => error instanceof TreasuryProblem
+        && (error.getResponse() as { code?: string }).code === 'TRS-AUT-005',
+    );
+    await assert.rejects(
+      service.login({
+        login: 'admin',
+        password: fixture.password,
+      }, 'suspended-login'),
+      (error) => error instanceof TreasuryProblem
+        && (error.getResponse() as { code?: string }).code === 'TRS-AUT-001',
+    );
+    await assert.rejects(
+      service.recoverPassword({
+        login: 'admin',
+        newPassword: 'safe suspended recovery password 2026',
+        recoveryCode: fixture.recoveryCode,
+        totpCode: credentials.totp(fixture.secret, Math.floor(Date.now() / 30_000)),
+      }, 'suspended-recovery'),
+      (error) => error instanceof TreasuryProblem
+        && (error.getResponse() as { code?: string }).code === 'TRS-AUT-006',
+    );
+  } finally {
+    await database.onModuleDestroy();
+  }
+});
+
 test('PostgreSQL password+TOTP session and saved-code recovery are replay-safe and atomic', {
   skip: connectionString ? false : 'TEST_DATABASE_URL is not configured',
 }, async () => {

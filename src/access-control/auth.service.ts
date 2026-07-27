@@ -99,7 +99,12 @@ export class AuthService {
       await this.releasePasswordAttempt(bucket, reservation);
       throw error;
     }
-    if (!account || !passwordValid || account.state !== 'ACTIVE') {
+    if (
+      !account
+      || !passwordValid
+      || account.state !== 'ACTIVE'
+      || account.user_ref_state !== 'ACTIVE'
+    ) {
       const retryAfter = await this.finalizePasswordFailure(bucket, reservation);
       await this.auditFailure(account, requestId, account ? 'INVALID_OR_UNAVAILABLE' : 'UNKNOWN_LOGIN');
       if (retryAfter > 0) throw this.throttled(retryAfter);
@@ -115,6 +120,7 @@ export class AuthService {
           || locked.version !== account.version
           || locked.password_hash !== account.password_hash
           || locked.state !== 'ACTIVE'
+          || locked.user_ref_state !== 'ACTIVE'
         ) {
           throw new RangeError('LOGIN_STALE');
         }
@@ -129,7 +135,7 @@ export class AuthService {
             await this.credentials.hashPassword(dto.password.normalize('NFC')),
           );
         }
-        if (locked.privileged || locked.totp_ciphertext) {
+        if (locked.privileged || this.hasAnyTotp(locked)) {
           if (!this.hasTotp(locked)) throw new TreasuryProblem('TRS-AUT-002', 401);
           const challengeId = opaqueToken();
           const expiresAt = new Date(Date.now() + 5 * 60_000);
@@ -167,6 +173,16 @@ export class AuthService {
   }
 
   async verifyTotp(dto: TotpProofDto, requestId: string): Promise<TotpResult> {
+    if (
+      typeof dto.challengeId !== 'string'
+      || dto.challengeId.length < 1
+      || dto.challengeId.length > 128
+    ) {
+      throw new TreasuryProblem('TRS-AUT-005', 401);
+    }
+    if (typeof dto.code !== 'string' || !/^[0-9]{6}$/u.test(dto.code)) {
+      throw new TreasuryProblem('TRS-AUT-002', 401);
+    }
     const result = await this.repository.transaction<TotpResult | {
       failure: 'INVALID_TOTP';
       attempts: number;
@@ -443,6 +459,21 @@ export class AuthService {
     dto: PasswordRecoveryDto,
     requestId: string,
   ): Promise<{ outcome: 'PASSWORD_RESET'; replacementRecoveryCode: string }> {
+    if (typeof dto.newPassword !== 'string') {
+      throw new TreasuryProblem('TRS-AUT-007', 422);
+    }
+    if (
+      typeof dto.login !== 'string'
+      || dto.login.length < 1
+      || dto.login.length > 254
+      || typeof dto.recoveryCode !== 'string'
+      || dto.recoveryCode.length < 1
+      || dto.recoveryCode.length > 256
+      || typeof dto.totpCode !== 'string'
+      || !/^[0-9]{6}$/u.test(dto.totpCode)
+    ) {
+      throw new TreasuryProblem('TRS-AUT-006', 401);
+    }
     const normalizedLogin = this.credentials.normalizeLogin(dto.login);
     const password = this.credentials.validatePassword(dto.newPassword, [normalizedLogin]);
     const bucket = this.throttleBucket(`recovery:${normalizedLogin}`);
@@ -457,15 +488,26 @@ export class AuthService {
         account?.recovery_code_hash ?? await this.dummyRecoveryHash,
         dto.recoveryCode,
       );
+      const now = Date.now();
+      const currentCounter = Math.floor(now / 30_000);
+      const lastAcceptedCounter = account?.totp_last_counter === null
+        || account?.totp_last_counter === undefined
+        ? null
+        : Number(account.totp_last_counter);
       const totpCounter = this.credentials.verifyTotp(
         account && this.hasTotp(account) ? this.decryptTotp(account) : this.dummyTotpSecret,
         dto.totpCode,
-        account?.totp_last_counter === null || account?.totp_last_counter === undefined
-          ? null
-          : Number(account.totp_last_counter),
+        Math.max(currentCounter - 1, lastAcceptedCounter ?? currentCounter - 1),
+        now,
       );
 
-      if (!account || account.state !== 'ACTIVE' || !recoveryValid || totpCounter === null) {
+      if (
+        !account
+        || account.state !== 'ACTIVE'
+        || account.user_ref_state !== 'ACTIVE'
+        || !recoveryValid
+        || totpCounter === null
+      ) {
         return { failure: 'INVALID_RECOVERY' };
       }
 
@@ -500,13 +542,25 @@ export class AuthService {
   }
 
   async authenticateSession(rawToken: string): Promise<SessionContext> {
-    const tokenDigest = digest(rawToken);
+    return this.authenticateSessionDigest(digest(rawToken), true);
+  }
+
+  private async authenticateSessionDigest(
+    tokenDigest: string,
+    allowCasRetry: boolean,
+  ): Promise<SessionContext> {
     const row = await this.repository.findSession(tokenDigest);
     if (!row) throw new TreasuryProblem('TRS-AUT-003', 401);
     const now = new Date();
-    const context = this.sessionContext(row, tokenDigest);
     if (!row.matched_current) {
-      await this.repository.touchSession(row.id, now);
+      const touched = await this.repository.touchSession(
+        row.id,
+        row.presented_id,
+        tokenDigest,
+        now,
+      );
+      if (!touched) return this.retrySessionAfterCasFailure(tokenDigest, allowCasRetry);
+      const context = this.sessionContext(row, tokenDigest);
       context.session.idleExpiresAt = new Date(
         Math.min(now.getTime() + 15 * 60_000, row.absolute_expires_at.getTime()),
       ).toISOString();
@@ -525,18 +579,24 @@ export class AuthService {
         digest(xsrfToken),
         now,
       );
-      if (rotated) {
-        context.physicalSessionId = rotated;
-        context.rotatedSessionToken = nextToken;
-        context.refreshedXsrfToken = xsrfToken;
-        context.session.idleExpiresAt = new Date(
-          Math.min(now.getTime() + 15 * 60_000, row.absolute_expires_at.getTime()),
-        ).toISOString();
-      }
+      if (!rotated) return this.retrySessionAfterCasFailure(tokenDigest, allowCasRetry);
+      const context = this.sessionContext(row, tokenDigest);
+      context.physicalSessionId = rotated;
+      context.rotatedSessionToken = nextToken;
+      context.refreshedXsrfToken = xsrfToken;
+      context.session.idleExpiresAt = new Date(
+        Math.min(now.getTime() + 15 * 60_000, row.absolute_expires_at.getTime()),
+      ).toISOString();
       return context;
     }
-    await this.repository.touchSession(row.id, now);
-    return context;
+    const touched = await this.repository.touchSession(
+      row.id,
+      row.presented_id,
+      tokenDigest,
+      now,
+    );
+    if (!touched) return this.retrySessionAfterCasFailure(tokenDigest, allowCasRetry);
+    return this.sessionContext(row, tokenDigest);
   }
 
   async refreshXsrf(context: SessionContext): Promise<string | null> {
@@ -680,8 +740,18 @@ export class AuthService {
     return Boolean(account.totp_ciphertext && account.totp_iv && account.totp_auth_tag && account.totp_key_version);
   }
 
+  private hasAnyTotp(account: AccountRow): boolean {
+    return Boolean(
+      account.totp_ciphertext
+      || account.totp_iv
+      || account.totp_auth_tag
+      || account.totp_key_version,
+    );
+  }
+
   private enrollmentEligible(account: AccountRow): boolean {
     return ['INVITED', 'ACTIVE'].includes(account.state)
+      && account.user_ref_state === 'ACTIVE'
       && !account.totp_ciphertext
       && !account.totp_iv
       && !account.totp_auth_tag
@@ -700,9 +770,20 @@ export class AuthService {
 
   private challengeUsable(challenge: ChallengeRow): boolean {
     return challenge.state === 'ACTIVE'
+      && challenge.user_ref_state === 'ACTIVE'
       && challenge.challenge_consumed_at === null
       && challenge.challenge_attempts < 5
       && challenge.challenge_expires_at.getTime() > Date.now();
+  }
+
+  private retrySessionAfterCasFailure(
+    tokenDigest: string,
+    allowCasRetry: boolean,
+  ): Promise<SessionContext> {
+    if (!allowCasRetry) {
+      throw new TreasuryProblem('TRS-AUT-003', 401);
+    }
+    return this.authenticateSessionDigest(tokenDigest, false);
   }
 
   private throttleBucket(subject: string): string {

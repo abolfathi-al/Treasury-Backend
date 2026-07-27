@@ -132,6 +132,21 @@ export const identityAccounts = pgTable('identity_accounts', {
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
 }, (table) => [
   unique().on(table.id, table.userRefId),
+  check('identity_accounts_totp_secret_tuple_check', sql`(
+    (
+      ${table.totpCiphertext} IS NULL
+      AND ${table.totpIv} IS NULL
+      AND ${table.totpAuthTag} IS NULL
+      AND ${table.totpKeyVersion} IS NULL
+    )
+    OR
+    (
+      ${table.totpCiphertext} IS NOT NULL
+      AND ${table.totpIv} IS NOT NULL
+      AND ${table.totpAuthTag} IS NOT NULL
+      AND ${table.totpKeyVersion} IS NOT NULL
+    )
+  )`),
 ]);
 
 export const roles = pgTable('roles', {

@@ -57,7 +57,12 @@ export class AuthGuard implements CanActivate {
     const response = context.switchToHttp().getResponse<Response>();
     const cookies = parseCookies(request.header('cookie'));
     const sessionToken = cookies[SESSION_COOKIE];
-    if (!sessionToken) throw new TreasuryProblem('TRS-GEN-002', 401);
+    if (!sessionToken) {
+      throw new TreasuryProblem(
+        request.path === '/v1/auth/sessions/current' ? 'TRS-AUT-003' : 'TRS-GEN-002',
+        401,
+      );
+    }
     const auth = await this.authService.authenticateSession(sessionToken);
     request.auth = auth;
     if (auth.rotatedSessionToken && auth.refreshedXsrfToken) {

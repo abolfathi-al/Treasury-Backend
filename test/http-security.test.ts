@@ -1,9 +1,13 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { ValidationPipe } from '@nestjs/common';
+import {
+  ArgumentsHost,
+  BadRequestException,
+  ValidationPipe,
+} from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 
-import type { Response } from 'express';
+import type { Request, Response } from 'express';
 
 import {
   clearSessionCookies,
@@ -17,7 +21,10 @@ import {
 import { csrfValid } from '../src/access-control/auth.guard';
 import { AppModule } from '../src/app.module';
 import { AuthService } from '../src/access-control/auth.service';
-import { TreasuryProblem } from '../src/common/problem';
+import {
+  ProblemFilter,
+  TreasuryProblem,
+} from '../src/common/problem';
 
 function fakeResponse(): { response: Response; cookies: string[] } {
   const cookies: string[] = [];
@@ -67,10 +74,6 @@ test('recovery HTTP responses are explicit 200 and RFC problem responses use the
     forbidNonWhitelisted: true,
   }));
   const service = app.get(AuthService);
-  service.recoverPassword = async () => ({
-    outcome: 'PASSWORD_RESET',
-    replacementRecoveryCode: 'replacement',
-  });
   try {
     await app.listen(0, '127.0.0.1');
   } catch (error) {
@@ -89,16 +92,71 @@ test('recovery HTTP responses are explicit 200 and RFC problem responses use the
       headers: { 'Content-Type': 'application/json' },
       body: '{',
     });
-    assert.equal(invalid.status, 422);
+    assert.equal(invalid.status, 401);
     assert.match(invalid.headers.get('content-type') ?? '', /^application\/problem\+json/u);
     assert.equal(invalid.headers.get('cache-control'), 'no-store');
+    assert.equal(
+      (await invalid.json() as { code: string }).code,
+      'TRS-AUT-006',
+    );
 
     const malformedCookie = await fetch(`${base}/v1/auth/sessions/current`, {
       headers: { Cookie: '__Host-treasury_session=%ZZ', 'X-Request-Id': 'x'.repeat(129) },
     });
     assert.equal(malformedCookie.status, 401);
     assert.match(malformedCookie.headers.get('content-type') ?? '', /^application\/problem\+json/u);
-    assert.match(String((await malformedCookie.json() as { requestId: string }).requestId), /^[0-9a-f-]{36}$/u);
+    const malformedCookieBody = await malformedCookie.json() as {
+      code: string;
+      requestId: string;
+    };
+    assert.equal(malformedCookieBody.code, 'TRS-AUT-003');
+    assert.match(String(malformedCookieBody.requestId), /^[0-9a-f-]{36}$/u);
+
+    for (const [path, body, expectedStatus, expectedCode] of [
+      [
+        'totp-verifications',
+        { challengeId: '', code: '123456' },
+        401,
+        'TRS-AUT-005',
+      ],
+      [
+        'totp-verifications',
+        { challengeId: 'challenge', code: '12345' },
+        401,
+        'TRS-AUT-002',
+      ],
+      [
+        'password-recoveries',
+        {
+          login: 'admin',
+          newPassword: 'short',
+          recoveryCode: 'saved-code',
+          totpCode: '123456',
+        },
+        422,
+        'TRS-AUT-007',
+      ],
+      [
+        'password-recoveries',
+        {
+          login: 'admin',
+          newPassword: 'a sufficiently long new password',
+          recoveryCode: 'saved-code',
+          totpCode: '12345',
+        },
+        401,
+        'TRS-AUT-006',
+      ],
+    ] as const) {
+      const response = await fetch(`${base}/v1/auth/${path}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const responseBody = await response.json() as { code?: string };
+      assert.equal(response.status, expectedStatus, JSON.stringify(responseBody));
+      assert.equal(responseBody.code, expectedCode);
+    }
 
     service.recoverPassword = async () => {
       throw new TreasuryProblem('TRS-AUT-008', 429, undefined, { retryAfter: 17 });
@@ -199,6 +257,37 @@ test('recovery HTTP responses are explicit 200 and RFC problem responses use the
   }
 });
 
+test('auth validation failures map only to operation-declared Canon codes', () => {
+  assert.deepEqual(
+    filteredValidationProblem(
+      '/v1/auth/totp-verifications',
+      ['challengeId must be longer than or equal to 1 characters'],
+    ),
+    { status: 401, code: 'TRS-AUT-005' },
+  );
+  assert.deepEqual(
+    filteredValidationProblem(
+      '/v1/auth/totp-verifications',
+      ['code must match /^[0-9]{6}$/ regular expression'],
+    ),
+    { status: 401, code: 'TRS-AUT-002' },
+  );
+  assert.deepEqual(
+    filteredValidationProblem(
+      '/v1/auth/password-recoveries',
+      ['newPassword must be longer than or equal to 15 characters'],
+    ),
+    { status: 422, code: 'TRS-AUT-007' },
+  );
+  assert.deepEqual(
+    filteredValidationProblem(
+      '/v1/auth/password-recoveries',
+      ['totpCode must match /^[0-9]{6}$/ regular expression'],
+    ),
+    { status: 401, code: 'TRS-AUT-006' },
+  );
+});
+
 test('CSRF requires exact Origin and a cookie/header proof bound to the session', () => {
   const proofDigest = digest('proof');
   assert.equal(
@@ -214,3 +303,41 @@ test('CSRF requires exact Origin and a cookie/header proof bound to the session'
     false,
   );
 });
+
+function filteredValidationProblem(
+  path: string,
+  messages: string[],
+): { status: number; code: string } {
+  let status = 0;
+  let body: { code?: string } = {};
+  const response = {
+    setHeader: () => undefined,
+    status(value: number) {
+      status = value;
+      return this;
+    },
+    type() {
+      return this;
+    },
+    send(value: { code?: string }) {
+      body = value;
+      return this;
+    },
+  } as unknown as Response;
+  const request = {
+    method: 'POST',
+    path,
+    header: () => undefined,
+  } as unknown as Request;
+  const host = {
+    switchToHttp: () => ({
+      getRequest: () => request,
+      getResponse: () => response,
+    }),
+  } as unknown as ArgumentsHost;
+  new ProblemFilter().catch(
+    new BadRequestException({ message: messages }),
+    host,
+  );
+  return { status, code: body.code ?? '' };
+}

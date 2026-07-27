@@ -9,6 +9,7 @@ export interface AccountRow {
   organization_id: string;
   organization_code: string;
   display_name: string;
+  user_ref_state: string;
   normalized_login: string;
   password_hash: string;
   password_profile_version: number;
@@ -125,10 +126,17 @@ export class AuthRepository {
         SELECT id FROM identity_accounts WHERE normalized_login = $1 FOR UPDATE
       `, [normalizedLogin]);
       if (!locked.rowCount) return null;
+      await executor.query(`
+        SELECT ur.id
+        FROM identity_accounts ia
+        JOIN user_refs ur ON ur.id = ia.user_ref_id
+        WHERE ia.id = $1
+        FOR UPDATE OF ur
+      `, [locked.rows[0]!.id]);
     }
     const result = await executor.query<AccountRow>(`
       SELECT ia.id, ia.user_ref_id, ur.organization_id, o.code AS organization_code,
-             ur.display_name,
+             ur.display_name, ur.state AS user_ref_state,
              ia.normalized_login, ia.password_hash, ia.password_profile_version,
              ia.totp_ciphertext, ia.totp_iv, ia.totp_auth_tag, ia.totp_key_version,
              ia.totp_last_counter, ia.recovery_code_hash, ia.authorization_epoch,
@@ -404,13 +412,21 @@ export class AuthRepository {
       located.rows[0]!.identity_account_id,
     ]);
     await client.query(`
+      SELECT ur.id
+      FROM identity_accounts ia
+      JOIN user_refs ur ON ur.id = ia.user_ref_id
+      WHERE ia.id = $1
+      FOR UPDATE OF ur
+    `, [located.rows[0]!.identity_account_id]);
+    await client.query(`
       SELECT id FROM totp_enrollment_challenges
       WHERE enrollment_id_digest = $1
       FOR UPDATE
     `, [enrollmentIdDigest]);
     const result = await client.query<TotpEnrollmentRow>(`
       SELECT ia.id, ia.user_ref_id, ur.organization_id, o.code AS organization_code,
-             ur.display_name, ia.normalized_login, ia.password_hash,
+             ur.display_name, ur.state AS user_ref_state,
+             ia.normalized_login, ia.password_hash,
              ia.password_profile_version, ia.totp_ciphertext, ia.totp_iv,
              ia.totp_auth_tag, ia.totp_key_version, ia.totp_last_counter,
              ia.recovery_code_hash, ia.authorization_epoch, ia.privileged,
@@ -594,10 +610,17 @@ export class AuthRepository {
     await client.query('SELECT id FROM identity_accounts WHERE id = $1 FOR UPDATE', [
       located.rows[0].identity_account_id,
     ]);
+    await client.query(`
+      SELECT ur.id
+      FROM identity_accounts ia
+      JOIN user_refs ur ON ur.id = ia.user_ref_id
+      WHERE ia.id = $1
+      FOR UPDATE OF ur
+    `, [located.rows[0].identity_account_id]);
     await client.query('SELECT id FROM auth_challenges WHERE token_digest = $1 FOR UPDATE', [tokenDigest]);
     const result = await client.query<ChallengeRow>(`
       SELECT ia.id, ia.user_ref_id, ur.organization_id, o.code AS organization_code,
-             ur.display_name,
+             ur.display_name, ur.state AS user_ref_state,
              ia.normalized_login, ia.password_hash, ia.password_profile_version,
              ia.totp_ciphertext, ia.totp_iv, ia.totp_auth_tag, ia.totp_key_version,
              ia.totp_last_counter, ia.recovery_code_hash, ia.authorization_epoch,
@@ -775,7 +798,12 @@ export class AuthRepository {
       const current = await client.query<SessionRow>(`
         SELECT s.*, ia.authorization_epoch AS account_authorization_epoch
         FROM auth_sessions s
-        JOIN identity_accounts ia ON ia.id = s.identity_account_id
+        JOIN identity_accounts ia
+          ON ia.id = s.identity_account_id
+         AND ia.state = 'ACTIVE'
+        JOIN user_refs ur
+          ON ur.id = ia.user_ref_id
+         AND ur.state = 'ACTIVE'
         WHERE s.id = $1
           AND s.token_digest = $2
           AND s.state = 'ACTIVE'
@@ -786,7 +814,7 @@ export class AuthRepository {
             SELECT 1 FROM auth_sessions successor
             WHERE successor.rotation_parent_id = s.id
           )
-        FOR UPDATE OF s, ia
+        FOR UPDATE OF s, ia, ur
       `, [sessionId, currentDigest, now]);
       if (!current.rowCount) return null;
       const row = current.rows[0]!;
@@ -823,12 +851,59 @@ export class AuthRepository {
     });
   }
 
-  async touchSession(sessionId: string, now: Date): Promise<boolean> {
+  async touchSession(
+    sessionId: string,
+    presentedSessionId: string,
+    presentedTokenDigest: string,
+    now: Date,
+  ): Promise<boolean> {
     const result = await this.database.pool.query(`
       UPDATE auth_sessions
-      SET last_seen_at = $2, idle_expires_at = LEAST($3, absolute_expires_at)
-      WHERE id = $1 AND state = 'ACTIVE' AND revoked_at IS NULL
-    `, [sessionId, now, new Date(now.getTime() + 15 * 60_000)]);
+      SET last_seen_at = $4, idle_expires_at = LEAST($5, absolute_expires_at)
+      WHERE id = $1
+        AND state = 'ACTIVE'
+        AND revoked_at IS NULL
+        AND idle_expires_at > $4
+        AND absolute_expires_at > $4
+        AND EXISTS (
+          SELECT 1
+          FROM identity_accounts ia
+          JOIN user_refs ur ON ur.id = ia.user_ref_id
+          WHERE ia.id = auth_sessions.identity_account_id
+            AND ia.state = 'ACTIVE'
+            AND ur.state = 'ACTIVE'
+        )
+        AND EXISTS (
+          SELECT 1
+          FROM auth_sessions presented
+          WHERE presented.id = $2
+            AND presented.logical_session_id = auth_sessions.logical_session_id
+            AND presented.revoked_at IS NULL
+            AND presented.absolute_expires_at > $4
+            AND (
+              (
+                presented.token_digest = $3
+                AND (
+                  (presented.state = 'ACTIVE' AND presented.idle_expires_at > $4)
+                  OR (
+                    presented.state = 'ROTATED'
+                    AND presented.predecessor_valid_until > $4
+                  )
+                )
+              )
+              OR (
+                presented.previous_token_digest = $3
+                AND presented.previous_valid_until > $4
+              )
+            )
+        )
+    `, [
+      sessionId,
+      presentedSessionId,
+      presentedTokenDigest,
+      now,
+      new Date(now.getTime() + 15 * 60_000),
+    ]);
     return result.rowCount === 1;
   }
 

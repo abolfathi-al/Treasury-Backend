@@ -253,6 +253,17 @@ test('TOTP enrollment migration keeps one encrypted same-organization OPEN chall
   assert.match(schema, /totp_enrollment_secret_state_check/u);
 });
 
+test('Auth hardening migration and Drizzle schema reject partial TOTP secret tuples', async () => {
+  const migration = await readFile('migrations/0009_auth_production_hardening.sql', 'utf8');
+  const schema = await readFile('src/database/schema.ts', 'utf8');
+  assert.match(migration, /identity_accounts_totp_secret_tuple_check/u);
+  assert.match(migration, /totp_ciphertext IS NULL/u);
+  assert.match(migration, /totp_key_version IS NOT NULL/u);
+  assert.match(schema, /identity_accounts_totp_secret_tuple_check/u);
+  assert.match(schema, /table\.totpCiphertext/u);
+  assert.match(schema, /table\.totpKeyVersion/u);
+});
+
 test('Drizzle structure mirrors migration-level singleton, composite, mapping, and session invariants', async () => {
   await import('../src/database/schema');
   const schema = await readFile('src/database/schema.ts', 'utf8');

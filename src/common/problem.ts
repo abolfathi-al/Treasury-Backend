@@ -82,7 +82,7 @@ export class ProblemFilter implements ExceptionFilter {
     } else {
       const exceptionStatus = exception.getStatus();
       const validation = exceptionStatus === 400
-        ? authEnrollmentValidationProblem(request, exception)
+        ? authValidationProblem(request, exception)
         : null;
       status = validation?.status ?? (exceptionStatus === 400 ? 422 : exceptionStatus);
       code = validation?.code ?? (status === 422
@@ -120,7 +120,7 @@ export class ProblemFilter implements ExceptionFilter {
   }
 }
 
-function authEnrollmentValidationProblem(
+function authValidationProblem(
   request: Request,
   exception: HttpException,
 ): { code: ProblemCode; status: number } | null {
@@ -142,6 +142,16 @@ function authEnrollmentValidationProblem(
     return messages.some((message) => message.includes('enrollmentId'))
       ? { code: 'TRS-AUT-005', status: 401 }
       : { code: 'TRS-AUT-002', status: 401 };
+  }
+  if (request.path === '/v1/auth/totp-verifications') {
+    return messages.some((message) => message.includes('challengeId'))
+      ? { code: 'TRS-AUT-005', status: 401 }
+      : { code: 'TRS-AUT-002', status: 401 };
+  }
+  if (request.path === '/v1/auth/password-recoveries') {
+    return messages.some((message) => message.includes('newPassword'))
+      ? { code: 'TRS-AUT-007', status: 422 }
+      : { code: 'TRS-AUT-006', status: 401 };
   }
   return null;
 }
