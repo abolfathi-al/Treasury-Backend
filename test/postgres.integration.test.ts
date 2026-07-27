@@ -394,6 +394,7 @@ async function seedOrganization(database: DatabaseService): Promise<string> {
       'access_grant_treasury_unit_scopes',
       'access_grant_branch_scopes',
       'access_grants',
+      'totp_enrollment_challenges',
       'identity_accounts',
       'roles',
       'user_refs',

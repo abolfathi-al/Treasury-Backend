@@ -133,6 +133,67 @@ test('recovery HTTP responses are explicit 200 and RFC problem responses use the
       }),
     });
     assert.equal(success.status, 200);
+
+    const invalidStartPassword = await fetch(`${base}/v1/auth/totp-enrollments`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        login: 'admin',
+        currentOrTemporaryPassword: 'a sufficiently long current password',
+        newPassword: 'short',
+      }),
+    });
+    assert.equal(invalidStartPassword.status, 422);
+    assert.equal(
+      (await invalidStartPassword.json() as { code: string }).code,
+      'TRS-AUT-007',
+    );
+
+    const invalidStartProof = await fetch(`${base}/v1/auth/totp-enrollments`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        login: '',
+        currentOrTemporaryPassword: 'short',
+        newPassword: 'a sufficiently long replacement password',
+      }),
+    });
+    const invalidStartProofBody = await invalidStartProof.json() as { code?: string };
+    assert.equal(invalidStartProof.status, 401, JSON.stringify(invalidStartProofBody));
+    assert.equal(
+      invalidStartProofBody.code,
+      'TRS-AUT-001',
+    );
+
+    const invalidEnrollmentId = await fetch(`${base}/v1/auth/totp-enrollment-completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        enrollmentId: 'invalid',
+        firstCode: '123456',
+        secondCode: '654321',
+      }),
+    });
+    assert.equal(invalidEnrollmentId.status, 401);
+    assert.equal(
+      (await invalidEnrollmentId.json() as { code: string }).code,
+      'TRS-AUT-005',
+    );
+
+    const invalidEnrollmentCodes = await fetch(`${base}/v1/auth/totp-enrollment-completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        enrollmentId: 'a'.repeat(43),
+        firstCode: '12345',
+        secondCode: '654321',
+      }),
+    });
+    assert.equal(invalidEnrollmentCodes.status, 401);
+    assert.equal(
+      (await invalidEnrollmentCodes.json() as { code: string }).code,
+      'TRS-AUT-002',
+    );
   } finally {
     await app.close();
   }

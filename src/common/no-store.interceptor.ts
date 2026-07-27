@@ -10,6 +10,8 @@ import type { Observable } from 'rxjs';
 const secretBearingPaths = new Set([
   '/v1/auth/sessions',
   '/v1/auth/totp-verifications',
+  '/v1/auth/totp-enrollments',
+  '/v1/auth/totp-enrollment-completions',
   '/v1/auth/password-recoveries',
 ]);
 

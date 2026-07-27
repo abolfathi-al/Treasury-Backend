@@ -81,8 +81,11 @@ export class ProblemFilter implements ExceptionFilter {
       extensions = body.extensions ?? {};
     } else {
       const exceptionStatus = exception.getStatus();
-      status = exceptionStatus === 400 ? 422 : exceptionStatus;
-      code = status === 422
+      const validation = exceptionStatus === 400
+        ? authEnrollmentValidationProblem(request, exception)
+        : null;
+      status = validation?.status ?? (exceptionStatus === 400 ? 422 : exceptionStatus);
+      code = validation?.code ?? (status === 422
         ? 'TRS-GEN-001'
         : status === 401
           ? 'TRS-GEN-002'
@@ -90,7 +93,7 @@ export class ProblemFilter implements ExceptionFilter {
             ? 'TRS-GEN-003'
             : status === 404
               ? 'TRS-GEN-004'
-              : 'TRS-GEN-005';
+              : 'TRS-GEN-005');
       const body = exception.getResponse();
       detail = typeof body === 'string' ? body : undefined;
     }
@@ -115,4 +118,30 @@ export class ProblemFilter implements ExceptionFilter {
     }
     response.status(status).type('application/problem+json').send(body);
   }
+}
+
+function authEnrollmentValidationProblem(
+  request: Request,
+  exception: HttpException,
+): { code: ProblemCode; status: number } | null {
+  if (request.method !== 'POST') return null;
+  const response = exception.getResponse();
+  const messages = typeof response === 'object'
+    && response !== null
+    && 'message' in response
+    && Array.isArray(response.message)
+    ? response.message.filter((message): message is string => typeof message === 'string')
+    : [];
+
+  if (request.path === '/v1/auth/totp-enrollments') {
+    return messages.some((message) => message.includes('newPassword'))
+      ? { code: 'TRS-AUT-007', status: 422 }
+      : { code: 'TRS-AUT-001', status: 401 };
+  }
+  if (request.path === '/v1/auth/totp-enrollment-completions') {
+    return messages.some((message) => message.includes('enrollmentId'))
+      ? { code: 'TRS-AUT-005', status: 401 }
+      : { code: 'TRS-AUT-002', status: 401 };
+  }
+  return null;
 }

@@ -10,7 +10,13 @@ import {
   SessionRow,
 } from './auth.repository';
 import { CredentialService } from './credential.service';
-import { LoginDto, PasswordRecoveryDto, TotpProofDto } from './auth.dto';
+import {
+  LoginDto,
+  PasswordRecoveryDto,
+  TotpEnrollmentCompleteDto,
+  TotpEnrollmentStartDto,
+  TotpProofDto,
+} from './auth.dto';
 
 export interface SessionView {
   sessionId: string;
@@ -102,29 +108,41 @@ export class AuthService {
 
     try {
       return await this.repository.transaction(async (client) => {
+        const locked = await this.repository.findAccountByLogin(normalizedLogin, client, true);
+        if (
+          !locked
+          || locked.id !== account.id
+          || locked.version !== account.version
+          || locked.password_hash !== account.password_hash
+          || locked.state !== 'ACTIVE'
+        ) {
+          throw new RangeError('LOGIN_STALE');
+        }
         await this.repository.lockAuthBucket(client, 'auth-throttle', bucket);
         await this.repository.clearThrottle(bucket, client);
-        if (this.credentials.passwordNeedsRehash(account.password_hash)) {
+        if (this.credentials.passwordNeedsRehash(locked.password_hash)) {
           await this.repository.updatePasswordHash(
             client,
-            account.id,
+            locked.id,
+            locked.version,
+            locked.password_hash,
             await this.credentials.hashPassword(dto.password.normalize('NFC')),
           );
         }
-        if (account.privileged || account.totp_ciphertext) {
-          if (!this.hasTotp(account)) throw new TreasuryProblem('TRS-AUT-002', 401);
+        if (locked.privileged || locked.totp_ciphertext) {
+          if (!this.hasTotp(locked)) throw new TreasuryProblem('TRS-AUT-002', 401);
           const challengeId = opaqueToken();
           const expiresAt = new Date(Date.now() + 5 * 60_000);
           await this.repository.createChallenge(client, {
-            accountId: account.id,
+            accountId: locked.id,
             tokenDigest: digest(challengeId),
             kind: 'LOGIN',
             expiresAt,
             deviceLabel: dto.deviceLabel,
           });
           await this.repository.audit(client, {
-            organizationId: account.organization_id,
-            accountId: account.id,
+            organizationId: locked.organization_id,
+            accountId: locked.id,
             requestId,
             eventType: 'AUTH_LOGIN_PASSWORD_ACCEPTED',
             outcome: 'CHALLENGE_ISSUED',
@@ -134,9 +152,15 @@ export class AuthService {
             body: { outcome: 'TOTP_REQUIRED' as const, challengeId, expiresAt: expiresAt.toISOString() },
           };
         }
-        return this.establishSession(client, account, 'PASSWORD', dto.deviceLabel, requestId);
+        return this.establishSession(client, locked, 'PASSWORD', dto.deviceLabel, requestId);
       });
     } catch (error) {
+      if (error instanceof RangeError && error.message === 'LOGIN_STALE') {
+        const retryAfter = await this.finalizePasswordFailure(bucket, reservation);
+        await this.auditFailure(account, requestId, 'INVALID_OR_UNAVAILABLE');
+        if (retryAfter > 0) throw this.throttled(retryAfter);
+        throw new TreasuryProblem('TRS-AUT-001', 401);
+      }
       await this.releasePasswordAttempt(bucket, reservation);
       throw error;
     }
@@ -202,6 +226,217 @@ export class AuthService {
       throw new TreasuryProblem('TRS-AUT-002', 401);
     }
     return result;
+  }
+
+  async startTotpEnrollment(
+    dto: TotpEnrollmentStartDto,
+    requestId: string,
+  ): Promise<{
+    outcome: 'TOTP_ENROLLMENT_STARTED';
+    enrollmentId: string;
+    secret: string;
+    otpauthUri: string;
+    expiresAt: string;
+  }> {
+    if (typeof dto.newPassword !== 'string') {
+      throw new TreasuryProblem('TRS-AUT-007', 422);
+    }
+    if (
+      typeof dto.login !== 'string'
+      || typeof dto.currentOrTemporaryPassword !== 'string'
+      || dto.login.length < 1
+      || dto.login.length > 254
+      || [...dto.currentOrTemporaryPassword].length < 15
+      || [...dto.currentOrTemporaryPassword].length > 128
+    ) {
+      throw new TreasuryProblem('TRS-AUT-001', 401);
+    }
+    const normalizedLogin = this.credentials.normalizeLogin(dto.login);
+    const currentPassword = dto.currentOrTemporaryPassword.normalize('NFC');
+    const newPassword = this.credentials.validatePassword(dto.newPassword, [normalizedLogin]);
+    if (newPassword === currentPassword) {
+      throw new TreasuryProblem('TRS-AUT-007', 422, 'The new password must differ from the current password.');
+    }
+    const bucket = this.throttleBucket(`password:${normalizedLogin}`);
+    const reservation = await this.reservePasswordAttempt(bucket);
+
+    let account: AccountRow | null;
+    let passwordValid: boolean;
+    try {
+      account = await this.repository.findAccountByLogin(normalizedLogin);
+      passwordValid = await this.credentials.verifyPassword(
+        account?.password_hash ?? await this.dummyPasswordHash,
+        currentPassword,
+      );
+    } catch (error) {
+      await this.releasePasswordAttempt(bucket, reservation);
+      throw error;
+    }
+    if (!account || !passwordValid || !this.enrollmentEligible(account)) {
+      const retryAfter = await this.finalizePasswordFailure(bucket, reservation);
+      await this.auditFailure(account, requestId, account ? 'INVALID_OR_UNAVAILABLE' : 'UNKNOWN_LOGIN');
+      if (retryAfter > 0) throw this.throttled(retryAfter);
+      throw new TreasuryProblem('TRS-AUT-001', 401);
+    }
+
+    const passwordHash = await this.credentials.hashPassword(newPassword);
+    const secret = this.credentials.generateTotpSecret();
+    const key = this.credentials.currentTotpKey();
+    const encrypted = this.credentials.encryptTotpSecret(secret, key.key, key.version);
+    const enrollmentId = opaqueToken();
+    const expiresAt = new Date(Date.now() + 5 * 60_000);
+    try {
+      await this.repository.transaction(async (client) => {
+        const locked = await this.repository.findAccountByLogin(normalizedLogin, client, true);
+        if (
+          !locked
+          || locked.id !== account!.id
+          || locked.version !== account!.version
+          || locked.password_hash !== account!.password_hash
+          || !this.enrollmentEligible(locked)
+        ) {
+          throw new RangeError('TOTP_ENROLLMENT_INELIGIBLE');
+        }
+        await this.repository.startTotpEnrollment(client, {
+          accountId: locked.id,
+          expectedVersion: locked.version,
+          passwordHash,
+          enrollmentIdDigest: this.credentials.enrollmentIdDigest(enrollmentId),
+          encrypted,
+          expiresAt,
+        });
+        await this.repository.lockAuthBucket(client, 'auth-throttle', bucket);
+        await this.repository.clearThrottle(bucket, client);
+        await this.repository.audit(client, {
+          organizationId: locked.organization_id,
+          accountId: locked.id,
+          requestId,
+          eventType: 'AUTH_TOTP_ENROLLMENT_STARTED',
+          outcome: 'CHALLENGE_ISSUED',
+        });
+      });
+    } catch (error) {
+      await this.releasePasswordAttempt(bucket, reservation);
+      if (error instanceof RangeError && error.message === 'TOTP_ENROLLMENT_INELIGIBLE') {
+        throw new TreasuryProblem('TRS-AUT-001', 401);
+      }
+      throw error;
+    }
+
+    const manualSecret = this.credentials.base32(secret);
+    const issuer = encodeURIComponent(account.organization_code);
+    const label = encodeURIComponent(`${account.organization_code}:${normalizedLogin}`);
+    return {
+      outcome: 'TOTP_ENROLLMENT_STARTED',
+      enrollmentId,
+      secret: manualSecret,
+      otpauthUri: `otpauth://totp/${label}?secret=${manualSecret}&issuer=${issuer}&algorithm=SHA256&digits=6&period=30`,
+      expiresAt: expiresAt.toISOString(),
+    };
+  }
+
+  async completeTotpEnrollment(
+    dto: TotpEnrollmentCompleteDto,
+    requestId: string,
+  ): Promise<{ outcome: 'TOTP_ENROLLED'; recoveryCode: string }> {
+    if (
+      typeof dto.enrollmentId !== 'string'
+      || !/^[A-Za-z0-9_-]{43}$/u.test(dto.enrollmentId)
+    ) {
+      throw new TreasuryProblem('TRS-AUT-005', 401);
+    }
+    if (
+      typeof dto.firstCode !== 'string'
+      || typeof dto.secondCode !== 'string'
+      || !/^[0-9]{6}$/u.test(dto.firstCode)
+      || !/^[0-9]{6}$/u.test(dto.secondCode)
+    ) {
+      throw new TreasuryProblem('TRS-AUT-002', 401);
+    }
+    const result = await this.repository.transaction<
+      { outcome: 'TOTP_ENROLLED'; recoveryCode: string }
+      | { failure: 'INVALID_CHALLENGE' }
+      | { failure: 'INVALID_TOTP'; attempts: number; expiresAt: Date }
+    >(async (client) => {
+      const enrollment = await this.repository.findTotpEnrollmentForUpdate(
+        this.credentials.enrollmentIdDigest(dto.enrollmentId),
+        client,
+      );
+      if (!enrollment) return { failure: 'INVALID_CHALLENGE' };
+      if (
+        enrollment.enrollment_state === 'ATTEMPTS_EXHAUSTED'
+        && enrollment.enrollment_expires_at.getTime() > Date.now()
+      ) {
+        return {
+          failure: 'INVALID_TOTP',
+          attempts: 5,
+          expiresAt: enrollment.enrollment_expires_at,
+        };
+      }
+      if (
+        enrollment.enrollment_state !== 'OPEN'
+        || enrollment.enrollment_expires_at.getTime() <= Date.now()
+        || enrollment.version !== enrollment.enrollment_account_version
+        || !this.enrollmentEligible(enrollment)
+        || !enrollment.pending_secret_ciphertext
+        || !enrollment.pending_secret_iv
+        || !enrollment.pending_secret_auth_tag
+        || !enrollment.pending_secret_key_version
+      ) {
+        if (enrollment.enrollment_state === 'OPEN') {
+          await this.repository.closeTotpEnrollment(client, enrollment.enrollment_row_id, 'EXPIRED');
+        }
+        return { failure: 'INVALID_CHALLENGE' };
+      }
+
+      const secret = this.credentials.decryptTotpSecret({
+        ciphertext: enrollment.pending_secret_ciphertext,
+        iv: enrollment.pending_secret_iv,
+        authTag: enrollment.pending_secret_auth_tag,
+        keyVersion: enrollment.pending_secret_key_version,
+      }, this.credentials.runtimeTotpKey(enrollment.pending_secret_key_version));
+      const now = Date.now();
+      const currentCounter = Math.floor(now / 30_000);
+      const firstCounter = this.credentials.verifyTotp(secret, dto.firstCode, null, now);
+      const secondCounter = this.credentials.verifyTotp(
+        secret,
+        dto.secondCode,
+        currentCounter - 1,
+        now,
+      );
+      if (firstCounter !== currentCounter - 1 || secondCounter !== currentCounter) {
+        const attempts = enrollment.enrollment_attempt_count + 1;
+        await this.repository.recordTotpEnrollmentFailure(
+          client,
+          enrollment.enrollment_row_id,
+          attempts,
+        );
+        return {
+          failure: 'INVALID_TOTP',
+          attempts,
+          expiresAt: enrollment.enrollment_expires_at,
+        };
+      }
+
+      const recoveryCode = this.credentials.generateRecoveryCode();
+      const recoveryCodeHash = await this.credentials.hashRecoveryCode(recoveryCode);
+      await this.repository.completeTotpEnrollment(
+        client,
+        enrollment,
+        currentCounter,
+        recoveryCodeHash,
+        requestId,
+      );
+      return { outcome: 'TOTP_ENROLLED', recoveryCode };
+    });
+    if (!('failure' in result)) return result;
+    if (result.failure === 'INVALID_CHALLENGE') {
+      throw new TreasuryProblem('TRS-AUT-005', 401);
+    }
+    if (result.attempts >= 5) {
+      throw this.throttled(Math.max(1, (result.expiresAt.getTime() - Date.now()) / 1000));
+    }
+    throw new TreasuryProblem('TRS-AUT-002', 401);
   }
 
   async recoverPassword(
@@ -443,6 +678,14 @@ export class AuthService {
 
   private hasTotp(account: AccountRow): boolean {
     return Boolean(account.totp_ciphertext && account.totp_iv && account.totp_auth_tag && account.totp_key_version);
+  }
+
+  private enrollmentEligible(account: AccountRow): boolean {
+    return ['INVITED', 'ACTIVE'].includes(account.state)
+      && !account.totp_ciphertext
+      && !account.totp_iv
+      && !account.totp_auth_tag
+      && !account.totp_key_version;
   }
 
   private decryptTotp(account: AccountRow): Buffer {

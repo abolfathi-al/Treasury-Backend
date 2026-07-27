@@ -130,7 +130,9 @@ export const identityAccounts = pgTable('identity_accounts', {
   authorizationEpoch: bigint('authorization_epoch', { mode: 'number' }).notNull().default(0),
   version: integer('version').notNull().default(0),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
-});
+}, (table) => [
+  unique().on(table.id, table.userRefId),
+]);
 
 export const roles = pgTable('roles', {
   id: uuid('id').primaryKey().defaultRandom(),
@@ -332,6 +334,66 @@ export const authChallenges = pgTable('auth_challenges', {
   consumedAt: timestamp('consumed_at', { withTimezone: true }),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
 });
+
+export const totpEnrollmentChallenges = pgTable('totp_enrollment_challenges', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  organizationId: uuid('organization_id').notNull().references(() => organizations.id),
+  identityAccountId: uuid('identity_account_id').notNull(),
+  userRefId: uuid('user_ref_id').notNull(),
+  enrollmentIdDigest: char('enrollment_id_digest', { length: 64 }).notNull().unique(),
+  pendingSecretCiphertext: text('pending_secret_ciphertext'),
+  pendingSecretIv: text('pending_secret_iv'),
+  pendingSecretAuthTag: text('pending_secret_auth_tag'),
+  pendingSecretKeyVersion: integer('pending_secret_key_version'),
+  accountVersion: integer('account_version').notNull(),
+  attemptCount: integer('attempt_count').notNull().default(0),
+  expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
+  closedAt: timestamp('closed_at', { withTimezone: true }),
+  state: varchar('state', { length: 24 }).notNull().default('OPEN'),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  foreignKey({
+    columns: [table.identityAccountId, table.userRefId],
+    foreignColumns: [identityAccounts.id, identityAccounts.userRefId],
+    name: 'totp_enrollment_account_fk',
+  }),
+  foreignKey({
+    columns: [table.organizationId, table.userRefId],
+    foreignColumns: [userRefs.organizationId, userRefs.id],
+    name: 'totp_enrollment_organization_user_fk',
+  }),
+  uniqueIndex('uq_totp_enrollment_challenges_open_account')
+    .on(table.organizationId, table.identityAccountId)
+    .where(sql`${table.state} = 'OPEN'`),
+  index('ix_totp_enrollment_challenges_open_expiry')
+    .on(table.expiresAt)
+    .where(sql`${table.state} = 'OPEN'`),
+  check('totp_enrollment_attempt_count_check', sql`${table.attemptCount} BETWEEN 0 AND 5`),
+  check('totp_enrollment_account_version_check', sql`${table.accountVersion} >= 0`),
+  check('totp_enrollment_state_check', sql`${table.state} IN (
+    'OPEN', 'CONSUMED', 'EXPIRED', 'ATTEMPTS_EXHAUSTED'
+  )`),
+  check('totp_enrollment_secret_state_check', sql`(
+    (
+      ${table.state} = 'OPEN'
+      AND ${table.closedAt} IS NULL
+      AND ${table.pendingSecretCiphertext} IS NOT NULL
+      AND ${table.pendingSecretIv} IS NOT NULL
+      AND ${table.pendingSecretAuthTag} IS NOT NULL
+      AND ${table.pendingSecretKeyVersion} IS NOT NULL
+    )
+    OR
+    (
+      ${table.state} <> 'OPEN'
+      AND ${table.closedAt} IS NOT NULL
+      AND ${table.pendingSecretCiphertext} IS NULL
+      AND ${table.pendingSecretIv} IS NULL
+      AND ${table.pendingSecretAuthTag} IS NULL
+      AND ${table.pendingSecretKeyVersion} IS NULL
+    )
+  )`),
+]);
 
 export const authStepUpProofs = pgTable('auth_step_up_proofs', {
   id: uuid('id').primaryKey().defaultRandom(),

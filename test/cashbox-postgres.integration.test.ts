@@ -414,6 +414,7 @@ async function cleanup(database: DatabaseService): Promise<void> {
       'access_grant_branch_scopes',
       'access_grants',
       'role_permissions',
+      'totp_enrollment_challenges',
       'identity_accounts',
       'roles',
       'idempotency_records',

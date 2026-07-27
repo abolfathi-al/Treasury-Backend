@@ -42,6 +42,23 @@ test('runtime TOTP keyring resolves ciphertext by stored key version', () => {
   }
 });
 
+test('TOTP enrollment identifiers use a domain-separated keyed digest', () => {
+  const previous = process.env.LOGIN_THROTTLE_HMAC_KEY_BASE64;
+  process.env.LOGIN_THROTTLE_HMAC_KEY_BASE64 = Buffer.alloc(32, 11).toString('base64');
+  try {
+    const enrollmentId = 'A'.repeat(43);
+    assert.equal(credentials.enrollmentIdDigest(enrollmentId).length, 64);
+    assert.equal(
+      credentials.enrollmentIdDigest(enrollmentId),
+      credentials.enrollmentIdDigest(enrollmentId),
+    );
+    assert.notEqual(credentials.enrollmentIdDigest(enrollmentId), enrollmentId);
+  } finally {
+    if (previous === undefined) delete process.env.LOGIN_THROTTLE_HMAC_KEY_BASE64;
+    else process.env.LOGIN_THROTTLE_HMAC_KEY_BASE64 = previous;
+  }
+});
+
 test('recovery hashes are salted and verifiable without storing the code', async () => {
   const code = credentials.generateRecoveryCode();
   const first = await credentials.hashRecoveryCode(code);

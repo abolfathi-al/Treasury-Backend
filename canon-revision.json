@@ -1,6 +1,6 @@
 {
   "repository": "Treasury-Canon",
-  "revision": "c99fcd263a69ac48c2ae76bb3e50fc1a976b72c2",
+  "revision": "ef18110639a8fcdf65eeb270db75a3fe8a8f4dda",
   "canon_root": "canon-v4",
-  "authorized_delivery_slice": "INC-1G-CHEQUE-FOUNDATION"
+  "authorized_delivery_slice": "INC-1H-TOTP-ENROLLMENT"
 }

@@ -54,3 +54,35 @@ export class PasswordRecoveryDto {
   @Matches(/^[0-9]{6}$/u)
   totpCode!: string;
 }
+
+export class TotpEnrollmentStartDto {
+  @IsString()
+  @MinLength(1)
+  @MaxLength(254)
+  login!: string;
+
+  @IsString()
+  @MinLength(15)
+  @MaxLength(128)
+  currentOrTemporaryPassword!: string;
+
+  @IsString()
+  @MinLength(15)
+  @MaxLength(128)
+  newPassword!: string;
+}
+
+export class TotpEnrollmentCompleteDto {
+  @IsString()
+  @Length(43, 43)
+  @Matches(/^[A-Za-z0-9_-]{43}$/u)
+  enrollmentId!: string;
+
+  @IsString()
+  @Matches(/^[0-9]{6}$/u)
+  firstCode!: string;
+
+  @IsString()
+  @Matches(/^[0-9]{6}$/u)
+  secondCode!: string;
+}

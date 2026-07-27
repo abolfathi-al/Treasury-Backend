@@ -22,6 +22,8 @@ import { PrintTemplateController } from '../src/master-data/print-template.contr
 const expectedOperations = [
   ['POST', 'v1/auth/sessions'],
   ['POST', 'v1/auth/totp-verifications'],
+  ['POST', 'v1/auth/totp-enrollments'],
+  ['POST', 'v1/auth/totp-enrollment-completions'],
   ['GET', 'v1/auth/sessions/current'],
   ['DELETE', 'v1/auth/sessions/:resourceId'],
   ['POST', 'v1/auth/password-recoveries'],
@@ -67,7 +69,7 @@ const expectedOperations = [
   ['POST', 'v1/cheque-books/:chequeBookId/leaves/:leafNumber/transitions'],
 ] as const;
 
-test('all authorized operations through INC-1G are present in owner-local controllers', async () => {
+test('all authorized operations through INC-1H are present in owner-local controllers', async () => {
   const operations = new Set<string>();
   for (const controller of [
     AuthController,
@@ -231,6 +233,24 @@ test('migration locks bootstrap, normalized method children, sessions, and idemp
   assert.match(migration, /expires_at timestamptz NOT NULL/u);
   assert.match(migration, /'INVITED', 'ACTIVE', 'LOCKED', 'SUSPENDED', 'CLOSED'/u);
   assert.doesNotMatch(migration, /debit_mapping_ref varchar/u);
+});
+
+test('TOTP enrollment migration keeps one encrypted same-organization OPEN challenge', async () => {
+  const migration = await readFile('migrations/0008_totp_enrollment.sql', 'utf8');
+  const schema = await readFile('src/database/schema.ts', 'utf8');
+  for (const invariant of [
+    'CREATE TABLE totp_enrollment_challenges',
+    'totp_enrollment_account_fk',
+    'totp_enrollment_organization_user_fk',
+    'uq_totp_enrollment_challenges_open_account',
+    'ix_totp_enrollment_challenges_open_expiry',
+    'totp_enrollment_secret_state_check',
+  ]) {
+    assert.match(migration, new RegExp(invariant, 'u'));
+  }
+  assert.match(migration, /pending_secret_ciphertext IS NULL/u);
+  assert.match(schema, /totpEnrollmentChallenges/u);
+  assert.match(schema, /totp_enrollment_secret_state_check/u);
 });
 
 test('Drizzle structure mirrors migration-level singleton, composite, mapping, and session invariants', async () => {
