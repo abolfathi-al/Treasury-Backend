@@ -16,6 +16,7 @@ import { IdentityController } from '../src/access-control/identity.controller';
 import { BankingController } from '../src/banking/banking.controller';
 import { CashboxController } from '../src/cashbox-and-custody/cashbox.controller';
 import { MasterDataController } from '../src/master-data/master-data.controller';
+import { PrintTemplateController } from '../src/master-data/print-template.controller';
 
 const expectedOperations = [
   ['POST', 'v1/auth/sessions'],
@@ -44,6 +45,8 @@ const expectedOperations = [
   ['POST', 'v1/parties'],
   ['GET', 'v1/method-definitions'],
   ['POST', 'v1/method-definitions'],
+  ['GET', 'v1/print-templates'],
+  ['POST', 'v1/print-templates'],
   ['GET', 'v1/cashboxes'],
   ['POST', 'v1/cashboxes'],
   ['POST', 'v1/cashboxes/:cashboxId/handovers'],
@@ -61,13 +64,14 @@ const expectedOperations = [
   ['POST', 'v1/payment-gateways'],
 ] as const;
 
-test('all authorized operations through INC-1E are present in owner-local controllers', async () => {
+test('all authorized operations through INC-1F are present in owner-local controllers', async () => {
   const operations = new Set<string>();
   for (const controller of [
     AuthController,
     IdentityController,
     AccessAdminController,
     MasterDataController,
+    PrintTemplateController,
     CashboxController,
     BankingController,
   ]) {
@@ -82,6 +86,25 @@ test('all authorized operations through INC-1E are present in owner-local contro
   }
   for (const [method, path] of expectedOperations) {
     assert.ok(operations.has(`${method} ${path}`), `${method} ${path}`);
+  }
+});
+
+test('Print Template operations use exact scoped permissions and operation IDs', () => {
+  for (const [handler, permission, operationId] of [
+    [
+      PrintTemplateController.prototype.list,
+      'print-template.view',
+      'listPrintTemplates',
+    ],
+    [
+      PrintTemplateController.prototype.create,
+      'print-template.manage',
+      'createPrintTemplate',
+    ],
+  ] as const) {
+    assert.equal(Reflect.getMetadata(REQUIRED_PERMISSION, handler), permission);
+    assert.equal(Reflect.getMetadata(AUTHORIZATION_OPERATION, handler), operationId);
+    assert.equal(Reflect.getMetadata(PERMISSION_SCOPE_MODE, handler), 'ONE_GRANT_RESOURCE');
   }
 });
 
@@ -294,6 +317,26 @@ test('INC-1E migration and Drizzle schema constrain Banking Base Data', async ()
     await readFile('src/banking/banking.repository.ts', 'utf8'),
     /SET state = 'ACTIVE', version = version \+ 1/u,
   );
+});
+
+test('INC-1F migration and Drizzle schema constrain immutable Print Template versions', async () => {
+  const migration = await readFile('migrations/0006_print_templates.sql', 'utf8');
+  const schema = await readFile('src/database/schema.ts', 'utf8');
+  for (const source of [migration, schema]) {
+    for (const invariant of [
+      'cheque_books',
+      'print_templates',
+      'template_body',
+      'template_digest',
+      'template_version',
+      'print_templates_scope_check',
+      'print_templates_list_idx',
+    ]) assert.match(source, new RegExp(invariant, 'u'));
+  }
+  assert.match(migration, /enforce_print_template_reference_availability/u);
+  assert.match(migration, /enforce_print_template_version_immutability/u);
+  assert.match(migration, /jsonb_typeof\(template_body\) = 'object'/u);
+  assert.match(migration, /UNIQUE \(organization_id, code, template_version\)/u);
 });
 
 test('operator bootstrap is local-only, advisory-locked, and transactional', async () => {

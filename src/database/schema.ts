@@ -1017,3 +1017,114 @@ export const paymentGateways = pgTable('payment_gateways', {
     table.id,
   ),
 ]);
+
+export const chequeBooks = pgTable('cheque_books', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  bankAccountId: uuid('bank_account_id').notNull().references(() => bankAccounts.id),
+  series: varchar('series', { length: 32 }).notNull(),
+  firstLeaf: bigint('first_leaf', { mode: 'number' }).notNull(),
+  lastLeaf: bigint('last_leaf', { mode: 'number' }).notNull(),
+  receivedDate: date('received_date').notNull(),
+  custodianUserId: uuid('custodian_user_id').references(() => userRefs.id),
+  state: varchar('state', { length: 16 }).notNull().default('DRAFT'),
+  version: bigint('version', { mode: 'number' }).notNull().default(0),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  unique().on(table.bankAccountId, table.series, table.firstLeaf, table.lastLeaf),
+  check('cheque_books_series_nonempty', sql`length(btrim(${table.series})) > 0`),
+  check('cheque_books_leaf_range', sql`${table.lastLeaf} >= ${table.firstLeaf}`),
+  check(
+    'cheque_books_state_check',
+    sql`${table.state} IN ('DRAFT', 'ACTIVE', 'SUSPENDED', 'EXHAUSTED', 'CLOSED')`,
+  ),
+  check('cheque_books_version_nonnegative', sql`${table.version} >= 0`),
+]);
+
+export const printTemplates = pgTable('print_templates', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  organizationId: uuid('organization_id').notNull().references(() => organizations.id),
+  treasuryUnitId: uuid('treasury_unit_id'),
+  bankId: uuid('bank_id'),
+  chequeBookId: uuid('cheque_book_id').references(() => chequeBooks.id),
+  code: varchar('code', { length: 64 }).notNull(),
+  documentKind: varchar('document_kind', { length: 16 }).notNull(),
+  language: varchar('language', { length: 8 }).notNull(),
+  direction: varchar('direction', { length: 3 }).notNull(),
+  pageProfile: varchar('page_profile', { length: 32 }).notNull(),
+  calibrationXmm: numeric('calibration_x_mm', { precision: 8, scale: 3 }).notNull().default('0'),
+  calibrationYmm: numeric('calibration_y_mm', { precision: 8, scale: 3 }).notNull().default('0'),
+  templateBody: jsonb('template_body').$type<Record<string, unknown>>().notNull(),
+  templateDigest: char('template_digest', { length: 64 }).notNull(),
+  templateVersion: bigint('template_version', { mode: 'number' }).notNull(),
+  state: varchar('state', { length: 16 }).notNull().default('DRAFT'),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  unique().on(table.organizationId, table.code, table.templateVersion),
+  foreignKey({
+    columns: [table.organizationId, table.treasuryUnitId],
+    foreignColumns: [treasuryUnits.organizationId, treasuryUnits.id],
+    name: 'print_templates_treasury_unit_fk',
+  }),
+  foreignKey({
+    columns: [table.organizationId, table.bankId],
+    foreignColumns: [banks.organizationId, banks.id],
+    name: 'print_templates_bank_fk',
+  }),
+  check('print_templates_code_format', sql`${table.code} ~ '^[A-Z][A-Z0-9_-]{1,63}$'`),
+  check(
+    'print_templates_document_kind_check',
+    sql`${table.documentKind} IN ('RECEIPT', 'PAYMENT', 'TRANSFER', 'CHEQUE')`,
+  ),
+  check('print_templates_language_check', sql`${table.language} IN ('fa-IR', 'en')`),
+  check('print_templates_direction_check', sql`${table.direction} IN ('RTL', 'LTR')`),
+  check(
+    'print_templates_page_profile_check',
+    sql`${table.pageProfile} IN (
+      'A4_PORTRAIT', 'A4_LANDSCAPE', 'A5_PORTRAIT', 'A5_LANDSCAPE',
+      'CHEQUE_CUSTOM'
+    )`,
+  ),
+  check(
+    'print_templates_calibration_x_range',
+    sql`${table.calibrationXmm} BETWEEN -100 AND 100`,
+  ),
+  check(
+    'print_templates_calibration_y_range',
+    sql`${table.calibrationYmm} BETWEEN -100 AND 100`,
+  ),
+  check('print_templates_body_object', sql`jsonb_typeof(${table.templateBody}) = 'object'`),
+  check(
+    'print_templates_digest_format',
+    sql`${table.templateDigest} ~ '^[a-f0-9]{64}$'`,
+  ),
+  check('print_templates_version_positive', sql`${table.templateVersion} > 0`),
+  check(
+    'print_templates_state_check',
+    sql`${table.state} IN ('DRAFT', 'ACTIVE', 'RETIRED')`,
+  ),
+  check(
+    'print_templates_scope_check',
+    sql`(
+      ${table.documentKind} = 'CHEQUE'
+      AND (${table.bankId} IS NOT NULL OR ${table.chequeBookId} IS NOT NULL)
+    ) OR (
+      ${table.documentKind} <> 'CHEQUE'
+      AND ${table.bankId} IS NULL
+      AND ${table.chequeBookId} IS NULL
+    )`,
+  ),
+  index('print_templates_list_idx').on(
+    table.organizationId,
+    table.code,
+    table.templateVersion,
+    table.id,
+  ),
+  index('print_templates_match_idx').on(
+    table.organizationId,
+    table.documentKind,
+    table.treasuryUnitId,
+    table.bankId,
+    table.chequeBookId,
+    table.state,
+  ),
+]);

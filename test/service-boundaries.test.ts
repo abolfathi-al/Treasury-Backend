@@ -8,6 +8,7 @@ import { SessionRevokeScope } from '../src/access-control/access-admin.dto';
 import type { CredentialService } from '../src/access-control/credential.service';
 import type { IdentityRepository } from '../src/access-control/identity.repository';
 import { IdentityService } from '../src/access-control/identity.service';
+import { digest } from '../src/common/http';
 import { TreasuryProblem } from '../src/common/problem';
 import {
   MethodBehaviorCategory,
@@ -17,6 +18,15 @@ import {
 } from '../src/master-data/master-data.dto';
 import type { MasterDataRepository } from '../src/master-data/master-data.repository';
 import { MasterDataService } from '../src/master-data/master-data.service';
+import {
+  PrintTemplateDirection,
+  PrintTemplateDocumentKind,
+  PrintTemplateLanguage,
+  PrintTemplatePageProfile,
+} from '../src/master-data/print-template.dto';
+import { canonicalizeJson } from '../src/master-data/print-template.jcs';
+import type { PrintTemplateRepository } from '../src/master-data/print-template.repository';
+import { PrintTemplateService } from '../src/master-data/print-template.service';
 
 const shortKeyProblem = (error: unknown) => error instanceof TreasuryProblem && error.getStatus() === 422;
 
@@ -50,6 +60,25 @@ test('all business create boundaries enforce the OpenAPI Idempotency-Key length'
       partyKinds: [PartyKind.CUSTOMER],
     }, 'x'), shortKeyProblem),
   ]);
+  const templateBody = { title: 'Receipt' };
+  await assert.rejects(
+    new PrintTemplateService({} as PrintTemplateRepository).create(
+      'org',
+      'actor',
+      {
+        code: 'RECEIPT_MAIN',
+        documentKind: PrintTemplateDocumentKind.RECEIPT,
+        language: PrintTemplateLanguage.EN,
+        direction: PrintTemplateDirection.LTR,
+        pageProfile: PrintTemplatePageProfile.A4_PORTRAIT,
+        templateBody,
+        templateDigest: digest(canonicalizeJson(templateBody)),
+      },
+      'x',
+      'request',
+    ),
+    shortKeyProblem,
+  );
 
   const identityRepository = {
     userContext: async () => [],
@@ -142,7 +171,7 @@ test('all business create boundaries enforce the OpenAPI Idempotency-Key length'
   );
 });
 
-test('malformed opaque cursors fail as typed 422 boundaries before PostgreSQL casts', () => {
+test('malformed opaque cursors fail as typed 422 boundaries before PostgreSQL casts', async () => {
   const master = new MasterDataService({} as MasterDataRepository);
   for (const call of [
     () => master.listBranches('org', undefined, 'not-a-uuid'),
@@ -159,6 +188,15 @@ test('malformed opaque cursors fail as typed 422 boundaries before PostgreSQL ca
     {} as AuthService,
   );
   assert.throws(() => identity.list('org', undefined, 'not-a-uuid'), shortKeyProblem);
+  await assert.rejects(
+    new PrintTemplateService({} as PrintTemplateRepository).list(
+      'org',
+      'actor',
+      undefined,
+      'not-a-cursor',
+    ),
+    shortKeyProblem,
+  );
 });
 
 test('Party service rejects invalid kinds and maps stable create conflicts', async () => {
