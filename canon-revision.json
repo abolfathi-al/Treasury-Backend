@@ -1,6 +1,6 @@
 {
   "repository": "Treasury-Canon",
-  "revision": "ef18110639a8fcdf65eeb270db75a3fe8a8f4dda",
+  "revision": "5137fec60393e49b9cdfce10f8107263458523b0",
   "canon_root": "canon-v4",
   "authorized_delivery_slice": "INC-1H-TOTP-ENROLLMENT"
 }
