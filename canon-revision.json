@@ -1,6 +1,6 @@
 {
   "repository": "Treasury-Canon",
-  "revision": "21801f0f9ecf574e18b0db8d0b831bb7039635e0",
+  "revision": "c99fcd263a69ac48c2ae76bb3e50fc1a976b72c2",
   "canon_root": "canon-v4",
-  "authorized_delivery_slice": "INC-1E-BANKING-BASE-DATA"
+  "authorized_delivery_slice": "INC-1G-CHEQUE-FOUNDATION"
 }

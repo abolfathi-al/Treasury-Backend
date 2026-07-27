@@ -6,6 +6,7 @@ import { BankingModule } from './banking/banking.module';
 import { ProblemFilter } from './common/problem';
 import { NoStoreInterceptor } from './common/no-store.interceptor';
 import { CashboxModule } from './cashbox-and-custody/cashbox.module';
+import { ChequeModule } from './cheques/cheque.module';
 import { DatabaseModule } from './database/database.module';
 import { MasterDataModule } from './master-data/master-data.module';
 
@@ -16,6 +17,7 @@ import { MasterDataModule } from './master-data/master-data.module';
     MasterDataModule,
     CashboxModule,
     BankingModule,
+    ChequeModule,
   ],
   providers: [
     { provide: APP_FILTER, useClass: ProblemFilter },

@@ -20,6 +20,7 @@ const bootstrapPermissions = [
   'cashbox.manage',
   'cashbox.view',
   'cheque-book.manage',
+  'cheque.transition',
   'identity-account.manage',
   'master-data.manage',
   'master-data.view',

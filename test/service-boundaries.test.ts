@@ -8,6 +8,8 @@ import { SessionRevokeScope } from '../src/access-control/access-admin.dto';
 import type { CredentialService } from '../src/access-control/credential.service';
 import type { IdentityRepository } from '../src/access-control/identity.repository';
 import { IdentityService } from '../src/access-control/identity.service';
+import type { ChequeRepository } from '../src/cheques/cheque.repository';
+import { ChequeService } from '../src/cheques/cheque.service';
 import { digest } from '../src/common/http';
 import { TreasuryProblem } from '../src/common/problem';
 import {
@@ -73,6 +75,22 @@ test('all business create boundaries enforce the OpenAPI Idempotency-Key length'
         pageProfile: PrintTemplatePageProfile.A4_PORTRAIT,
         templateBody,
         templateDigest: digest(canonicalizeJson(templateBody)),
+      },
+      'x',
+      'request',
+    ),
+    shortKeyProblem,
+  );
+  await assert.rejects(
+    new ChequeService({} as ChequeRepository).createChequeBook(
+      '00000000-0000-4000-8000-000000000001',
+      '00000000-0000-4000-8000-000000000002',
+      {
+        bankAccountId: '00000000-0000-4000-8000-000000000003',
+        series: 'SERIES-A',
+        firstLeaf: 1,
+        lastLeaf: 10,
+        receivedDate: '2026-07-27',
       },
       'x',
       'request',

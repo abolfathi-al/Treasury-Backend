@@ -31,6 +31,9 @@ const titles = {
   'TRS-MST-004': 'Method configuration invalid',
   'TRS-MST-005': 'Base currency locked',
   'TRS-BNK-001': 'Bank account unavailable',
+  'TRS-CHQ-001': 'Cheque leaf unavailable',
+  'TRS-CHQ-002': 'Cheque-book range overlap',
+  'TRS-CHQ-003': 'Illegal cheque transition',
   'TRS-CSH-002': 'Cashbox custody conflict',
 } as const;
 

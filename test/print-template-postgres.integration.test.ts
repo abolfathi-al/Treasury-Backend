@@ -397,12 +397,14 @@ async function seed(database: DatabaseService) {
     const accountIds = new Map(accounts.rows.map((account) => [account.bank_id, account.id]));
     const books = await client.query<{ id: string; series: string }>(`
       INSERT INTO cheque_books (
-        bank_account_id, series, first_leaf, last_leaf, received_date, state
+        organization_id, bank_account_id, series, first_leaf, last_leaf,
+        received_date, state
       ) VALUES
-        ($1,'SERIES-A',1,50,'2026-07-27','ACTIVE'),
-        ($2,'SERIES-B',51,100,'2026-07-27','ACTIVE')
+        ($1,$2,'SERIES-A',1,50,'2026-07-27','ACTIVE'),
+        ($1,$3,'SERIES-B',51,100,'2026-07-27','ACTIVE')
       RETURNING id, series
     `, [
+      organizationId,
       accountIds.get(bankIds.get('FIRST')!),
       accountIds.get(bankIds.get('SECOND')!),
     ]);
@@ -486,6 +488,8 @@ async function cleanup(database: DatabaseService): Promise<void> {
     await client.query('BEGIN');
     for (const table of [
       'print_templates',
+      'cheque_events',
+      'cheque_leaves',
       'cheque_books',
       'pos_terminals',
       'payment_gateways',

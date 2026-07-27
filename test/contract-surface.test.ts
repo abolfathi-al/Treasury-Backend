@@ -15,6 +15,7 @@ import {
 import { IdentityController } from '../src/access-control/identity.controller';
 import { BankingController } from '../src/banking/banking.controller';
 import { CashboxController } from '../src/cashbox-and-custody/cashbox.controller';
+import { ChequeController } from '../src/cheques/cheque.controller';
 import { MasterDataController } from '../src/master-data/master-data.controller';
 import { PrintTemplateController } from '../src/master-data/print-template.controller';
 
@@ -62,9 +63,11 @@ const expectedOperations = [
   ['POST', 'v1/pos-terminals'],
   ['GET', 'v1/payment-gateways'],
   ['POST', 'v1/payment-gateways'],
+  ['POST', 'v1/cheque-books'],
+  ['POST', 'v1/cheque-books/:chequeBookId/leaves/:leafNumber/transitions'],
 ] as const;
 
-test('all authorized operations through INC-1F are present in owner-local controllers', async () => {
+test('all authorized operations through INC-1G are present in owner-local controllers', async () => {
   const operations = new Set<string>();
   for (const controller of [
     AuthController,
@@ -74,6 +77,7 @@ test('all authorized operations through INC-1F are present in owner-local contro
     PrintTemplateController,
     CashboxController,
     BankingController,
+    ChequeController,
   ]) {
     const prefix = Reflect.getMetadata(PATH_METADATA, controller) as string;
     for (const name of Object.getOwnPropertyNames(controller.prototype)) {
@@ -87,6 +91,32 @@ test('all authorized operations through INC-1F are present in owner-local contro
   for (const [method, path] of expectedOperations) {
     assert.ok(operations.has(`${method} ${path}`), `${method} ${path}`);
   }
+});
+
+test('Cheque Foundation operations use exact scoped permissions without step-up', () => {
+  for (const [handler, permission, operationId] of [
+    [
+      ChequeController.prototype.createChequeBook,
+      'cheque-book.manage',
+      'createChequeBook',
+    ],
+    [
+      ChequeController.prototype.transitionCheque,
+      'cheque.transition',
+      'transitionCheque',
+    ],
+  ] as const) {
+    assert.equal(Reflect.getMetadata(REQUIRED_PERMISSION, handler), permission);
+    assert.equal(Reflect.getMetadata(AUTHORIZATION_OPERATION, handler), operationId);
+    assert.equal(Reflect.getMetadata(PERMISSION_SCOPE_MODE, handler), 'ONE_GRANT_RESOURCE');
+    assert.equal(Reflect.getMetadata(STEP_UP_REQUIRED, handler), undefined);
+  }
+});
+
+test('the bootstrap administrator can execute both Cheque Foundation operations', async () => {
+  const bootstrap = await readFile('scripts/bootstrap.ts', 'utf8');
+  assert.match(bootstrap, /'cheque-book\.manage'/u);
+  assert.match(bootstrap, /'cheque\.transition'/u);
 });
 
 test('Print Template operations use exact scoped permissions and operation IDs', () => {
@@ -337,6 +367,29 @@ test('INC-1F migration and Drizzle schema constrain immutable Print Template ver
   assert.match(migration, /enforce_print_template_version_immutability/u);
   assert.match(migration, /jsonb_typeof\(template_body\) = 'object'/u);
   assert.match(migration, /UNIQUE \(organization_id, code, template_version\)/u);
+});
+
+test('INC-1G migration and Drizzle schema constrain Cheque Foundation facts', async () => {
+  const migration = await readFile('migrations/0007_cheque_foundation.sql', 'utf8');
+  const schema = await readFile('src/database/schema.ts', 'utf8');
+  const repository = await readFile('src/cheques/cheque.repository.ts', 'utf8');
+  for (const source of [migration, schema]) {
+    for (const invariant of [
+      'cheque_books_leaf_count',
+      'cheque_leaves',
+      'cheque_events',
+      'AVAILABLE',
+      'CONSUMED',
+      'cheque_events_foundation_reason',
+      'cheque_leaves_available_idx',
+    ]) assert.match(source, new RegExp(invariant, 'u'));
+  }
+  assert.match(migration, /pg_advisory_xact_lock/u);
+  assert.match(migration, /int8range/u);
+  assert.match(migration, /reject_cheque_event_mutation/u);
+  assert.match(migration, /BEFORE UPDATE OR DELETE ON cheque_events/u);
+  assert.match(repository, /generate_series/u);
+  assert.match(repository, /FOR UPDATE/u);
 });
 
 test('operator bootstrap is local-only, advisory-locked, and transactional', async () => {

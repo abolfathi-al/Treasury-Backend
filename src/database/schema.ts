@@ -1020,24 +1020,125 @@ export const paymentGateways = pgTable('payment_gateways', {
 
 export const chequeBooks = pgTable('cheque_books', {
   id: uuid('id').primaryKey().defaultRandom(),
-  bankAccountId: uuid('bank_account_id').notNull().references(() => bankAccounts.id),
+  organizationId: uuid('organization_id').notNull().references(() => organizations.id),
+  bankAccountId: uuid('bank_account_id').notNull(),
   series: varchar('series', { length: 32 }).notNull(),
   firstLeaf: bigint('first_leaf', { mode: 'number' }).notNull(),
   lastLeaf: bigint('last_leaf', { mode: 'number' }).notNull(),
   receivedDate: date('received_date').notNull(),
-  custodianUserId: uuid('custodian_user_id').references(() => userRefs.id),
+  custodianUserId: uuid('custodian_user_id'),
+  notes: varchar('notes', { length: 1000 }),
   state: varchar('state', { length: 16 }).notNull().default('DRAFT'),
   version: bigint('version', { mode: 'number' }).notNull().default(0),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
 }, (table) => [
   unique().on(table.bankAccountId, table.series, table.firstLeaf, table.lastLeaf),
+  unique().on(table.organizationId, table.id),
+  unique().on(
+    table.organizationId,
+    table.id,
+    table.bankAccountId,
+    table.series,
+  ),
+  foreignKey({
+    columns: [table.organizationId, table.bankAccountId],
+    foreignColumns: [bankAccounts.organizationId, bankAccounts.id],
+    name: 'cheque_books_bank_account_fk',
+  }),
+  foreignKey({
+    columns: [table.organizationId, table.custodianUserId],
+    foreignColumns: [userRefs.organizationId, userRefs.id],
+    name: 'cheque_books_custodian_fk',
+  }),
   check('cheque_books_series_nonempty', sql`length(btrim(${table.series})) > 0`),
-  check('cheque_books_leaf_range', sql`${table.lastLeaf} >= ${table.firstLeaf}`),
+  check('cheque_books_positive_first_leaf', sql`${table.firstLeaf} >= 1`),
+  check(
+    'cheque_books_leaf_count',
+    sql`${table.lastLeaf} - ${table.firstLeaf} BETWEEN 0 AND 499`,
+  ),
   check(
     'cheque_books_state_check',
     sql`${table.state} IN ('DRAFT', 'ACTIVE', 'SUSPENDED', 'EXHAUSTED', 'CLOSED')`,
   ),
   check('cheque_books_version_nonnegative', sql`${table.version} >= 0`),
+]);
+
+export const chequeLeaves = pgTable('cheque_leaves', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  organizationId: uuid('organization_id').notNull().references(() => organizations.id),
+  chequeBookId: uuid('cheque_book_id').notNull(),
+  bankAccountId: uuid('bank_account_id').notNull(),
+  series: varchar('series', { length: 32 }).notNull(),
+  leafNumber: bigint('leaf_number', { mode: 'number' }).notNull(),
+  reservedForPaymentLineId: uuid('reserved_for_payment_line_id'),
+  reservationReviewDueAt: timestamp('reservation_review_due_at', { withTimezone: true }),
+  state: varchar('state', { length: 24 }).notNull().default('AVAILABLE'),
+  version: bigint('version', { mode: 'number' }).notNull().default(0),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  unique().on(table.organizationId, table.id),
+  unique().on(table.bankAccountId, table.series, table.leafNumber),
+  foreignKey({
+    columns: [
+      table.organizationId,
+      table.chequeBookId,
+      table.bankAccountId,
+      table.series,
+    ],
+    foreignColumns: [
+      chequeBooks.organizationId,
+      chequeBooks.id,
+      chequeBooks.bankAccountId,
+      chequeBooks.series,
+    ],
+    name: 'cheque_leaves_book_fk',
+  }),
+  check('cheque_leaves_number_positive', sql`${table.leafNumber} >= 1`),
+  check(
+    'cheque_leaves_state_check',
+    sql`${table.state} IN ('AVAILABLE', 'RESERVED', 'CONSUMED', 'VOID', 'LOST', 'STOPPED')`,
+  ),
+  check('cheque_leaves_version_nonnegative', sql`${table.version} >= 0`),
+  index('cheque_leaves_available_idx').on(
+    table.chequeBookId,
+    table.state,
+    table.leafNumber,
+  ),
+]);
+
+export const chequeEvents = pgTable('cheque_events', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  chequeType: varchar('cheque_type', { length: 16 }).notNull(),
+  chequeId: uuid('cheque_id').notNull(),
+  sequenceNo: bigint('sequence_no', { mode: 'number' }).notNull(),
+  fromState: varchar('from_state', { length: 24 }),
+  toState: varchar('to_state', { length: 24 }).notNull(),
+  actorUserId: uuid('actor_user_id').notNull().references(() => userRefs.id),
+  reason: varchar('reason', { length: 500 }),
+  evidenceDigest: varchar('evidence_digest', { length: 128 }),
+  custodianBeforeType: varchar('custodian_before_type', { length: 16 }),
+  custodianBeforeId: uuid('custodian_before_id'),
+  custodianAfterType: varchar('custodian_after_type', { length: 16 }),
+  custodianAfterId: uuid('custodian_after_id'),
+  occurredAt: timestamp('occurred_at', { withTimezone: true }).notNull().defaultNow(),
+  idempotencyKey: varchar('idempotency_key', { length: 128 }).notNull(),
+}, (table) => [
+  unique().on(table.chequeType, table.chequeId, table.sequenceNo),
+  unique().on(table.chequeType, table.chequeId, table.idempotencyKey),
+  check(
+    'cheque_events_type_check',
+    sql`${table.chequeType} IN ('RECEIVED', 'ISSUED', 'LEAF')`,
+  ),
+  check('cheque_events_sequence_positive', sql`${table.sequenceNo} > 0`),
+  check(
+    'cheque_events_foundation_reason',
+    sql`${table.chequeType} <> 'LEAF'
+      OR ${table.fromState} <> 'AVAILABLE'
+      OR ${table.toState} NOT IN ('VOID', 'LOST')
+      OR NULLIF(btrim(${table.reason}), '') IS NOT NULL`,
+  ),
 ]);
 
 export const printTemplates = pgTable('print_templates', {

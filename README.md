@@ -1,6 +1,6 @@
 # Treasury Backend
 
-NestJS modular monolith through the owner-approved `INC-1E-BANKING-BASE-DATA` increment.
+NestJS modular monolith through the owner-approved `INC-1G-CHEQUE-FOUNDATION` increment.
 The exact governed source is pinned in `canon-revision.json`.
 
 ## Runtime
@@ -55,6 +55,10 @@ locked transaction; then displays the single recovery code once.
   list/create operations with semantic views, resource-scoped authorization,
   active same-organization references, keyset pagination, replay authorization,
   and database-enforced account/collection-endpoint invariants;
+- immutable Print Template draft version list/create with canonical JSON digest
+  verification and semantic scope references;
+- atomic active Cheque Book creation with complete bounded available-leaf ranges,
+  plus versioned `AVAILABLE`-to-`VOID`/`LOST` controls and append-only events;
 - command-bound TOTP step-up for `createIdentityAccount`.
 
 There are no JWTs, generic repositories, CQRS buses, microservices, queues,
