@@ -12,6 +12,10 @@ import {
 import type { CashboxRepository } from '../src/cashbox-and-custody/cashbox.repository';
 import { CashboxService } from '../src/cashbox-and-custody/cashbox.service';
 import { TreasuryProblem } from '../src/common/problem';
+import type { DatabaseService } from '../src/database/database.service';
+import type { AccessAuthorizationService } from '../src/access-control/access-authorization.service';
+import type { IdentityService } from '../src/access-control/identity.service';
+import type { MasterDataService } from '../src/master-data/master-data.service';
 
 const id = (last: number) => `00000000-0000-4000-8000-${String(last).padStart(12, '0')}`;
 const baseCreate = (): CashboxCreateDto => ({
@@ -32,7 +36,13 @@ const baseHandover = (): HandoverCreateDto => ({
 });
 
 test('Cashbox service rejects invalid controls, cursor, and strong version before SQL', () => {
-  const service = new CashboxService({} as CashboxRepository);
+  const service = new CashboxService(
+    {} as CashboxRepository,
+    {} as DatabaseService,
+    {} as AccessAuthorizationService,
+    {} as IdentityService,
+    {} as MasterDataService,
+  );
   process.env.COMMAND_DIGEST_HMAC_KEY_BASE64 = Buffer.alloc(32, 21).toString('base64');
 
   for (const dto of [
@@ -106,11 +116,19 @@ test('Cashbox service maps stable create, stale-version, and custody failures', 
     [new RangeError('STALE_VERSION'), 'TRS-GEN-006'],
     [new RangeError('CUSTODY_CONFLICT'), 'TRS-CSH-002'],
   ] as const) {
-    const service = new CashboxService({
-      createHandover: async () => {
-        throw failure;
-      },
-    } as unknown as CashboxRepository);
+    const service = new CashboxService(
+      {} as CashboxRepository,
+      {
+        db: {
+          transaction: async () => {
+            throw failure;
+          },
+        },
+      } as unknown as DatabaseService,
+      {} as AccessAuthorizationService,
+      {} as IdentityService,
+      {} as MasterDataService,
+    );
     await assert.rejects(
       service.createHandover(
         id(9),

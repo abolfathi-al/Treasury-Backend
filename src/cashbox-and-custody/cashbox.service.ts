@@ -1,7 +1,15 @@
 import { Inject, Injectable } from '@nestjs/common';
+import { randomUUID } from 'node:crypto';
 
-import { commandDigest } from '../common/http';
+import { AccessAuthorizationService } from '../access-control/access-authorization.service';
+import { IdentityService } from '../access-control/identity.service';
+import { commandDigest, digest, stableJson } from '../common/http';
 import { TreasuryProblem } from '../common/problem';
+import {
+  DatabaseService,
+  type DatabaseTransaction,
+} from '../database/database.service';
+import { MasterDataService } from '../master-data/master-data.service';
 import {
   CashboxCreateDto,
   CashboxHandoverView,
@@ -16,7 +24,14 @@ const DECIMAL = /^-?(?:0|[1-9][0-9]{0,29})(?:\.[0-9]{1,8})?$/u;
 
 @Injectable()
 export class CashboxService {
-  constructor(@Inject(CashboxRepository) private readonly repository: CashboxRepository) {}
+  constructor(
+    @Inject(CashboxRepository) private readonly repository: CashboxRepository,
+    @Inject(DatabaseService) private readonly database: DatabaseService,
+    @Inject(AccessAuthorizationService)
+    private readonly authorization: AccessAuthorizationService,
+    @Inject(IdentityService) private readonly identity: IdentityService,
+    @Inject(MasterDataService) private readonly masterData: MasterDataService,
+  ) {}
 
   async list(
     organizationId: string,
@@ -90,21 +105,154 @@ export class CashboxService {
     }
     const version = this.ifMatch(ifMatch);
     const safeRequestId = this.requiredRequestId(requestId);
-    return this.mapCreate(() => this.repository.createHandover(
-      organizationId,
+    const idempotencyKey = this.key(key);
+    const requestDigest = commandDigest('createCashboxHandover', {
       actorUserId,
       cashboxId,
-      dto,
-      this.key(key),
-      commandDigest('createCashboxHandover', {
+      ifMatch,
+      body: dto,
+    });
+    return this.mapCreate(() => this.database.db.transaction(async (transaction) => {
+      await this.repository.acquireHandoverIdempotencyLock(
+        transaction,
+        organizationId,
+        idempotencyKey,
+      );
+      const replay = await this.repository.findHandoverIdempotencyRecord(
+        transaction,
+        organizationId,
+        idempotencyKey,
+      );
+      if (replay) {
+        await this.assertHandoverAuthorized(
+          transaction,
+          organizationId,
+          actorUserId,
+          cashboxId,
+        );
+        const assignment = await this.repository.findPrimaryAssignmentForReplay(
+          transaction,
+          organizationId,
+          cashboxId,
+        );
+        if (!assignment || assignment.userId !== actorUserId) {
+          throw new RangeError('CUSTODY_CONFLICT');
+        }
+        if (replay.requestDigest !== requestDigest || !replay.responseBody) {
+          throw new SyntaxError('IDEMPOTENCY_CONFLICT');
+        }
+        return replay.responseBody;
+      }
+
+      await this.repository.insertHandoverIdempotencyRecord(
+        transaction,
+        organizationId,
+        idempotencyKey,
+        requestDigest,
+      );
+      await this.assertHandoverAuthorized(
+        transaction,
+        organizationId,
         actorUserId,
         cashboxId,
-        ifMatch,
-        body: dto,
-      }),
-      version,
-      safeRequestId,
-    ));
+      );
+      const cashbox = await this.repository.findCashboxForHandover(
+        transaction,
+        organizationId,
+        cashboxId,
+      );
+      if (!cashbox) throw new ReferenceError('RESOURCE_HIDDEN');
+      if (cashbox.state !== 'ACTIVE') throw new Error('STATE_CONFLICT');
+      if (cashbox.version !== version) throw new RangeError('STALE_VERSION');
+
+      const assignment = await this.repository.findPrimaryAssignmentForHandover(
+        transaction,
+        organizationId,
+        cashboxId,
+      );
+      if (!assignment || assignment.userId !== actorUserId) {
+        throw new RangeError('CUSTODY_CONFLICT');
+      }
+      if (await this.repository.hasNonterminalHandover(transaction, cashboxId)) {
+        throw new Error('STATE_CONFLICT');
+      }
+
+      const incoming = await this.identity.findUserRefState(
+        transaction,
+        organizationId,
+        dto.incomingUserId,
+      );
+      if (!incoming) throw new ReferenceError('RESOURCE_HIDDEN');
+      if (incoming.state !== 'ACTIVE') throw new ReferenceError('INACTIVE_REFERENCE');
+
+      const controlledCurrencies = await this.repository
+        .listHandoverControlledCurrencies(transaction, cashboxId);
+      const allowed = await this.masterData.findCurrencyDecimalPlaces(
+        transaction,
+        organizationId,
+        controlledCurrencies,
+      );
+      const submitted = [...dto.moneyCounts]
+        .sort((left, right) => left.currency.localeCompare(right.currency));
+      if (
+        stableJson(submitted.map(({ currency }) => currency))
+        !== stableJson(allowed.map(({ currency }) => currency))
+        || submitted.some(({ currency, countedAmount }) => (
+          (countedAmount.split('.')[1]?.length ?? 0)
+          > (allowed.find((row) => row.currency === currency)?.decimalPlaces ?? -1)
+        ))
+        || dto.observedInstrumentIds.length > 0
+      ) throw new Error('VALIDATION');
+
+      const discrepancyCurrencies = submitted
+        .filter(({ countedAmount }) => !decimalIsZero(countedAmount))
+        .map(({ currency }) => currency);
+      const hasDiscrepancy = discrepancyCurrencies.length > 0;
+      if (hasDiscrepancy && !dto.reason?.trim()) throw new Error('VALIDATION');
+
+      const handoverId = randomUUID();
+      const snapshot = submitted.map(({ currency }) => ({ currency, bookAmount: '0' }));
+      const response = await this.repository.insertCountedHandover(transaction, {
+        id: handoverId,
+        organizationId,
+        cashboxId,
+        currentAssignmentId: assignment.id,
+        actorUserId,
+        incomingUserId: dto.incomingUserId,
+        bookSnapshotDigest: digest(stableJson({ money: snapshot, instruments: [] })),
+        hasDiscrepancy,
+        discrepancyCurrencies,
+        ...(dto.reason ? { reason: dto.reason } : {}),
+        requestId: safeRequestId,
+        moneyCounts: submitted,
+      });
+      await this.repository.saveHandoverIdempotencyResponse(
+        transaction,
+        organizationId,
+        idempotencyKey,
+        response,
+      );
+      return response;
+    }));
+  }
+
+  private async assertHandoverAuthorized(
+    transaction: DatabaseTransaction,
+    organizationId: string,
+    actorUserId: string,
+    cashboxId: string,
+  ): Promise<void> {
+    const context = await this.repository.findHandoverAuthorizationContext(
+      transaction,
+      organizationId,
+      cashboxId,
+    );
+    if (!await this.authorization.canCreateCashboxHandover(
+      transaction,
+      organizationId,
+      actorUserId,
+      context,
+    )) throw new Error('SCOPE_DENIED');
   }
 
   private validateCreate(dto: CashboxCreateDto, commandAt: Date): void {
@@ -257,4 +405,8 @@ export class CashboxService {
       throw error;
     }
   }
+}
+
+function decimalIsZero(value: string): boolean {
+  return /^-?0(?:\.0+)?$/u.test(value);
 }
