@@ -3,6 +3,8 @@ import {
   ArrayMinSize,
   ArrayUnique,
   IsArray,
+  IsBoolean,
+  IsDefined,
   IsIn,
   IsISO8601,
   IsOptional,
@@ -77,6 +79,7 @@ export const CANON_PERMISSIONS = [
   'receipt.view',
   'report.view',
   'role.manage',
+  'separation.override',
   'settlement.confirm',
   'settlement.create',
   'settlement.reverse',
@@ -99,6 +102,7 @@ export const PRIVILEGED_PERMISSIONS = [
   'payment.reverse',
   'receipt.reverse',
   'role.manage',
+  'separation.override',
   'settlement.reverse',
 ] as const;
 
@@ -169,6 +173,9 @@ export class AccessGrantCreateDto {
   @IsUUID() userId!: string;
   @IsUUID() roleId!: string;
 
+  @IsDefined() @IsBoolean()
+  organizationWide!: boolean;
+
   @IsOptional() @ValidateNested() @Type(() => GrantScopeDto)
   scope?: GrantScopeDto;
 
@@ -201,6 +208,7 @@ export interface CanonicalGrantScope {
 }
 
 export interface GrantAuthorization {
+  organizationWide: boolean;
   scope: CanonicalGrantScope;
   validFrom: Date;
   validTo: Date | null;

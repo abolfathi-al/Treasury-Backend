@@ -374,13 +374,13 @@ async function seed(database: DatabaseService) {
     `, [scopedRole.rows[0]!.id]);
     await client.query(`
       INSERT INTO access_grants (
-        organization_id, user_ref_id, role_id, scope_id
-      ) VALUES ($1,$2,$3,$1)
+        organization_id, user_ref_id, role_id, scope_id, organization_wide
+      ) VALUES ($1,$2,$3,$1,true)
     `, [organizationId, userId.get('banking-admin'), adminRole.rows[0]!.id]);
     const scopedGrant = await client.query<{ id: string }>(`
       INSERT INTO access_grants (
-        organization_id, user_ref_id, role_id, scope_id
-      ) VALUES ($1,$2,$3,$1)
+        organization_id, user_ref_id, role_id, scope_id, organization_wide
+      ) VALUES ($1,$2,$3,$1,false)
       RETURNING id
     `, [organizationId, userId.get('banking-scoped'), scopedRole.rows[0]!.id]);
     await client.query(`

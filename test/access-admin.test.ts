@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
+  AccessGrantCreateDto,
   CANON_PERMISSIONS,
   CanonicalGrantScope,
   PRIVILEGED_PERMISSIONS,
@@ -19,7 +20,7 @@ import { TreasuryProblem } from '../src/common/problem';
 const id = (suffix: number) => `00000000-0000-4000-8000-${String(suffix).padStart(12, '0')}`;
 
 test('Role permission admission is the exact Canon vocabulary including conditional step-up', () => {
-  assert.equal(CANON_PERMISSIONS.length, 71);
+  assert.equal(CANON_PERMISSIONS.length, 72);
   assert.equal(new Set(CANON_PERMISSIONS).size, CANON_PERMISSIONS.length);
   assert.deepEqual([...PRIVILEGED_PERMISSIONS].sort(), [
     'access-grant.manage',
@@ -32,6 +33,7 @@ test('Role permission admission is the exact Canon vocabulary including conditio
     'payment.reverse',
     'receipt.reverse',
     'role.manage',
+    'separation.override',
     'settlement.reverse',
   ]);
 });
@@ -75,6 +77,41 @@ test('Grant scope rejects explicit empty objects and invalid amount-currency com
     }),
     (error) => problem(error, 'TRS-GEN-001', 422),
   );
+});
+
+test('Access Grant creation requires one explicit and consistent scope mode', () => {
+  const base = { userId: id(1), roleId: id(2) };
+  for (const command of [
+    base as AccessGrantCreateDto,
+    { ...base, organizationWide: true, scope: { branchIds: [id(3)] } },
+    { ...base, organizationWide: false },
+    { ...base, organizationWide: false, scope: {} },
+  ]) {
+    assert.throws(
+      () => prepareGrant(command as AccessGrantCreateDto),
+      (error) => problem(error, 'TRS-GEN-001', 422),
+    );
+  }
+
+  const wide = prepareGrant({ ...base, organizationWide: true });
+  assert.equal(wide.organizationWide, true);
+  assert.deepEqual(wide.scope, {
+    branchIds: [],
+    treasuryUnitIds: [],
+    cashboxIds: [],
+    bankAccountIds: [],
+    documentTypes: [],
+    methodCategories: [],
+    currencies: [],
+  });
+
+  const restricted = prepareGrant({
+    ...base,
+    organizationWide: false,
+    scope: { branchIds: [id(3)] },
+  });
+  assert.equal(restricted.organizationWide, false);
+  assert.deepEqual(restricted.scope.branchIds, [id(3)]);
 });
 
 test('one grant must satisfy every dimension without cross-grant restriction mixing', () => {
@@ -138,6 +175,7 @@ test('cashbox scope is admitted after the Cashbox owner table is authorized', ()
     prepareGrant({
       userId: id(1),
       roleId: id(2),
+      organizationWide: false,
       scope: { cashboxIds: [id(3)] },
     }).scope.cashboxIds,
     [id(3)],
@@ -149,6 +187,7 @@ test('bank-account scope is admitted after the BankAccount owner table is author
     prepareGrant({
       userId: id(1),
       roleId: id(2),
+      organizationWide: false,
       scope: { bankAccountIds: [id(3)] },
     }).scope.bankAccountIds,
     [id(3)],
@@ -156,17 +195,21 @@ test('bank-account scope is admitted after the BankAccount owner table is author
 });
 
 function authorization(partial: Partial<CanonicalGrantScope>) {
+  const scope = {
+    branchIds: [],
+    treasuryUnitIds: [],
+    cashboxIds: [],
+    bankAccountIds: [],
+    documentTypes: [],
+    methodCategories: [],
+    currencies: [],
+    ...partial,
+  };
   return {
-    scope: {
-      branchIds: [],
-      treasuryUnitIds: [],
-      cashboxIds: [],
-      bankAccountIds: [],
-      documentTypes: [],
-      methodCategories: [],
-      currencies: [],
-      ...partial,
-    },
+    organizationWide: !Object.values(scope).some((value) => (
+      Array.isArray(value) ? value.length > 0 : Boolean(value)
+    )),
+    scope,
     validFrom: new Date('2026-01-01T00:00:00.000Z'),
     validTo: new Date('2028-01-01T00:00:00.000Z'),
   };

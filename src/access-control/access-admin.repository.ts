@@ -28,6 +28,7 @@ export interface ProtectedCommandContext {
 export interface PreparedAccessGrant {
   userId: string;
   roleId: string;
+  organizationWide: boolean;
   scope: CanonicalGrantScope;
   validFrom: Date;
   validTo: Date | null;
@@ -38,6 +39,7 @@ interface AccessGrantRow {
   id: string;
   userId: string;
   roleId: string;
+  organizationWide: boolean;
   amountCeiling: string | null;
   amountCeilingCurrency: string | null;
   validFrom: Date;
@@ -184,6 +186,7 @@ export class AccessAdminRepository {
   ): Promise<GrantAuthorization[]> {
     const result = await this.database.pool.query<AccessGrantRow>(`
       SELECT ag.id, ag.user_ref_id AS "userId", ag.role_id AS "roleId",
+             ag.organization_wide AS "organizationWide",
              ag.amount_ceiling AS "amountCeiling",
              ag.amount_ceiling_currency AS "amountCeilingCurrency",
              ag.valid_from AS "validFrom", ag.valid_to AS "validTo",
@@ -203,6 +206,7 @@ export class AccessAdminRepository {
     `, [organizationId, userId, permission]);
     const scopes = await this.loadScopes(this.database.pool, result.rows);
     return result.rows.map((row) => ({
+      organizationWide: row.organizationWide,
       scope: scopes.get(row.id)!,
       validFrom: row.validFrom,
       validTo: row.validTo,
@@ -212,6 +216,7 @@ export class AccessAdminRepository {
   async findAccessGrants(organizationId: string, cursor?: string) {
     const result = await this.database.pool.query<AccessGrantRow>(`
       SELECT ag.id, ag.user_ref_id AS "userId", ag.role_id AS "roleId",
+             ag.organization_wide AS "organizationWide",
              ag.amount_ceiling AS "amountCeiling",
              ag.amount_ceiling_currency AS "amountCeilingCurrency",
              ag.valid_from AS "validFrom", ag.valid_to AS "validTo",
@@ -285,9 +290,11 @@ export class AccessAdminRepository {
       const result = await client.query<AccessGrantRow>(`
         INSERT INTO access_grants (
           organization_id, user_ref_id, role_id, scope_type, scope_id,
-          amount_ceiling, amount_ceiling_currency, valid_from, valid_to, reason
-        ) VALUES ($1,$2,$3,'ORGANIZATION',$1,$4,$5,$6,$7,$8)
+          organization_wide, amount_ceiling, amount_ceiling_currency,
+          valid_from, valid_to, reason
+        ) VALUES ($1,$2,$3,'ORGANIZATION',$1,$4,$5,$6,$7,$8,$9)
         RETURNING id, user_ref_id AS "userId", role_id AS "roleId",
+                  organization_wide AS "organizationWide",
                   amount_ceiling AS "amountCeiling",
                   amount_ceiling_currency AS "amountCeilingCurrency",
                   valid_from AS "validFrom", valid_to AS "validTo",
@@ -297,6 +304,7 @@ export class AccessAdminRepository {
         command.organizationId,
         dto.userId,
         dto.roleId,
+        dto.organizationWide,
         dto.scope.amountCeiling?.amount ?? null,
         dto.scope.amountCeiling?.currency ?? null,
         dto.validFrom,
@@ -566,6 +574,7 @@ export class AccessAdminRepository {
   ): Promise<boolean> {
     const result = await client.query<AccessGrantRow>(`
       SELECT ag.id, ag.user_ref_id AS "userId", ag.role_id AS "roleId",
+             ag.organization_wide AS "organizationWide",
              ag.amount_ceiling AS "amountCeiling",
              ag.amount_ceiling_currency AS "amountCeilingCurrency",
              ag.valid_from AS "validFrom", ag.valid_to AS "validTo",
@@ -578,8 +587,9 @@ export class AccessAdminRepository {
         AND ag.state = 'ACTIVE'
         AND ag.valid_from = $4
         AND ag.valid_to IS NOT DISTINCT FROM $5::timestamptz
-        AND ag.amount_ceiling IS NOT DISTINCT FROM $6::numeric
-        AND ag.amount_ceiling_currency IS NOT DISTINCT FROM $7::varchar
+        AND ag.organization_wide = $6
+        AND ag.amount_ceiling IS NOT DISTINCT FROM $7::numeric
+        AND ag.amount_ceiling_currency IS NOT DISTINCT FROM $8::varchar
       FOR UPDATE
     `, [
       organizationId,
@@ -587,6 +597,7 @@ export class AccessAdminRepository {
       dto.roleId,
       dto.validFrom,
       dto.validTo,
+      dto.organizationWide,
       dto.scope.amountCeiling?.amount ?? null,
       dto.scope.amountCeiling?.currency ?? null,
     ]);
@@ -676,6 +687,7 @@ export class AccessAdminRepository {
       id: row.id,
       userId: row.userId,
       roleId: row.roleId,
+      organizationWide: row.organizationWide,
       ...(hasScope ? { scope: compactScope(scope) } : {}),
       validFrom: row.validFrom,
       ...(row.validTo ? { validTo: row.validTo } : {}),

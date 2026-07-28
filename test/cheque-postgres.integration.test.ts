@@ -136,13 +136,14 @@ test('INC-1G PostgreSQL books and leaf controls are scoped, atomic, and serializ
         AND leaf_number BETWEEN 200 AND 215
     `, [fixture.organizationId])).rows[0]!.count, '11');
 
-    await database.pool.query(
-      'DELETE FROM access_grant_bank_account_scopes WHERE access_grant_id = $1',
-      [fixture.scopedGrantId],
-    );
     await database.pool.query(`
+      WITH removed AS (
+        DELETE FROM access_grant_bank_account_scopes
+        WHERE access_grant_id = $1
+        RETURNING access_grant_id
+      )
       INSERT INTO access_grant_bank_account_scopes (access_grant_id, bank_account_id)
-      VALUES ($1,$2)
+      SELECT access_grant_id, $2 FROM removed
     `, [fixture.scopedGrantId, fixture.accountBId]);
     await assert.rejects(
       service.createChequeBook(
@@ -154,13 +155,14 @@ test('INC-1G PostgreSQL books and leaf controls are scoped, atomic, and serializ
       ),
       (error) => problem(error, 'TRS-GEN-003', 403),
     );
-    await database.pool.query(
-      'DELETE FROM access_grant_bank_account_scopes WHERE access_grant_id = $1',
-      [fixture.scopedGrantId],
-    );
     await database.pool.query(`
+      WITH removed AS (
+        DELETE FROM access_grant_bank_account_scopes
+        WHERE access_grant_id = $1
+        RETURNING access_grant_id
+      )
       INSERT INTO access_grant_bank_account_scopes (access_grant_id, bank_account_id)
-      VALUES ($1,$2)
+      SELECT access_grant_id, $2 FROM removed
     `, [fixture.scopedGrantId, fixture.accountAId]);
 
     await assert.rejects(
@@ -492,11 +494,11 @@ async function seed(database: DatabaseService) {
     `, [role.rows[0]!.id]);
     const grants = await client.query<{ id: string; user_ref_id: string }>(`
       INSERT INTO access_grants (
-        organization_id, user_ref_id, role_id, scope_id
+        organization_id, user_ref_id, role_id, scope_id, organization_wide
       ) VALUES
-        ($1,$2,$5,$1),
-        ($1,$3,$5,$1),
-        ($1,$4,$5,$1)
+        ($1,$2,$5,$1,true),
+        ($1,$3,$5,$1,false),
+        ($1,$4,$5,$1,false)
       RETURNING id, user_ref_id
     `, [
       organizationId,

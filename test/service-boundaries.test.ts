@@ -167,6 +167,7 @@ test('all business create boundaries enforce the OpenAPI Idempotency-Key length'
       {
         userId: '00000000-0000-4000-8000-000000000001',
         roleId: '00000000-0000-4000-8000-000000000002',
+        organizationWide: true,
       },
       'x',
       'request',

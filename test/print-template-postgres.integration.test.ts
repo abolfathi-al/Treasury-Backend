@@ -435,10 +435,10 @@ async function seed(database: DatabaseService) {
     `, [roleIds.get('PRINT_ADMIN'), roleIds.get('PRINT_SCOPED')]);
     await client.query(`
       INSERT INTO access_grants (
-        organization_id, user_ref_id, role_id, scope_id
+        organization_id, user_ref_id, role_id, scope_id, organization_wide
       ) VALUES
-        ($1,$2,$4,$1),
-        ($1,$3,$4,$1)
+        ($1,$2,$4,$1,true),
+        ($1,$3,$4,$1,true)
     `, [
       organizationId,
       userIds.get('print-admin'),
@@ -447,8 +447,8 @@ async function seed(database: DatabaseService) {
     ]);
     const scopedGrant = await client.query<{ id: string }>(`
       INSERT INTO access_grants (
-        organization_id, user_ref_id, role_id, scope_id
-      ) VALUES ($1,$2,$3,$1)
+        organization_id, user_ref_id, role_id, scope_id, organization_wide
+      ) VALUES ($1,$2,$3,$1,false)
       RETURNING id
     `, [
       organizationId,

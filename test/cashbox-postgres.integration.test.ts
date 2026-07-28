@@ -87,8 +87,14 @@ test('INC-1D PostgreSQL create/list/handover are scoped, replay-safe, atomic, an
       (error) => problem(error, 'TRS-GEN-007', 409),
     );
     await database.pool.query(`
+      WITH restricted AS (
+        UPDATE access_grants
+        SET organization_wide = false
+        WHERE id = $1
+        RETURNING id
+      )
       INSERT INTO access_grant_branch_scopes (access_grant_id, branch_id)
-      VALUES ($1,$2)
+      SELECT id, $2 FROM restricted
     `, [fixture.primaryGrantId, fixture.otherBranchId]);
     await assert.rejects(
       service.create(
@@ -100,10 +106,16 @@ test('INC-1D PostgreSQL create/list/handover are scoped, replay-safe, atomic, an
       ),
       (error) => problem(error, 'TRS-GEN-003', 403),
     );
-    await database.pool.query(
-      'DELETE FROM access_grant_branch_scopes WHERE access_grant_id = $1',
-      [fixture.primaryGrantId],
-    );
+    await database.pool.query(`
+      WITH removed AS (
+        DELETE FROM access_grant_branch_scopes
+        WHERE access_grant_id = $1
+        RETURNING access_grant_id
+      )
+      UPDATE access_grants
+      SET organization_wide = true
+      WHERE id IN (SELECT access_grant_id FROM removed)
+    `, [fixture.primaryGrantId]);
     await assert.rejects(
       service.create(
         fixture.organizationId,
@@ -347,8 +359,8 @@ async function seed(database: DatabaseService) {
     for (const subject of ['primary', 'other']) {
       const grant = await client.query<{ id: string }>(`
         INSERT INTO access_grants (
-          organization_id, user_ref_id, role_id, scope_id
-        ) VALUES ($1,$2,$3,$1)
+          organization_id, user_ref_id, role_id, scope_id, organization_wide
+        ) VALUES ($1,$2,$3,$1,true)
         RETURNING id
       `, [organizationId, userId.get(subject), role.rows[0]!.id]);
       if (subject === 'primary') primaryGrantId = grant.rows[0]!.id;
@@ -359,8 +371,8 @@ async function seed(database: DatabaseService) {
     `, [organizationId]);
     const scopedGrant = await client.query<{ id: string }>(`
       INSERT INTO access_grants (
-        organization_id, user_ref_id, role_id, scope_id
-      ) VALUES ($1,$2,$3,$1)
+        organization_id, user_ref_id, role_id, scope_id, organization_wide
+      ) VALUES ($1,$2,$3,$1,false)
       RETURNING id
     `, [organizationId, userId.get('scoped'), role.rows[0]!.id]);
     await client.query(`

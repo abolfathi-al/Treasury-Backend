@@ -6,6 +6,7 @@ import { METHOD_METADATA, PATH_METADATA } from '@nestjs/common/constants';
 
 import { AuthController } from '../src/access-control/auth.controller';
 import { AccessAdminController } from '../src/access-control/access-admin.controller';
+import { CANON_PERMISSIONS } from '../src/access-control/access-admin.dto';
 import {
   AUTHORIZATION_OPERATION,
   PERMISSION_SCOPE_MODE,
@@ -326,6 +327,40 @@ test('INC-1B migration normalizes scopes, constrains permissions, and versions s
   ]) {
     assert.match(migration, new RegExp(invariant, 'u'));
   }
+});
+
+test('CHG-017 requires explicit Access Grant scope mode across contract and persistence', async () => {
+  const migration = await readFile(
+    'migrations/0011_explicit_access_grant_scope.sql',
+    'utf8',
+  );
+  const dto = await readFile('src/access-control/access-admin.dto.ts', 'utf8');
+  const repository = await readFile('src/access-control/access-admin.repository.ts', 'utf8');
+  const auth = await readFile('src/access-control/auth.repository.ts', 'utf8');
+  const schema = await readFile('src/database/schema.ts', 'utf8');
+  for (const source of [migration, dto, repository, schema]) {
+    assert.match(source, /organizationWide|organization_wide/u);
+  }
+  for (const invariant of [
+    'access_grants_wide_without_amount',
+    'access_grants_scope_mode_consistency',
+    'DEFERRABLE INITIALLY DEFERRED',
+    'access_grant_currency_scopes_mode_guard',
+  ]) {
+    assert.match(migration, new RegExp(invariant, 'u'));
+  }
+  assert.match(auth, /AND ag\.organization_wide/u);
+});
+
+test('CHG-017 admits the emergency separation override permission', async () => {
+  const migrations = await Promise.all([
+    readFile('migrations/0002_access_control.sql', 'utf8'),
+    readFile('migrations/0012_separation_override_permission.sql', 'utf8'),
+  ]);
+  const persisted = [...migrations.join('\n').matchAll(/\('([^']+)'\)/gu)]
+    .map((match) => match[1])
+    .sort();
+  assert.deepEqual(persisted, [...CANON_PERMISSIONS].sort());
 });
 
 test('INC-1C migration and Drizzle schema normalize organization-scoped Party kinds', async () => {

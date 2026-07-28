@@ -119,6 +119,7 @@ export class AccessAdminService {
     const visible = grants.filter((grant) => authority.some((source) => grantContains(
       source,
       {
+        organizationWide: grant.organizationWide === true,
         scope: canonicalScope(grant.scope as GrantScopeDto | undefined),
         validFrom: new Date(grant.validFrom as string | Date),
         validTo: grant.validTo ? new Date(grant.validTo as string | Date) : null,
@@ -352,7 +353,16 @@ function representableAmount(value: string): boolean {
 }
 
 export function prepareGrant(dto: AccessGrantCreateDto): PreparedAccessGrant {
+  if (typeof dto.organizationWide !== 'boolean') {
+    throw new TreasuryProblem('TRS-GEN-001', 422);
+  }
+  if (dto.organizationWide === (dto.scope !== undefined)) {
+    throw new TreasuryProblem('TRS-GEN-001', 422);
+  }
   const scope = canonicalScope(dto.scope);
+  if (!dto.organizationWide && !hasScope(scope)) {
+    throw new TreasuryProblem('TRS-GEN-001', 422);
+  }
   const validFrom = dto.validFrom ? new Date(dto.validFrom) : new Date();
   const validTo = dto.validTo ? new Date(dto.validTo) : null;
   if (
@@ -364,6 +374,7 @@ export function prepareGrant(dto: AccessGrantCreateDto): PreparedAccessGrant {
   return {
     userId: dto.userId,
     roleId: dto.roleId,
+    organizationWide: dto.organizationWide,
     scope,
     validFrom,
     validTo,
@@ -377,6 +388,8 @@ export function grantContains(
 ): boolean {
   if (target.validFrom < source.validFrom) return false;
   if (source.validTo && (!target.validTo || target.validTo > source.validTo)) return false;
+  if (source.organizationWide) return true;
+  if (target.organizationWide) return false;
   for (const dimension of [
     'branchIds',
     'treasuryUnitIds',
@@ -403,6 +416,12 @@ export function grantContains(
     }
   }
   return true;
+}
+
+function hasScope(scope: CanonicalGrantScope): boolean {
+  return Object.values(scope).some((value) => (
+    Array.isArray(value) ? value.length > 0 : Boolean(value)
+  ));
 }
 
 function containsValues(source: string[], target: string[]): boolean {

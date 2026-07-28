@@ -177,6 +177,7 @@ export const accessGrants = pgTable('access_grants', {
   roleId: uuid('role_id').notNull().references(() => roles.id),
   scopeType: varchar('scope_type', { length: 32 }).notNull().default('ORGANIZATION'),
   scopeId: uuid('scope_id').notNull().references(() => organizations.id),
+  organizationWide: boolean('organization_wide').notNull(),
   amountCeiling: numeric('amount_ceiling', { precision: 38, scale: 8 }),
   amountCeilingCurrency: varchar('amount_ceiling_currency', { length: 8 }),
   validFrom: timestamp('valid_from', { withTimezone: true }).notNull().defaultNow(),
@@ -194,6 +195,10 @@ export const accessGrants = pgTable('access_grants', {
     name: 'access_grants_amount_currency_fk',
   }),
   check('access_grants_amount_positive', sql`${table.amountCeiling} IS NULL OR ${table.amountCeiling} > 0`),
+  check(
+    'access_grants_wide_without_amount',
+    sql`NOT ${table.organizationWide} OR ${table.amountCeiling} IS NULL`,
+  ),
   check('access_grants_valid_interval', sql`${table.validTo} IS NULL OR ${table.validTo} > ${table.validFrom}`),
 ]);
 

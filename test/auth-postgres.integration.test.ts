@@ -858,8 +858,11 @@ async function seedAccount(database: DatabaseService, credentials: CredentialSer
       );
     }
     await client.query(`
-      INSERT INTO access_grants (organization_id, user_ref_id, role_id, scope_type, scope_id)
-      VALUES ($1,$2,$3,'ORGANIZATION',$1)
+      INSERT INTO access_grants (
+        organization_id, user_ref_id, role_id, scope_type, scope_id,
+        organization_wide
+      )
+      VALUES ($1,$2,$3,'ORGANIZATION',$1,true)
     `, [organizationId, user.rows[0]!.id, role.rows[0]!.id]);
     await client.query('COMMIT');
     return { password, secret, recoveryCode, accountId: account.rows[0]!.id };

@@ -5,7 +5,10 @@ import test from 'node:test';
 
 import { AccessAdminRepository } from '../src/access-control/access-admin.repository';
 import { AccessAdminService } from '../src/access-control/access-admin.service';
-import { SessionRevokeScope } from '../src/access-control/access-admin.dto';
+import {
+  AccessGrantCreateDto,
+  SessionRevokeScope,
+} from '../src/access-control/access-admin.dto';
 import { AuthRepository } from '../src/access-control/auth.repository';
 import { AuthService, SessionContext } from '../src/access-control/auth.service';
 import { operationPermissionGranted } from '../src/access-control/auth.guard';
@@ -173,6 +176,7 @@ test('INC-1B PostgreSQL commands are scoped, replay-safe, atomic, and session-ch
     const grantBody = {
       userId: fixture.targetUserId,
       roleId: role.id,
+      organizationWide: false,
       scope: {
         branchIds: [fixture.branchId],
         documentTypes: ['PAYMENT'],
@@ -183,6 +187,78 @@ test('INC-1B PostgreSQL commands are scoped, replay-safe, atomic, and session-ch
       validFrom: '2026-01-01T00:00:00.000Z',
       reason: 'Foundation access',
     };
+    for (const [key, body] of [
+      [
+        'grant-mode-omitted',
+        { userId: fixture.targetUserId, roleId: role.id },
+      ],
+      [
+        'grant-wide-with-scope',
+        {
+          userId: fixture.targetUserId,
+          roleId: role.id,
+          organizationWide: true,
+          scope: { branchIds: [fixture.branchId] },
+        },
+      ],
+      [
+        'grant-restricted-without-scope',
+        {
+          userId: fixture.targetUserId,
+          roleId: role.id,
+          organizationWide: false,
+        },
+      ],
+      [
+        'grant-restricted-empty-scope',
+        {
+          userId: fixture.targetUserId,
+          roleId: role.id,
+          organizationWide: false,
+          scope: {},
+        },
+      ],
+    ] as const) {
+      const invalidStep = await step(
+        database,
+        fixture.actorAccountId,
+        fixture.actorSessionId,
+        'createAccessGrant',
+        '/v1/access-grants',
+        body,
+        key,
+      );
+      const epochBefore = await epoch(database, fixture.targetAccountId);
+      await assert.rejects(
+        service.createAccessGrant(
+          fixture.organizationId,
+          body as AccessGrantCreateDto,
+          key,
+          `${key}-request`,
+          actor,
+          invalidStep,
+        ),
+        (error) => problem(error, 'TRS-GEN-001', 422),
+      );
+      const state = await database.pool.query<{
+        grants: string;
+        idempotency: string;
+        proof_consumed: Date | null;
+      }>(`
+        SELECT
+          (SELECT count(*) FROM access_grants WHERE user_ref_id = $1)::text AS grants,
+          (SELECT count(*) FROM idempotency_records
+           WHERE idempotency_key = $2)::text AS idempotency,
+          p.consumed_at AS proof_consumed
+        FROM auth_step_up_proofs p WHERE p.token_digest = $3
+      `, [fixture.targetUserId, key, digest(invalidStep.proofId)]);
+      assert.deepEqual(state.rows[0], {
+        grants: '0',
+        idempotency: '0',
+        proof_consumed: null,
+      });
+      assert.equal(await epoch(database, fixture.targetAccountId), epochBefore);
+    }
     const oversizedBody = {
       ...grantBody,
       scope: {
@@ -246,7 +322,7 @@ test('INC-1B PostgreSQL commands are scoped, replay-safe, atomic, and session-ch
       'grant-request',
       actor,
       grantStep,
-    ) as { id: string };
+    ) as { id: string; organizationWide: boolean; scope?: unknown };
     const grantReplay = await service.createAccessGrant(
       fixture.organizationId,
       grantBody,
@@ -254,8 +330,11 @@ test('INC-1B PostgreSQL commands are scoped, replay-safe, atomic, and session-ch
       'grant-replay',
       actor,
       grantStep,
-    ) as { id: string };
+    ) as { id: string; organizationWide: boolean; scope?: unknown };
     assert.equal(grantReplay.id, grant.id);
+    assert.equal(grant.organizationWide, false);
+    assert.equal(grantReplay.organizationWide, false);
+    assert.ok(grant.scope);
     const grantState = await database.pool.query<{
       authorization_epoch: string;
       branches: string;
@@ -303,6 +382,7 @@ test('INC-1B PostgreSQL commands are scoped, replay-safe, atomic, and session-ch
     const privilegedBody = {
       userId: fixture.targetUserId,
       roleId: fixture.privilegedRoleId,
+      organizationWide: true,
       validFrom: '2026-01-01T00:00:00.000Z',
     };
     const ineligibleStep = await step(
@@ -354,14 +434,26 @@ test('INC-1B PostgreSQL commands are scoped, replay-safe, atomic, and session-ch
       privilegedBody,
       'grant-privileged',
     );
-    await service.createAccessGrant(
+    const privilegedGrant = await service.createAccessGrant(
       fixture.organizationId,
       privilegedBody,
       'grant-privileged',
       'grant-privileged-request',
       actor,
       eligibleStep,
-    );
+    ) as { id: string; organizationWide: boolean; scope?: unknown };
+    const privilegedReplay = await service.createAccessGrant(
+      fixture.organizationId,
+      privilegedBody,
+      'grant-privileged',
+      'grant-privileged-replay',
+      actor,
+      eligibleStep,
+    ) as { id: string; organizationWide: boolean; scope?: unknown };
+    assert.equal(privilegedGrant.organizationWide, true);
+    assert.equal(privilegedReplay.id, privilegedGrant.id);
+    assert.equal(privilegedReplay.organizationWide, true);
+    assert.equal(privilegedGrant.scope, undefined);
     assert.equal(await epoch(database, fixture.targetAccountId), 2);
 
     const rotated = await auth.authenticateSession(fixture.targetToken);
@@ -509,8 +601,9 @@ async function seed(database: DatabaseService) {
     }
     await client.query(`
       INSERT INTO access_grants (
-        organization_id, user_ref_id, role_id, scope_type, scope_id, valid_from
-      ) VALUES ($1,$2,$3,'ORGANIZATION',$1,'2020-01-01T00:00:00.000Z')
+        organization_id, user_ref_id, role_id, scope_type, scope_id,
+        organization_wide, valid_from
+      ) VALUES ($1,$2,$3,'ORGANIZATION',$1,true,'2020-01-01T00:00:00.000Z')
     `, [organizationId, actorUser.rows[0]!.id, adminRole.rows[0]!.id]);
     const privilegedRole = await client.query<{ id: string }>(`
       INSERT INTO roles (organization_id, code, name)
@@ -622,16 +715,27 @@ async function seedScopedAdmin(
       [role.rows[0]!.id, permission],
     );
   }
-  const grant = await database.pool.query<{ id: string }>(`
-    INSERT INTO access_grants (
-      organization_id, user_ref_id, role_id, scope_type, scope_id, valid_from
-    ) VALUES ($1,$2,$3,'ORGANIZATION',$1,'2020-01-01T00:00:00.000Z')
-    RETURNING id
-  `, [fixture.organizationId, user.rows[0]!.id, role.rows[0]!.id]);
-  await database.pool.query(`
-    INSERT INTO access_grant_branch_scopes (access_grant_id, branch_id)
-    VALUES ($1,$2)
-  `, [grant.rows[0]!.id, fixture.branchId]);
+  const scopedClient = await database.pool.connect();
+  try {
+    await scopedClient.query('BEGIN');
+    const grant = await scopedClient.query<{ id: string }>(`
+      INSERT INTO access_grants (
+        organization_id, user_ref_id, role_id, scope_type, scope_id,
+        organization_wide, valid_from
+      ) VALUES ($1,$2,$3,'ORGANIZATION',$1,false,'2020-01-01T00:00:00.000Z')
+      RETURNING id
+    `, [fixture.organizationId, user.rows[0]!.id, role.rows[0]!.id]);
+    await scopedClient.query(`
+      INSERT INTO access_grant_branch_scopes (access_grant_id, branch_id)
+      VALUES ($1,$2)
+    `, [grant.rows[0]!.id, fixture.branchId]);
+    await scopedClient.query('COMMIT');
+  } catch (error) {
+    await scopedClient.query('ROLLBACK');
+    throw error;
+  } finally {
+    scopedClient.release();
+  }
   const token = `scoped-${randomUUID()}`;
   await database.pool.query(`
     INSERT INTO auth_sessions (

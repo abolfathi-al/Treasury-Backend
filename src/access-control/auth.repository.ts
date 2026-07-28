@@ -815,6 +815,7 @@ export class AuthRepository implements OnModuleInit, OnModuleDestroy {
         COALESCE(
           array_agg(DISTINCT rp.permission) FILTER (
             WHERE rp.permission IS NOT NULL
+              AND ag.organization_wide
               AND ag.amount_ceiling IS NULL
               AND NOT EXISTS (SELECT 1 FROM access_grant_branch_scopes s WHERE s.access_grant_id = ag.id)
               AND NOT EXISTS (SELECT 1 FROM access_grant_treasury_unit_scopes s WHERE s.access_grant_id = ag.id)
