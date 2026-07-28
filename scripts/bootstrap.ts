@@ -237,18 +237,22 @@ async function readSecret(label: string): Promise<string> {
   process.stdin.setEncoding('utf8');
   return new Promise((resolve, reject) => {
     let value = '';
-    const onData = (character: string) => {
-      if (character === '\u0003') {
-        cleanup();
-        reject(new Error('Bootstrap cancelled.'));
-      } else if (character === '\r' || character === '\n') {
-        cleanup();
-        process.stdout.write('\n');
-        resolve(value);
-      } else if (character === '\u007f') {
-        value = value.slice(0, -1);
-      } else if (character >= ' ') {
-        value += character;
+    const onData = (chunk: string) => {
+      for (const character of chunk) {
+        if (character === '\u0003') {
+          cleanup();
+          reject(new Error('Bootstrap cancelled.'));
+          return;
+        } else if (character === '\r' || character === '\n') {
+          cleanup();
+          process.stdout.write('\n');
+          resolve(value);
+          return;
+        } else if (character === '\u007f') {
+          value = value.slice(0, -1);
+        } else if (character >= ' ') {
+          value += character;
+        }
       }
     };
     const cleanup = () => {
