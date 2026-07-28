@@ -28,6 +28,7 @@ const titles = {
   'TRS-AUT-012': 'Access-control identity conflict',
   'TRS-MST-001': 'Inactive reference',
   'TRS-MST-002': 'Duplicate master identity',
+  'TRS-MST-003': 'Exchange rate missing or ambiguous',
   'TRS-MST-004': 'Method configuration invalid',
   'TRS-MST-005': 'Base currency locked',
   'TRS-BNK-001': 'Bank account unavailable',
@@ -35,6 +36,8 @@ const titles = {
   'TRS-CHQ-002': 'Cheque-book range overlap',
   'TRS-CHQ-003': 'Illegal cheque transition',
   'TRS-CSH-002': 'Cashbox custody conflict',
+  'TRS-RCP-002': 'Receipt line incomplete',
+  'TRS-RCP-003': 'Receipt allocation exceeds line',
 } as const;
 
 export type ProblemCode = keyof typeof titles;

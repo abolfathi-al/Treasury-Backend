@@ -9,6 +9,7 @@ import { CashboxModule } from './cashbox-and-custody/cashbox.module';
 import { ChequeModule } from './cheques/cheque.module';
 import { DatabaseModule } from './database/database.module';
 import { MasterDataModule } from './master-data/master-data.module';
+import { ReceiptModule } from './receipts/receipt.module';
 
 @Module({
   imports: [
@@ -18,6 +19,7 @@ import { MasterDataModule } from './master-data/master-data.module';
     CashboxModule,
     BankingModule,
     ChequeModule,
+    ReceiptModule,
   ],
   providers: [
     { provide: APP_FILTER, useClass: ProblemFilter },

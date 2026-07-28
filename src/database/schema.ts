@@ -1313,3 +1313,341 @@ export const printTemplates = pgTable('print_templates', {
     table.state,
   ),
 ]);
+
+export const exchangeRates = pgTable('exchange_rates', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  sourceCurrency: varchar('source_currency', { length: 8 }).notNull(),
+  targetCurrency: varchar('target_currency', { length: 8 }).notNull(),
+  rateType: varchar('rate_type', { length: 64 }).notNull(),
+  rate: numeric('rate', { precision: 38, scale: 18 }).notNull(),
+  validAt: timestamp('valid_at', { withTimezone: true }).notNull(),
+  sourceName: varchar('source_name', { length: 160 }).notNull(),
+  recordedBy: uuid('recorded_by').notNull().references(() => userRefs.id),
+  approvedBy: uuid('approved_by').references(() => userRefs.id),
+  state: varchar('state', { length: 16 }).notNull(),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  unique().on(
+    table.sourceCurrency,
+    table.targetCurrency,
+    table.rateType,
+    table.validAt,
+    table.sourceName,
+  ),
+  check('exchange_rates_positive', sql`${table.rate} > 0`),
+  check(
+    'exchange_rates_state_check',
+    sql`${table.state} IN ('DRAFT', 'APPROVED', 'RETIRED')`,
+  ),
+  check(
+    'exchange_rates_distinct_pair',
+    sql`${table.sourceCurrency} <> ${table.targetCurrency}`,
+  ),
+  index('exchange_rates_selection_idx')
+    .on(table.sourceCurrency, table.targetCurrency, table.validAt)
+    .where(sql`${table.state} = 'APPROVED'`),
+]);
+
+export const attachments = pgTable('attachments', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  organizationId: uuid('organization_id').notNull().references(() => organizations.id),
+  contentDigest: char('content_digest', { length: 64 }).notNull(),
+  attachmentVersion: integer('attachment_version').notNull(),
+  fileName: varchar('file_name', { length: 255 }).notNull(),
+  mediaType: varchar('media_type', { length: 128 }).notNull(),
+  byteLength: bigint('byte_length', { mode: 'number' }).notNull(),
+  storageRef: varchar('storage_ref', { length: 500 }).notNull(),
+  state: varchar('state', { length: 16 }).notNull(),
+  createdBy: uuid('created_by').notNull(),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  unique().on(table.organizationId, table.id),
+  unique().on(table.organizationId, table.id, table.contentDigest),
+  unique().on(table.organizationId, table.contentDigest, table.attachmentVersion),
+  foreignKey({
+    columns: [table.organizationId, table.createdBy],
+    foreignColumns: [userRefs.organizationId, userRefs.id],
+    name: 'attachments_creator_fk',
+  }),
+  check('attachments_digest_format', sql`${table.contentDigest} ~ '^[a-f0-9]{64}$'`),
+  check('attachments_version_positive', sql`${table.attachmentVersion} > 0`),
+  check('attachments_byte_length_nonnegative', sql`${table.byteLength} >= 0`),
+  check(
+    'attachments_state_check',
+    sql`${table.state} IN ('ACTIVE', 'SUPERSEDED', 'REDACTED')`,
+  ),
+]);
+
+export const receiptNumberCounters = pgTable('receipt_number_counters', {
+  organizationId: uuid('organization_id').notNull().references(() => organizations.id),
+  businessDate: date('business_date').notNull(),
+  nextValue: bigint('next_value', { mode: 'number' }).notNull(),
+}, (table) => [
+  primaryKey({ columns: [table.organizationId, table.businessDate] }),
+  check('receipt_number_counters_positive', sql`${table.nextValue} > 0`),
+]);
+
+// Explicit annotation breaks the Receipt header/line base-currency FK cycle.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export const receiptDocuments: any = pgTable('receipt_documents', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  organizationId: uuid('organization_id').notNull().references(() => organizations.id),
+  businessNumber: varchar('business_number', { length: 64 }).notNull(),
+  businessDate: date('business_date').notNull(),
+  enteredAt: timestamp('entered_at', { withTimezone: true }).notNull(),
+  partyId: uuid('party_id').notNull(),
+  branchId: uuid('branch_id'),
+  treasuryUnitId: uuid('treasury_unit_id').notNull(),
+  baseCurrency: varchar('base_currency', { length: 8 }).notNull(),
+  totalBaseAmount: numeric('total_base_amount', { precision: 38, scale: 8 }).notNull(),
+  description: varchar('description', { length: 1000 }),
+  purpose: varchar('purpose', { length: 500 }),
+  contractRef: varchar('contract_ref', { length: 128 }),
+  invoiceRef: varchar('invoice_ref', { length: 128 }),
+  orderRef: varchar('order_ref', { length: 128 }),
+  projectRef: varchar('project_ref', { length: 128 }),
+  costCenterRef: varchar('cost_center_ref', { length: 128 }),
+  origin: varchar('origin', { length: 32 }).notNull().default('MANUAL'),
+  creatorUserId: uuid('creator_user_id').notNull(),
+  state: varchar('state', { length: 32 }).notNull().default('DRAFT'),
+  workflowState: varchar('workflow_state', { length: 24 }).notNull().default('DRAFT'),
+  executionState: varchar('execution_state', { length: 24 }).notNull().default('NOT_EXECUTED'),
+  accountingState: varchar('accounting_state', { length: 24 }).notNull().default('NOT_READY'),
+  version: bigint('version', { mode: 'number' }).notNull().default(0),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  unique().on(table.organizationId, table.businessNumber),
+  unique().on(table.organizationId, table.id),
+  unique().on(table.organizationId, table.id, table.baseCurrency),
+  foreignKey({
+    columns: [table.organizationId, table.partyId],
+    foreignColumns: [parties.organizationId, parties.id],
+    name: 'receipt_documents_party_fk',
+  }),
+  foreignKey({
+    columns: [table.organizationId, table.branchId],
+    foreignColumns: [branches.organizationId, branches.id],
+    name: 'receipt_documents_branch_fk',
+  }),
+  foreignKey({
+    columns: [table.organizationId, table.treasuryUnitId],
+    foreignColumns: [treasuryUnits.organizationId, treasuryUnits.id],
+    name: 'receipt_documents_treasury_unit_fk',
+  }),
+  foreignKey({
+    columns: [table.organizationId, table.baseCurrency],
+    foreignColumns: [currencies.organizationId, currencies.code],
+    name: 'receipt_documents_currency_fk',
+  }),
+  foreignKey({
+    columns: [table.organizationId, table.creatorUserId],
+    foreignColumns: [userRefs.organizationId, userRefs.id],
+    name: 'receipt_documents_creator_fk',
+  }),
+  check('receipt_documents_positive_total', sql`${table.totalBaseAmount} > 0`),
+  check('receipt_documents_origin_manual', sql`${table.origin} = 'MANUAL'`),
+  check('receipt_documents_state_draft', sql`${table.state} = 'DRAFT'`),
+  check('receipt_documents_workflow_draft', sql`${table.workflowState} = 'DRAFT'`),
+  check('receipt_documents_execution_unexecuted', sql`${table.executionState} = 'NOT_EXECUTED'`),
+  check('receipt_documents_accounting_not_ready', sql`${table.accountingState} = 'NOT_READY'`),
+  index('receipt_documents_list_idx')
+    .on(table.organizationId, table.businessDate, table.id),
+]);
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export const receiptLines: any = pgTable('receipt_lines', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  organizationId: uuid('organization_id').notNull().references(() => organizations.id),
+  receiptDocumentId: uuid('receipt_document_id').notNull(),
+  lineNumber: integer('line_number').notNull(),
+  methodId: uuid('method_id').notNull(),
+  methodName: varchar('method_name', { length: 160 }).notNull(),
+  methodCategory: varchar('method_category', { length: 32 }).notNull(),
+  methodRequiredReferences: jsonb('method_required_references').$type<string[]>().notNull(),
+  createsFundsInTransit: boolean('creates_funds_in_transit').notNull(),
+  requiresApproval: boolean('requires_approval').notNull(),
+  amount: numeric('amount', { precision: 38, scale: 8 }).notNull(),
+  currency: varchar('currency', { length: 8 }).notNull(),
+  baseCurrency: varchar('base_currency', { length: 8 }).notNull(),
+  exchangeRate: numeric('exchange_rate', { precision: 38, scale: 18 }).notNull(),
+  rateType: varchar('rate_type', { length: 64 }).notNull(),
+  rateSource: varchar('rate_source', { length: 24 }).notNull(),
+  rateRecordId: uuid('rate_record_id').references(() => exchangeRates.id),
+  rateAt: timestamp('rate_at', { withTimezone: true }).notNull(),
+  baseAmount: numeric('base_amount', { precision: 38, scale: 8 }).notNull(),
+  roundingDifference: numeric('rounding_difference', { precision: 38, scale: 8 }).notNull(),
+  cashboxId: uuid('cashbox_id'),
+  bankAccountId: uuid('bank_account_id'),
+  posTerminalId: uuid('pos_terminal_id'),
+  paymentGatewayId: uuid('payment_gateway_id'),
+  chequeBankId: uuid('cheque_bank_id'),
+  chequeBankBranchId: uuid('cheque_bank_branch_id'),
+  chequePayerPartyId: uuid('cheque_payer_party_id'),
+  chequeInput: jsonb('cheque_input').$type<Record<string, unknown>>(),
+  trackingNumber: varchar('tracking_number', { length: 128 }),
+  payerAccountReference: varchar('payer_account_reference', { length: 128 }),
+  dueDate: date('due_date'),
+  payerName: varchar('payer_name', { length: 200 }),
+  remainderTreatment: varchar('remainder_treatment', { length: 24 }).notNull(),
+  description: varchar('description', { length: 1000 }),
+  accountingDimensions: jsonb('accounting_dimensions').$type<Record<string, string>>(),
+  state: varchar('state', { length: 16 }).notNull().default('DRAFT'),
+  version: bigint('version', { mode: 'number' }).notNull().default(0),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  unique().on(table.organizationId, table.id),
+  unique().on(table.organizationId, table.id, table.baseCurrency),
+  unique().on(table.organizationId, table.receiptDocumentId, table.lineNumber),
+  foreignKey({
+    columns: [table.organizationId, table.receiptDocumentId, table.baseCurrency],
+    foreignColumns: [
+      receiptDocuments.organizationId,
+      receiptDocuments.id,
+      receiptDocuments.baseCurrency,
+    ],
+    name: 'receipt_lines_document_fk',
+  }),
+  foreignKey({
+    columns: [table.organizationId, table.methodId],
+    foreignColumns: [methodDefinitions.organizationId, methodDefinitions.id],
+    name: 'receipt_lines_method_fk',
+  }),
+  foreignKey({
+    columns: [table.organizationId, table.chequeBankId],
+    foreignColumns: [banks.organizationId, banks.id],
+    name: 'receipt_lines_cheque_bank_fk',
+  }),
+  foreignKey({
+    columns: [table.organizationId, table.chequeBankId, table.chequeBankBranchId],
+    foreignColumns: [
+      bankBranches.organizationId,
+      bankBranches.bankId,
+      bankBranches.id,
+    ],
+    name: 'receipt_lines_cheque_bank_branch_fk',
+  }),
+  foreignKey({
+    columns: [table.organizationId, table.chequePayerPartyId],
+    foreignColumns: [parties.organizationId, parties.id],
+    name: 'receipt_lines_cheque_payer_party_fk',
+  }),
+  check('receipt_lines_positive_line_number', sql`${table.lineNumber} > 0`),
+  check('receipt_lines_positive_amount', sql`${table.amount} > 0`),
+  check('receipt_lines_positive_base_amount', sql`${table.baseAmount} > 0`),
+  check('receipt_lines_positive_rate', sql`${table.exchangeRate} > 0`),
+  check('receipt_lines_cheque_reference_shape', sql`(
+    (
+      ${table.chequeInput} IS NULL
+      AND ${table.chequeBankId} IS NULL
+      AND ${table.chequeBankBranchId} IS NULL
+      AND ${table.chequePayerPartyId} IS NULL
+    )
+    OR (
+      ${table.chequeInput} IS NOT NULL
+      AND ${table.chequeBankId} IS NOT NULL
+      AND ${table.chequeInput} ? 'bankId'
+      AND jsonb_typeof(${table.chequeInput}->'bankId') IS NOT DISTINCT FROM 'string'
+      AND ${table.chequeInput}->>'bankId'
+        IS NOT DISTINCT FROM ${table.chequeBankId}::text
+      AND (
+        (NOT (${table.chequeInput} ? 'bankBranchId')
+          AND ${table.chequeBankBranchId} IS NULL)
+        OR (
+          jsonb_typeof(${table.chequeInput}->'bankBranchId')
+            IS NOT DISTINCT FROM 'string'
+          AND ${table.chequeInput}->>'bankBranchId'
+            IS NOT DISTINCT FROM ${table.chequeBankBranchId}::text
+        )
+      )
+      AND (
+        (NOT (${table.chequeInput} ? 'payerPartyId')
+          AND ${table.chequePayerPartyId} IS NULL)
+        OR (
+          jsonb_typeof(${table.chequeInput}->'payerPartyId')
+            IS NOT DISTINCT FROM 'string'
+          AND ${table.chequeInput}->>'payerPartyId'
+            IS NOT DISTINCT FROM ${table.chequePayerPartyId}::text
+        )
+      )
+    )
+  )`),
+  check(
+    'receipt_lines_rate_shape',
+    sql`(
+      ${table.rateSource} = 'IDENTITY'
+      AND ${table.rateRecordId} IS NULL
+      AND ${table.currency} = ${table.baseCurrency}
+      AND ${table.exchangeRate} = 1
+      AND ${table.roundingDifference} = 0
+    ) OR (
+      ${table.rateSource} = 'TABLE'
+      AND ${table.rateRecordId} IS NOT NULL
+      AND ${table.currency} <> ${table.baseCurrency}
+    )`,
+  ),
+]);
+
+export const receiptAllocations = pgTable('receipt_allocations', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  organizationId: uuid('organization_id').notNull().references(() => organizations.id),
+  receiptLineId: uuid('receipt_line_id').notNull(),
+  externalObjectType: varchar('external_object_type', { length: 32 }).notNull(),
+  externalObjectId: varchar('external_object_id', { length: 128 }).notNull(),
+  baseAmount: numeric('base_amount', { precision: 38, scale: 8 }).notNull(),
+  baseCurrency: varchar('base_currency', { length: 8 }).notNull(),
+  state: varchar('state', { length: 16 }).notNull().default('ACTIVE'),
+  version: bigint('version', { mode: 'number' }).notNull().default(0),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  unique().on(table.organizationId, table.id),
+  unique().on(
+    table.organizationId,
+    table.receiptLineId,
+    table.externalObjectType,
+    table.externalObjectId,
+  ),
+  foreignKey({
+    columns: [table.organizationId, table.receiptLineId, table.baseCurrency],
+    foreignColumns: [
+      receiptLines.organizationId,
+      receiptLines.id,
+      receiptLines.baseCurrency,
+    ],
+    name: 'receipt_allocations_line_fk',
+  }),
+  check('receipt_allocations_positive', sql`${table.baseAmount} > 0`),
+]);
+
+export const receiptLineAttachmentLinks = pgTable('receipt_line_attachment_links', {
+  organizationId: uuid('organization_id').notNull().references(() => organizations.id),
+  receiptLineId: uuid('receipt_line_id').notNull(),
+  attachmentId: uuid('attachment_id').notNull(),
+  contentDigest: char('content_digest', { length: 64 }).notNull(),
+  purpose: varchar('purpose', { length: 64 }).notNull().default(''),
+  linkedAt: timestamp('linked_at', { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  primaryKey({
+    columns: [table.organizationId, table.receiptLineId, table.attachmentId, table.purpose],
+  }),
+  foreignKey({
+    columns: [table.organizationId, table.receiptLineId],
+    foreignColumns: [receiptLines.organizationId, receiptLines.id],
+    name: 'receipt_line_attachment_links_line_fk',
+  }),
+  foreignKey({
+    columns: [table.organizationId, table.attachmentId, table.contentDigest],
+    foreignColumns: [
+      attachments.organizationId,
+      attachments.id,
+      attachments.contentDigest,
+    ],
+    name: 'receipt_line_attachment_links_attachment_fk',
+  }),
+  check(
+    'receipt_line_attachment_links_digest_format',
+    sql`${table.contentDigest} ~ '^[a-f0-9]{64}$'`,
+  ),
+]);
