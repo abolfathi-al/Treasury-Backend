@@ -1,0 +1,61 @@
+name: Backend CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_DB: treasury
+          POSTGRES_USER: treasury
+          POSTGRES_PASSWORD: treasury-ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U treasury -d treasury"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgresql://treasury:treasury-ci@127.0.0.1:5432/treasury
+      TEST_DATABASE_URL: postgresql://treasury:treasury-ci@127.0.0.1:5432/treasury
+      APP_ORIGIN: https://treasury.example.test
+      LOGIN_THROTTLE_HMAC_KEY_BASE64: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+      COMMAND_DIGEST_HMAC_KEY_BASE64: AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=
+      TOTP_ENCRYPTION_KEY_BASE64: AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=
+      TOTP_KEY_VERSION: "1"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22.12.0
+          cache: npm
+
+      - name: Install frozen dependencies
+        run: npm ci
+
+      - name: Migrate fresh PostgreSQL database
+        run: npm run db:migrate
+
+      - name: Run full test suite
+        run: npm test
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Build
+        run: npm run build

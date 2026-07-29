@@ -1,6 +1,12 @@
 {
   "repository": "Treasury-Canon",
-  "revision": "4e4909d5f69ced2c7613f7a91d5db335046f63cf",
+  "revision": "6a666d48bd602340d7ce67b03576e9c9a89f0fb0",
   "canon_root": "canon-v4",
-  "authorized_delivery_slice": "INC-1A-AUTH-METHODS"
+  "authorized_delivery_slice": "INC-2A-RECEIPT-DRAFTS",
+  "authorized_operations": [
+    "listReceipts",
+    "createReceipt",
+    "getReceipt",
+    "replaceReceiptDraft"
+  ]
 }

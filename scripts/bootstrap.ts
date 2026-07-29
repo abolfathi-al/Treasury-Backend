@@ -16,9 +16,11 @@ const bootstrapPermissions = [
   'bank-type.view',
   'bank.manage',
   'bank.view',
+  'cashbox.handover',
   'cashbox.manage',
   'cashbox.view',
   'cheque-book.manage',
+  'cheque.transition',
   'identity-account.manage',
   'master-data.manage',
   'master-data.view',
@@ -157,8 +159,9 @@ async function bootstrap(): Promise<void> {
     }
     await client.query(`
       INSERT INTO access_grants (
-        organization_id, user_ref_id, role_id, scope_type, scope_id
-      ) VALUES ($1,$2,$3,'ORGANIZATION',$1)
+        organization_id, user_ref_id, role_id, scope_type, scope_id,
+        organization_wide
+      ) VALUES ($1,$2,$3,'ORGANIZATION',$1,true)
     `, [organizationId, userId, roleId]);
     await client.query(`
       INSERT INTO security_audit_events (

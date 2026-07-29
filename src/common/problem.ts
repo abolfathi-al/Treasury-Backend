@@ -14,6 +14,7 @@ const titles = {
   'TRS-GEN-003': 'Permission denied',
   'TRS-GEN-004': 'Resource not found',
   'TRS-GEN-005': 'State conflict',
+  'TRS-GEN-006': 'Stale version',
   'TRS-GEN-007': 'Idempotency key conflict',
   'TRS-AUT-001': 'Authentication failed',
   'TRS-AUT-002': 'TOTP required or invalid',
@@ -24,15 +25,29 @@ const titles = {
   'TRS-AUT-008': 'Authentication throttled',
   'TRS-AUT-009': 'CSRF verification failed',
   'TRS-AUT-010': 'Fresh step-up required',
+  'TRS-AUT-012': 'Access-control identity conflict',
   'TRS-MST-001': 'Inactive reference',
   'TRS-MST-002': 'Duplicate master identity',
+  'TRS-MST-003': 'Exchange rate missing or ambiguous',
   'TRS-MST-004': 'Method configuration invalid',
   'TRS-MST-005': 'Base currency locked',
+  'TRS-BNK-001': 'Bank account unavailable',
+  'TRS-CHQ-001': 'Cheque leaf unavailable',
+  'TRS-CHQ-002': 'Cheque-book range overlap',
+  'TRS-CHQ-003': 'Illegal cheque transition',
+  'TRS-CSH-002': 'Cashbox custody conflict',
+  'TRS-RCP-002': 'Receipt line incomplete',
+  'TRS-RCP-003': 'Receipt allocation exceeds line',
 } as const;
 
 export type ProblemCode = keyof typeof titles;
 
-const retryable = new Set<ProblemCode>(['TRS-AUT-008', 'TRS-AUT-010']);
+const retryable = new Set<ProblemCode>([
+  'TRS-GEN-006',
+  'TRS-AUT-008',
+  'TRS-AUT-010',
+  'TRS-CSH-002',
+]);
 
 export class TreasuryProblem extends HttpException {
   constructor(
@@ -69,8 +84,11 @@ export class ProblemFilter implements ExceptionFilter {
       extensions = body.extensions ?? {};
     } else {
       const exceptionStatus = exception.getStatus();
-      status = exceptionStatus === 400 ? 422 : exceptionStatus;
-      code = status === 422
+      const validation = exceptionStatus === 400
+        ? authValidationProblem(request, exception)
+        : null;
+      status = validation?.status ?? (exceptionStatus === 400 ? 422 : exceptionStatus);
+      code = validation?.code ?? (status === 422
         ? 'TRS-GEN-001'
         : status === 401
           ? 'TRS-GEN-002'
@@ -78,7 +96,7 @@ export class ProblemFilter implements ExceptionFilter {
             ? 'TRS-GEN-003'
             : status === 404
               ? 'TRS-GEN-004'
-              : 'TRS-GEN-005';
+              : 'TRS-GEN-005');
       const body = exception.getResponse();
       detail = typeof body === 'string' ? body : undefined;
     }
@@ -103,4 +121,40 @@ export class ProblemFilter implements ExceptionFilter {
     }
     response.status(status).type('application/problem+json').send(body);
   }
+}
+
+function authValidationProblem(
+  request: Request,
+  exception: HttpException,
+): { code: ProblemCode; status: number } | null {
+  if (request.method !== 'POST') return null;
+  const response = exception.getResponse();
+  const messages = typeof response === 'object'
+    && response !== null
+    && 'message' in response
+    && Array.isArray(response.message)
+    ? response.message.filter((message): message is string => typeof message === 'string')
+    : [];
+
+  if (request.path === '/v1/auth/totp-enrollments') {
+    return messages.some((message) => message.includes('newPassword'))
+      ? { code: 'TRS-AUT-007', status: 422 }
+      : { code: 'TRS-AUT-001', status: 401 };
+  }
+  if (request.path === '/v1/auth/totp-enrollment-completions') {
+    return messages.some((message) => message.includes('enrollmentId'))
+      ? { code: 'TRS-AUT-005', status: 401 }
+      : { code: 'TRS-AUT-002', status: 401 };
+  }
+  if (request.path === '/v1/auth/totp-verifications') {
+    return messages.some((message) => message.includes('challengeId'))
+      ? { code: 'TRS-AUT-005', status: 401 }
+      : { code: 'TRS-AUT-002', status: 401 };
+  }
+  if (request.path === '/v1/auth/password-recoveries') {
+    return messages.some((message) => message.includes('newPassword'))
+      ? { code: 'TRS-AUT-007', status: 422 }
+      : { code: 'TRS-AUT-006', status: 401 };
+  }
+  return null;
 }

@@ -1,6 +1,6 @@
 # Treasury Backend
 
-NestJS modular monolith for the owner-approved `INC-1A-AUTH-METHODS` increment.
+NestJS modular monolith through the owner-approved `INC-2A-RECEIPT-DRAFTS` increment.
 The exact governed source is pinned in `canon-revision.json`.
 
 ## Runtime
@@ -39,15 +39,33 @@ locked transaction; then displays the single recovery code once.
 ## Implemented contract
 
 - opaque, digest-at-rest `__Host-treasury_session` sessions;
-- password login, RFC 6238 SHA-256 TOTP, current session, logout, and saved-code
-  plus current-TOTP password recovery;
+- password login, RFC 6238 SHA-256 TOTP, current session, logout, and password
+  recovery with either a saved recovery code or the connected authenticator;
 - exact-Origin and session-bound Angular XSRF double-submit checks;
 - organization, Branch, Treasury Unit, User Reference, Identity Account, and
   Currency foundation operations;
 - Method Definition list/create with normalized references/currencies/limits,
   category-specific anchors, tracking requirements, positive per-currency
   limits, and idempotent creation;
+- typed organization-scoped Party list/create with normalized multi-role kinds
+  and idempotent creation;
+- typed, scope-filtered Cashbox list/create and counted handover initiation with
+  strong version checks, idempotency, and unchanged custody;
+- Bank Type, Bank, Bank Branch, Bank Account, POS Terminal, and Payment Gateway
+  list/create operations with semantic views, resource-scoped authorization,
+  active same-organization references, keyset pagination, replay authorization,
+  and database-enforced account/collection-endpoint invariants;
+- immutable Print Template draft version list/create with canonical JSON digest
+  verification and semantic scope references;
+- atomic active Cheque Book creation with complete bounded available-leaf ranges,
+  plus versioned `AVAILABLE`-to-`VOID`/`LOST` controls and append-only events;
+- semantic Receipt draft list/create/get/replace with one-grant authorization,
+  actor-bound idempotency, strong versions, server-derived totals and immutable
+  IDENTITY/TABLE rate snapshots, fail-closed evidence, and tenant-qualified
+  database constraints;
 - command-bound TOTP step-up for `createIdentityAccount`.
 
 There are no JWTs, generic repositories, CQRS buses, microservices, queues,
-caches, or runtime Method activation paths in this increment.
+caches, direct bank/provider connectivity, credential-storage fields, or
+Receipt submission/approval/execution/reversal routes, or runtime Method
+activation paths in this increment.

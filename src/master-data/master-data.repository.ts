@@ -6,6 +6,9 @@ import {
   BranchCreateDto,
   CurrencyCreateDto,
   MethodCreateDto,
+  PartyCreateDto,
+  PartyPage,
+  PartyView,
   TreasuryUnitCreateDto,
 } from './master-data.dto';
 
@@ -135,6 +138,76 @@ export class MasterDataRepository {
       ]);
       return result.rows[0];
     });
+  }
+
+  async listParties(
+    organizationId: string,
+    limit: number,
+    cursor?: string,
+  ): Promise<PartyPage> {
+    const result = await this.database.pool.query<PartyView>(`
+      SELECT p.id, p.organization_id AS "organizationId", p.code,
+             COALESCE((
+               SELECT jsonb_agg(k.party_kind ORDER BY k.party_kind)
+               FROM party_kinds k WHERE k.party_id = p.id
+             ), '[]') AS "partyKinds",
+             p.display_name AS "displayName", p.legal_name AS "legalName",
+             p.national_id AS "nationalId", p.registration_id AS "registrationId",
+             p.phone, p.email, p.notes, p.state, p.version,
+             to_char(p.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS "createdAt",
+             to_char(p.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS "updatedAt"
+      FROM parties p
+      WHERE p.organization_id = $1 AND ($2::uuid IS NULL OR p.id > $2)
+      ORDER BY p.id
+      LIMIT $3
+    `, [organizationId, cursor ?? null, limit + 1]);
+    return this.page(result.rows, limit);
+  }
+
+  createParty(
+    organizationId: string,
+    dto: PartyCreateDto,
+    idempotencyKey: string,
+    requestDigest: string,
+  ): Promise<PartyView> {
+    return this.idempotentCreate(
+      organizationId,
+      'createParty',
+      idempotencyKey,
+      requestDigest,
+      async (client) => {
+        const party = await client.query<PartyView>(`
+          INSERT INTO parties (
+            organization_id, code, display_name, legal_name, national_id,
+            registration_id, phone, email, notes
+          ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+          RETURNING id, organization_id AS "organizationId", code,
+                    display_name AS "displayName", legal_name AS "legalName",
+                    national_id AS "nationalId", registration_id AS "registrationId",
+                    phone, email, notes, state, version,
+                    to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS "createdAt",
+                    to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS "updatedAt"
+        `, [
+          organizationId,
+          dto.code,
+          dto.displayName,
+          dto.legalName ?? null,
+          dto.nationalId ?? null,
+          dto.registrationId ?? null,
+          dto.phone ?? null,
+          dto.email ?? null,
+          dto.notes ?? null,
+        ]);
+        const created = party.rows[0]!;
+        for (const kind of dto.partyKinds) {
+          await client.query(
+            'INSERT INTO party_kinds (party_id, party_kind) VALUES ($1, $2)',
+            [created.id, kind],
+          );
+        }
+        return { ...created, partyKinds: [...dto.partyKinds].sort() };
+      },
+    );
   }
 
   async listMethods(
@@ -271,14 +344,16 @@ export class MasterDataRepository {
     return this.page(result.rows, limit, cursorField);
   }
 
-  private page(
-    rows: Record<string, unknown>[],
+  private page<T extends object>(
+    rows: T[],
     limit: number,
     cursorField = 'id',
-  ): Page<Record<string, unknown>> {
+  ): Page<T> {
     const hasMore = rows.length > limit;
     const items = rows.slice(0, limit).map(omitNullProperties);
-    const nextCursor = hasMore ? String(items.at(-1)?.[cursorField]) : undefined;
+    const nextCursor = hasMore
+      ? String((items.at(-1) as Record<string, unknown> | undefined)?.[cursorField])
+      : undefined;
     return {
       items,
       page: {
@@ -290,7 +365,7 @@ export class MasterDataRepository {
     };
   }
 
-  private async idempotentCreate<T extends Record<string, unknown>>(
+  private async idempotentCreate<T extends object>(
     organizationId: string,
     scope: string,
     idempotencyKey: string,
@@ -341,7 +416,7 @@ export class MasterDataRepository {
   }
 }
 
-function omitNullProperties<T extends Record<string, unknown>>(record: T): T {
+function omitNullProperties<T extends object>(record: T): T {
   return Object.fromEntries(
     Object.entries(record).filter(([, value]) => value !== null),
   ) as T;

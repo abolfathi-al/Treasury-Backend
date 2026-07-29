@@ -17,6 +17,9 @@ import {
 } from '../common/http';
 import { TreasuryProblem } from '../common/problem';
 import {
+  AUTHORIZATION_OPERATION,
+  PermissionScopeMode,
+  PERMISSION_SCOPE_MODE,
   PUBLIC_OPERATION,
   REQUIRED_PERMISSION,
   STEP_UP_REQUIRED,
@@ -28,6 +31,7 @@ export interface TreasuryRequest extends Request {
   stepUp?: {
     proofId: string;
     command: {
+      operationId: string;
       method: string;
       path: string;
       bodyDigest: string;
@@ -53,7 +57,12 @@ export class AuthGuard implements CanActivate {
     const response = context.switchToHttp().getResponse<Response>();
     const cookies = parseCookies(request.header('cookie'));
     const sessionToken = cookies[SESSION_COOKIE];
-    if (!sessionToken) throw new TreasuryProblem('TRS-GEN-002', 401);
+    if (!sessionToken) {
+      throw new TreasuryProblem(
+        request.path === '/v1/auth/sessions/current' ? 'TRS-AUT-003' : 'TRS-GEN-002',
+        401,
+      );
+    }
     const auth = await this.authService.authenticateSession(sessionToken);
     request.auth = auth;
     if (auth.rotatedSessionToken && auth.refreshedXsrfToken) {
@@ -64,7 +73,15 @@ export class AuthGuard implements CanActivate {
       context.getHandler(),
       context.getClass(),
     ]);
-    if (permission && !auth.session.effectivePermissions.includes(permission)) {
+    const operationId = this.reflector.getAllAndOverride<string>(AUTHORIZATION_OPERATION, [
+      context.getHandler(),
+      context.getClass(),
+    ]);
+    const scopeMode = this.reflector.getAllAndOverride<PermissionScopeMode>(
+      PERMISSION_SCOPE_MODE,
+      [context.getHandler(), context.getClass()],
+    );
+    if (permission && !operationPermissionGranted(auth, operationId, permission, scopeMode)) {
       throw new TreasuryProblem('TRS-GEN-003', 403);
     }
 
@@ -72,18 +89,20 @@ export class AuthGuard implements CanActivate {
       this.assertCsrf(request, auth, cookies);
     }
 
-    if (this.reflector.getAllAndOverride<boolean>(STEP_UP_REQUIRED, [
+    const stepUpOperationId = this.reflector.getAllAndOverride<string>(STEP_UP_REQUIRED, [
       context.getHandler(),
       context.getClass(),
-    ])) {
+    ]);
+    if (stepUpOperationId) {
       const idempotencyKey = request.header('Idempotency-Key');
       if (!idempotencyKey || idempotencyKey.length < 8 || idempotencyKey.length > 128) {
         throw new TreasuryProblem('TRS-GEN-001', 422, 'Idempotency-Key must contain 8 through 128 characters.');
       }
       const command = {
+        operationId: stepUpOperationId,
         method: request.method,
         path: request.path,
-        bodyDigest: commandDigest('createIdentityAccount', request.body),
+        bodyDigest: commandDigest(stepUpOperationId, request.body),
         idempotencyKey,
       };
       const proofId = request.header('X-Step-Up-Proof');
@@ -108,6 +127,19 @@ export class AuthGuard implements CanActivate {
       throw new TreasuryProblem('TRS-AUT-009', 403);
     }
   }
+}
+
+export function operationPermissionGranted(
+  auth: SessionContext,
+  operationId: string | undefined,
+  permission: string,
+  scopeMode: PermissionScopeMode | undefined,
+): boolean {
+  if (!operationId || !scopeMode) return false;
+  const permissions = scopeMode === 'ORGANIZATION_WIDE'
+    ? auth.organizationPermissions
+    : auth.session.effectivePermissions;
+  return permissions.includes(permission);
 }
 
 export function csrfValid(

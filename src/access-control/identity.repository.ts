@@ -61,18 +61,20 @@ export class IdentityRepository {
     },
   ): Promise<Record<string, unknown>> {
     return this.identityCreateTransaction(async (client) => {
-        const proof = await client.query<{ id: string }>(`
-          SELECT p.id
+        const proof = await client.query<{
+          id: string;
+          consumed_at: Date | null;
+        }>(`
+          SELECT p.id, p.consumed_at
           FROM auth_step_up_proofs p
           JOIN auth_challenges c ON c.id = p.challenge_id
           WHERE p.token_digest = $1
-            AND p.consumed_at IS NULL
-            AND p.expires_at > now()
             AND c.session_id = $2
             AND c.http_method = $3
             AND c.http_path = $4
             AND c.request_body_digest = $5
             AND c.idempotency_key = $6
+            AND p.expires_at > now()
           FOR UPDATE OF p
         `, [
           stepUp.proofDigest,
@@ -101,6 +103,11 @@ export class IdentityRepository {
             throw new SyntaxError('IDEMPOTENCY_CONFLICT');
           }
         } else {
+          if (
+            proof.rows[0]!.consumed_at
+          ) {
+            throw new RangeError('STEP_UP_INVALID');
+          }
           await client.query(`
             INSERT INTO idempotency_records (organization_id, scope, idempotency_key, request_digest)
             VALUES ($1,'createIdentityAccount',$2,$3)

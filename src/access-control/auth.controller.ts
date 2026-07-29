@@ -19,7 +19,13 @@ import {
   setXsrfCookie,
 } from '../common/http';
 import { PublicOperation, RequirePermission } from './auth.decorators';
-import { LoginDto, PasswordRecoveryDto, TotpProofDto } from './auth.dto';
+import {
+  LoginDto,
+  PasswordRecoveryDto,
+  TotpEnrollmentCompleteDto,
+  TotpEnrollmentStartDto,
+  TotpProofDto,
+} from './auth.dto';
 import { TreasuryRequest } from './auth.guard';
 import { AuthService } from './auth.service';
 
@@ -55,6 +61,29 @@ export class AuthController {
     return result.body;
   }
 
+  @Post('totp-enrollments')
+  @PublicOperation()
+  async startTotpEnrollment(
+    @Body() body: TotpEnrollmentStartDto,
+    @Req() request: TreasuryRequest,
+    @Res({ passthrough: true }) response: Response,
+  ): Promise<unknown> {
+    response.setHeader('Cache-Control', 'no-store');
+    return this.authService.startTotpEnrollment(body, this.requestId(request));
+  }
+
+  @Post('totp-enrollment-completions')
+  @PublicOperation()
+  @HttpCode(200)
+  async completeTotpEnrollment(
+    @Body() body: TotpEnrollmentCompleteDto,
+    @Req() request: TreasuryRequest,
+    @Res({ passthrough: true }) response: Response,
+  ): Promise<unknown> {
+    response.setHeader('Cache-Control', 'no-store');
+    return this.authService.completeTotpEnrollment(body, this.requestId(request));
+  }
+
   @Get('sessions/current')
   async current(
     @Req() request: TreasuryRequest,
@@ -66,7 +95,7 @@ export class AuthController {
   }
 
   @Delete('sessions/:resourceId')
-  @RequirePermission('auth.logout')
+  @RequirePermission('auth.logout', 'logout', 'ORGANIZATION_WIDE')
   @HttpCode(204)
   async logout(
     @Param('resourceId') resourceId: string,

@@ -6,6 +6,10 @@ import {
   BranchCreateDto,
   CurrencyCreateDto,
   MethodCreateDto,
+  PartyCreateDto,
+  PartyKind,
+  PartyPage,
+  PartyView,
   TreasuryUnitCreateDto,
 } from './master-data.dto';
 import { MasterDataRepository } from './master-data.repository';
@@ -57,6 +61,30 @@ export class MasterDataService {
       dto,
       this.key(key),
       commandDigest('createCurrency', dto),
+    ));
+  }
+
+  listParties(organizationId: string, limit?: string, cursor?: string): Promise<PartyPage> {
+    return this.repository.listParties(organizationId, this.limit(limit), this.uuidCursor(cursor));
+  }
+
+  createParty(
+    organizationId: string,
+    dto: PartyCreateDto,
+    key: string,
+  ): Promise<PartyView> {
+    if (
+      dto.partyKinds.length === 0
+      || new Set(dto.partyKinds).size !== dto.partyKinds.length
+      || dto.partyKinds.some((kind) => !Object.values(PartyKind).includes(kind))
+    ) {
+      throw new TreasuryProblem('TRS-GEN-001', 422, 'partyKinds must contain unique supported values.');
+    }
+    return this.mapCreate(() => this.repository.createParty(
+      organizationId,
+      dto,
+      this.key(key),
+      commandDigest('createParty', dto),
     ));
   }
 

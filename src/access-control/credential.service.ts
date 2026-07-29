@@ -116,6 +116,23 @@ export class CredentialService {
     return key;
   }
 
+  currentTotpKey(): { version: number; key: Buffer } {
+    const version = Number(process.env.TOTP_KEY_VERSION ?? 1);
+    if (!Number.isInteger(version) || version < 1) {
+      throw new Error('TOTP_KEY_VERSION must be a positive integer');
+    }
+    return { version, key: this.runtimeTotpKey(version) };
+  }
+
+  enrollmentIdDigest(enrollmentId: string): string {
+    const key = Buffer.from(process.env.LOGIN_THROTTLE_HMAC_KEY_BASE64 ?? '', 'base64');
+    if (key.length < 32) throw new Error('LOGIN_THROTTLE_HMAC_KEY_BASE64 is invalid');
+    return createHmac('sha256', key)
+      .update('treasury-totp-enrollment-id:v1\0')
+      .update(enrollmentId)
+      .digest('hex');
+  }
+
   totp(secret: Buffer, counter: number): string {
     const counterBytes = Buffer.alloc(8);
     counterBytes.writeBigUInt64BE(BigInt(counter));
