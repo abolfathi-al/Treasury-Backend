@@ -15,5 +15,6 @@ import { PrintTemplateService } from './print-template.service';
     PrintTemplateService,
     PrintTemplateRepository,
   ],
+  exports: [MasterDataService],
 })
 export class MasterDataModule {}

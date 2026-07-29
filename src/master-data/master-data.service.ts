@@ -2,6 +2,7 @@ import { Inject, Injectable } from '@nestjs/common';
 
 import { commandDigest } from '../common/http';
 import { TreasuryProblem } from '../common/problem';
+import type { DatabaseTransaction } from '../database/database.service';
 import {
   BranchCreateDto,
   CurrencyCreateDto,
@@ -18,6 +19,18 @@ import { validateMethodSemantics } from './method-policy';
 @Injectable()
 export class MasterDataService {
   constructor(@Inject(MasterDataRepository) private readonly repository: MasterDataRepository) {}
+
+  findCurrencyDecimalPlaces(
+    transaction: DatabaseTransaction,
+    organizationId: string,
+    currencyCodes: string[],
+  ): Promise<Array<{ currency: string; decimalPlaces: number }>> {
+    return this.repository.findCurrencyDecimalPlaces(
+      transaction,
+      organizationId,
+      currencyCodes,
+    );
+  }
 
   async organization(organizationId: string): Promise<Record<string, unknown>> {
     const organization = await this.repository.organization(organizationId);

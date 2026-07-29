@@ -1,7 +1,12 @@
 import { Inject, Injectable } from '@nestjs/common';
+import { and, eq, inArray } from 'drizzle-orm';
 import type { PoolClient } from 'pg';
 
-import { DatabaseService } from '../database/database.service';
+import {
+  DatabaseService,
+  type DatabaseTransaction,
+} from '../database/database.service';
+import { currencies } from '../database/schema';
 import {
   BranchCreateDto,
   CurrencyCreateDto,
@@ -20,6 +25,25 @@ export interface Page<T> {
 @Injectable()
 export class MasterDataRepository {
   constructor(@Inject(DatabaseService) private readonly database: DatabaseService) {}
+
+  async findCurrencyDecimalPlaces(
+    transaction: DatabaseTransaction,
+    organizationId: string,
+    currencyCodes: string[],
+  ): Promise<Array<{ currency: string; decimalPlaces: number }>> {
+    if (currencyCodes.length === 0) return [];
+    return transaction
+      .select({
+        currency: currencies.code,
+        decimalPlaces: currencies.decimalPlaces,
+      })
+      .from(currencies)
+      .where(and(
+        eq(currencies.organizationId, organizationId),
+        inArray(currencies.code, currencyCodes),
+      ))
+      .orderBy(currencies.code);
+  }
 
   async organization(organizationId: string): Promise<Record<string, unknown> | null> {
     const result = await this.database.pool.query(`

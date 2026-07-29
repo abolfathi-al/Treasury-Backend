@@ -2,6 +2,7 @@ import { Inject, Injectable } from '@nestjs/common';
 
 import { commandDigest, digest } from '../common/http';
 import { TreasuryProblem } from '../common/problem';
+import type { DatabaseTransaction } from '../database/database.service';
 import { AuthService, SessionContext } from './auth.service';
 import { CredentialService } from './credential.service';
 import { IdentityAccountCreateDto, UserRefCreateDto } from './identity.dto';
@@ -14,6 +15,14 @@ export class IdentityService {
     @Inject(CredentialService) private readonly credentials: CredentialService,
     @Inject(AuthService) private readonly authService: AuthService,
   ) {}
+
+  findUserRefState(
+    transaction: DatabaseTransaction,
+    organizationId: string,
+    userId: string,
+  ): Promise<{ state: string } | undefined> {
+    return this.repository.findUserRefState(transaction, organizationId, userId);
+  }
 
   list(organizationId: string, rawLimit?: string, cursor?: string) {
     return this.repository.listUserRefs(organizationId, this.limit(rawLimit), this.uuidCursor(cursor));

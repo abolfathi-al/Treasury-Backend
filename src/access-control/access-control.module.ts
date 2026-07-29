@@ -8,6 +8,8 @@ import { AuthService } from './auth.service';
 import { AccessAdminController } from './access-admin.controller';
 import { AccessAdminRepository } from './access-admin.repository';
 import { AccessAdminService } from './access-admin.service';
+import { AccessAuthorizationRepository } from './access-authorization.repository';
+import { AccessAuthorizationService } from './access-authorization.service';
 import { CredentialService } from './credential.service';
 import { IdentityController } from './identity.controller';
 import { IdentityRepository } from './identity.repository';
@@ -18,6 +20,8 @@ import { IdentityService } from './identity.service';
   providers: [
     AccessAdminService,
     AccessAdminRepository,
+    AccessAuthorizationRepository,
+    AccessAuthorizationService,
     AuthService,
     AuthRepository,
     CredentialService,
@@ -25,6 +29,11 @@ import { IdentityService } from './identity.service';
     IdentityRepository,
     { provide: APP_GUARD, useClass: AuthGuard },
   ],
-  exports: [AuthService, CredentialService],
+  exports: [
+    AccessAuthorizationService,
+    AuthService,
+    CredentialService,
+    IdentityService,
+  ],
 })
 export class AccessControlModule {}

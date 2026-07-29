@@ -6,10 +6,18 @@ import {
   CashboxCreateDto,
   CashboxType,
 } from '../src/cashbox-and-custody/cashbox.dto';
+import { AccessAuthorizationRepository } from '../src/access-control/access-authorization.repository';
+import { AccessAuthorizationService } from '../src/access-control/access-authorization.service';
+import type { AuthService } from '../src/access-control/auth.service';
+import type { CredentialService } from '../src/access-control/credential.service';
+import { IdentityRepository } from '../src/access-control/identity.repository';
+import { IdentityService } from '../src/access-control/identity.service';
 import { CashboxRepository } from '../src/cashbox-and-custody/cashbox.repository';
 import { CashboxService } from '../src/cashbox-and-custody/cashbox.service';
 import { TreasuryProblem } from '../src/common/problem';
 import { DatabaseService } from '../src/database/database.service';
+import { MasterDataRepository } from '../src/master-data/master-data.repository';
+import { MasterDataService } from '../src/master-data/master-data.service';
 
 const connectionString = process.env.TEST_DATABASE_URL;
 
@@ -19,9 +27,52 @@ test('INC-1D PostgreSQL create/list/handover are scoped, replay-safe, atomic, an
   process.env.DATABASE_URL = connectionString;
   process.env.COMMAND_DIGEST_HMAC_KEY_BASE64 = Buffer.alloc(32, 23).toString('base64');
   const database = new DatabaseService();
-  const service = new CashboxService(new CashboxRepository(database));
+  const service = new CashboxService(
+    new CashboxRepository(database),
+    database,
+    new AccessAuthorizationService(new AccessAuthorizationRepository()),
+    new IdentityService(
+      new IdentityRepository(database),
+      {} as CredentialService,
+      {} as AuthService,
+    ),
+    new MasterDataService(new MasterDataRepository(database)),
+  );
   try {
     const fixture = await seed(database);
+    const missingCashboxId = '00000000-0000-4000-8000-999999999999';
+    await assert.rejects(
+      service.createHandover(
+        fixture.organizationId,
+        fixture.primaryUserId,
+        missingCashboxId,
+        {
+          incomingUserId: fixture.incomingUserId,
+          moneyCounts: [{ currency: 'USD', countedAmount: '0' }],
+          observedInstrumentIds: [],
+        },
+        'handover-missing-unrestricted',
+        '"0"',
+        'request-missing-unrestricted',
+      ),
+      (error) => problem(error, 'TRS-GEN-004', 404),
+    );
+    await assert.rejects(
+      service.createHandover(
+        fixture.organizationId,
+        fixture.scopedUserId,
+        missingCashboxId,
+        {
+          incomingUserId: fixture.incomingUserId,
+          moneyCounts: [{ currency: 'USD', countedAmount: '0' }],
+          observedInstrumentIds: [],
+        },
+        'handover-missing-scoped',
+        '"0"',
+        'request-missing-scoped',
+      ),
+      (error) => problem(error, 'TRS-GEN-003', 403),
+    );
     const first = await service.create(
       fixture.organizationId,
       fixture.primaryUserId,
@@ -238,6 +289,14 @@ test('INC-1D PostgreSQL create/list/handover are scoped, replay-safe, atomic, an
       ),
       (error) => problem(error, 'TRS-GEN-006', 409),
     );
+    const rolledBack = await database.pool.query<{ count: number }>(`
+      SELECT count(*)::int
+      FROM idempotency_records
+      WHERE organization_id = $1
+        AND scope = 'createCashboxHandover'
+        AND idempotency_key = 'stale-handover'
+    `, [fixture.organizationId]);
+    assert.equal(rolledBack.rows[0]!.count, 0);
 
     const concurrent = await Promise.allSettled([
       service.createHandover(
