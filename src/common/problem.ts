@@ -36,8 +36,10 @@ const titles = {
   'TRS-CHQ-002': 'Cheque-book range overlap',
   'TRS-CHQ-003': 'Illegal cheque transition',
   'TRS-CSH-002': 'Cashbox custody conflict',
+  'TRS-RCP-001': 'Receipt total mismatch',
   'TRS-RCP-002': 'Receipt line incomplete',
   'TRS-RCP-003': 'Receipt allocation exceeds line',
+  'TRS-RCP-005': 'Receipt approval policy unavailable',
 } as const;
 
 export type ProblemCode = keyof typeof titles;

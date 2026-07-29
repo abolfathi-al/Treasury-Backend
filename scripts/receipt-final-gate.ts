@@ -13,8 +13,11 @@ export const RECEIPT_QA_PERMISSIONS = [
   'cashbox.view',
   'master-data.view',
   'party.view',
+  'receipt.approve',
   'receipt.create',
   'receipt.edit-draft',
+  'receipt.reject',
+  'receipt.submit',
   'receipt.view',
 ] as const;
 
@@ -289,7 +292,7 @@ async function seedBrowserReceiptFoundation(databaseUrl: string): Promise<void> 
       INSERT INTO method_definitions (
         organization_id, code, name, direction, behavior_category,
         creates_funds_in_transit, requires_approval
-      ) VALUES ($1, 'QA-CASH', 'QA Cash Receipt', 'RECEIPT', 'CASH', false, false)
+      ) VALUES ($1, 'QA-CASH', 'QA Cash Receipt', 'RECEIPT', 'CASH', false, true)
       RETURNING id
     `, [organizationId]);
     await client.query(
@@ -322,6 +325,20 @@ async function seedBrowserReceiptFoundation(databaseUrl: string): Promise<void> 
         effective_from, state
       ) VALUES ($1, $2, $3, 'PRIMARY', now(), 'ACTIVE')
     `, [organizationId, cashbox.rows[0]!.id, userId]);
+    const policy = await client.query<{ id: string }>(`
+      INSERT INTO receipt_approval_policies (
+        organization_id, code, name, document_type,
+        currency, method_category, version, state
+      ) VALUES ($1, 'QA-CASH-RECEIPT', 'QA Cash Receipt Approval',
+        'RECEIPT', $2, 'CASH', 1, 'ACTIVE')
+      RETURNING id
+    `, [organizationId, currency]);
+    await client.query(`
+      INSERT INTO receipt_approval_policy_steps (
+        organization_id, policy_id, step_order, approver_user_id,
+        approvals_required, separation_rules
+      ) VALUES ($1, $2, 1, $3, 1, '{}')
+    `, [organizationId, policy.rows[0]!.id, userId]);
     await client.query('COMMIT');
   } catch (error) {
     await client.query('ROLLBACK');

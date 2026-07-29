@@ -6,6 +6,7 @@ import { stableJson } from '../common/http';
 import { DatabaseService } from '../database/database.service';
 import {
   ReceiptAllocationInputDto,
+  ReceiptApprovalSnapshotView,
   ReceiptCreateDto,
   ReceiptLineInputDto,
   ReceiptLineView,
@@ -137,6 +138,100 @@ export class ReceiptRepository {
       return (await this.views(client, organizationId, [receiptId]))[0]!;
     } finally {
       client.release();
+    }
+  }
+
+  async view(client: PoolClient, organizationId: string, receiptId: string): Promise<ReceiptView> {
+    return (await this.views(client, organizationId, [receiptId]))[0]!;
+  }
+
+  async revalidateSubmission(
+    client: PoolClient,
+    organizationId: string,
+    actorUserId: string,
+    receipt: ReceiptView,
+  ): Promise<void> {
+    const dto: ReceiptCreateDto = {
+      businessDate: receipt.businessDate,
+      partyId: receipt.partyId,
+      branchId: receipt.branchId,
+      treasuryUnitId: receipt.treasuryUnitId,
+      baseCurrency: receipt.baseCurrency,
+      description: receipt.description,
+      purpose: receipt.purpose,
+      contractRef: receipt.contractRef,
+      invoiceRef: receipt.invoiceRef,
+      orderRef: receipt.orderRef,
+      projectRef: receipt.projectRef,
+      costCenterRef: receipt.costCenterRef,
+      lines: receipt.lines.map((line) => ({
+        lineNumber: line.lineNumber,
+        methodId: line.methodId,
+        money: { ...line.money, amount: compactDecimal(line.money.amount) },
+        cashboxId: line.cashboxId,
+        bankAccountId: line.bankAccountId,
+        posTerminalId: line.posTerminalId,
+        paymentGatewayId: line.paymentGatewayId,
+        cheque: line.cheque && {
+          bankId: line.cheque.bankId,
+          bankBranchId: line.cheque.bankBranchId,
+          chequeNumber: line.cheque.chequeNumber,
+          series: line.cheque.series,
+          localTrackingId: line.cheque.localTrackingId,
+          issuerAccountRef: line.cheque.issuerAccountRef,
+          payerPartyId: line.cheque.payerPartyId,
+          sayadObservation: line.cheque.sayadObservation,
+          receiptDate: line.cheque.receiptDate,
+          dueDate: line.cheque.dueDate,
+        },
+        trackingNumber: line.trackingNumber,
+        payerAccountReference: line.payerAccountReference,
+        dueDate: line.dueDate,
+        payerName: line.payerName,
+        allocations: line.allocations.map((allocation) => ({
+          externalObjectType: allocation.externalObjectType,
+          externalObjectId: allocation.externalObjectId,
+          baseMoney: {
+            ...allocation.baseMoney,
+            amount: compactDecimal(allocation.baseMoney.amount),
+          },
+        })),
+        remainderTreatment: line.remainderTreatment,
+        description: line.description,
+        accountingDimensions: line.accountingDimensions,
+        attachments: line.attachments?.map((attachment) => ({
+          id: attachment.id,
+          contentDigest: attachment.contentDigest,
+          purpose: attachment.purpose,
+        })),
+      })),
+    };
+    const facts = await this.derive(
+      client,
+      organizationId,
+      actorUserId,
+      'receipt.submit',
+      dto,
+      new Date(receipt.enteredAt),
+    );
+    if (compareDecimal(facts.totalBaseAmount, receipt.totalBaseAmount.amount) !== 0) {
+      throw new Error('TOTAL_MISMATCH');
+    }
+    for (const [index, line] of receipt.lines.entries()) {
+      const derived = facts.lines[index];
+      if (
+        !derived
+        || derived.input.lineNumber !== line.lineNumber
+        || compareDecimal(derived.baseAmount, line.baseAmount.amount) !== 0
+        || derived.rate.rateSource !== line.rateSnapshot.rateSource
+        || derived.rate.rateRecordId !== line.rateSnapshot.rateRecordId
+        || derived.rate.ratedAt !== line.rateSnapshot.ratedAt
+        || compareDecimal(derived.rate.rate, line.rateSnapshot.rate) !== 0
+        || compareDecimal(
+          derived.rate.roundingDifference,
+          line.rateSnapshot.roundingDifference,
+        ) !== 0
+      ) throw new Error('RATE_INVALID');
     }
   }
 
@@ -310,7 +405,7 @@ export class ReceiptRepository {
     client: PoolClient,
     organizationId: string,
     actorUserId: string,
-    permission: 'receipt.create' | 'receipt.edit-draft',
+    permission: 'receipt.create' | 'receipt.edit-draft' | 'receipt.submit',
     dto: ReceiptCreateDto,
     enteredAt: Date,
   ): Promise<DraftFacts> {
@@ -1221,11 +1316,167 @@ export class ReceiptRepository {
       }) as ReceiptLineView;
       linesByReceipt.set(receiptId, [...(linesByReceipt.get(receiptId) ?? []), view]);
     }
+    const approvalViews = await this.approvalViews(client, organizationId, ids);
     const headerMap = new Map(headers.rows.map((header) => [header.id, header]));
     return ids.map((id) => compact({
       ...headerMap.get(id)!,
+      approvalSnapshot: approvalViews.get(id),
       lines: linesByReceipt.get(id) ?? [],
     }) as ReceiptView);
+  }
+
+  private async approvalViews(
+    client: PoolClient,
+    organizationId: string,
+    receiptIds: string[],
+  ): Promise<Map<string, ReceiptApprovalSnapshotView>> {
+    const result = new Map<string, ReceiptApprovalSnapshotView>();
+    if (receiptIds.length === 0) return result;
+    const snapshots = await client.query<{
+      id: string;
+      receiptId: string;
+      documentVersion: number;
+      amountBasis: { amount: string; currency: string };
+      evaluatedAt: string;
+      receiptState: string;
+    }>(`
+      SELECT s.id, s.receipt_document_id AS "receiptId",
+             s.document_version::int AS "documentVersion",
+             jsonb_build_object('amount', s.amount_basis::text, 'currency', s.base_currency)
+               AS "amountBasis",
+             to_char(s.evaluated_at AT TIME ZONE 'UTC',
+               'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS "evaluatedAt",
+             rd.state AS "receiptState"
+      FROM receipt_documents rd
+      JOIN receipt_approval_snapshots s
+        ON s.organization_id = rd.organization_id
+          AND s.receipt_document_id = rd.id
+          AND s.id = rd.current_approval_snapshot_id
+      WHERE rd.organization_id = $1 AND rd.id = ANY($2::uuid[])
+    `, [organizationId, receiptIds]);
+    const snapshotIds = snapshots.rows.map(({ id }) => id);
+    if (snapshotIds.length === 0) return result;
+    const contexts = await client.query<{
+      snapshotId: string;
+      value: ReceiptApprovalSnapshotView['policyContexts'][number];
+    }>(`
+      SELECT approval_snapshot_id AS "snapshotId", jsonb_build_object(
+        'order', context_order, 'firstLineNumber', first_line_number,
+        'currency', currency, 'methodCategory', method_category,
+        'policyId', policy_id,
+        'policy', jsonb_build_object('id', policy_id, 'label', policy_name),
+        'policyVersion', policy_version
+      ) AS value
+      FROM receipt_approval_snapshot_contexts
+      WHERE organization_id = $1 AND approval_snapshot_id = ANY($2::uuid[])
+      ORDER BY approval_snapshot_id, context_order
+    `, [organizationId, snapshotIds]);
+    const steps = await client.query<{
+      id: string;
+      snapshotId: string;
+      order: number;
+      roleId: string | null;
+      roleName: string | null;
+      approverUserId: string | null;
+      approverName: string | null;
+      approvalsRequired: number;
+      separationRules: string[];
+      sourceContextOrders: number[];
+    }>(`
+      SELECT id, approval_snapshot_id AS "snapshotId", step_order AS "order",
+             role_id AS "roleId", role_name AS "roleName",
+             approver_user_id AS "approverUserId", approver_name AS "approverName",
+             approvals_required AS "approvalsRequired",
+             separation_rules AS "separationRules",
+             source_context_orders AS "sourceContextOrders"
+      FROM receipt_approval_snapshot_steps
+      WHERE organization_id = $1 AND approval_snapshot_id = ANY($2::uuid[])
+      ORDER BY approval_snapshot_id, step_order
+    `, [organizationId, snapshotIds]);
+    const actions = await client.query<{
+      snapshotId: string;
+      stepId: string | null;
+      value: ReceiptApprovalSnapshotView['actions'][number];
+    }>(`
+      SELECT a.approval_snapshot_id AS "snapshotId",
+             a.approval_snapshot_step_id AS "stepId",
+             jsonb_strip_nulls(jsonb_build_object(
+               'id', a.id, 'approvalSnapshotId', a.approval_snapshot_id,
+               'approvalSnapshotStepId', a.approval_snapshot_step_id,
+               'stepOrder', a.step_order, 'actorUserId', a.actor_user_id,
+               'actor', jsonb_build_object('id', actor.id, 'label', actor.display_name),
+               'delegatedFromUserId', a.delegated_from_user_id,
+               'delegatedFrom', CASE WHEN delegated.id IS NULL THEN NULL ELSE
+                 jsonb_build_object('id', delegated.id, 'label', delegated.display_name) END,
+               'action', a.action, 'reason', a.reason,
+               'actedAt', to_char(a.acted_at AT TIME ZONE 'UTC',
+                 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')
+             )) AS value
+      FROM receipt_approval_actions a
+      JOIN user_refs actor
+        ON actor.organization_id = a.organization_id AND actor.id = a.actor_user_id
+      LEFT JOIN user_refs delegated
+        ON delegated.organization_id = a.organization_id
+          AND delegated.id = a.delegated_from_user_id
+      WHERE a.organization_id = $1 AND a.approval_snapshot_id = ANY($2::uuid[])
+      ORDER BY a.approval_snapshot_id, a.acted_at, a.id
+    `, [organizationId, snapshotIds]);
+    for (const snapshot of snapshots.rows) {
+      const snapshotActions = actions.rows
+        .filter(({ snapshotId }) => snapshotId === snapshot.id)
+        .map(({ value }) => value);
+      const snapshotSteps = steps.rows.filter(({ snapshotId }) => snapshotId === snapshot.id);
+      const firstIncomplete = snapshotSteps.find(({ id, approvalsRequired }) =>
+        new Set(actions.rows.filter((action) =>
+          action.snapshotId === snapshot.id
+          && action.stepId === id
+          && action.value.action === 'APPROVED').map(({ value }) => value.actorUserId)).size
+          < approvalsRequired);
+      result.set(snapshot.receiptId, {
+        id: snapshot.id,
+        documentVersion: snapshot.documentVersion,
+        amountBasis: snapshot.amountBasis,
+        evaluatedAt: snapshot.evaluatedAt,
+        policyContexts: contexts.rows
+          .filter(({ snapshotId }) => snapshotId === snapshot.id)
+          .map(({ value }) => value),
+        steps: snapshotSteps.map((step) => {
+          const stepActions = actions.rows.filter((action) =>
+            action.snapshotId === snapshot.id && action.stepId === step.id);
+          const approvalsRecorded = new Set(stepActions
+            .filter(({ value }) => value.action === 'APPROVED')
+            .map(({ value }) => value.actorUserId)).size;
+          const terminal = stepActions.find(({ value }) =>
+            value.action === 'REJECTED' || value.action === 'RETURNED')?.value.action;
+          return compact({
+            order: step.order,
+            roleId: step.roleId,
+            role: step.roleId ? { id: step.roleId, label: step.roleName! } : undefined,
+            approverUserId: step.approverUserId,
+            approver: step.approverUserId
+              ? { id: step.approverUserId, label: step.approverName! }
+              : undefined,
+            approvalsRequired: step.approvalsRequired,
+            approvalsRecorded,
+            separationRules: step.separationRules,
+            sourceContextOrders: step.sourceContextOrders,
+            state: terminal
+              ?? (approvalsRecorded >= step.approvalsRequired
+                ? 'APPROVED'
+                : firstIncomplete?.id === step.id && snapshot.receiptState === 'APPROVAL_PENDING'
+                  ? 'CURRENT'
+                  : 'WAITING'),
+          }) as ReceiptApprovalSnapshotView['steps'][number];
+        }),
+        actions: snapshotActions,
+        state: snapshot.receiptState === 'APPROVED'
+          ? 'APPROVED'
+          : snapshot.receiptState === 'REJECTED'
+            ? 'REJECTED'
+            : 'PENDING',
+      });
+    }
+    return result;
   }
 
   private async chequeViews(
@@ -1349,13 +1600,14 @@ export class ReceiptRepository {
   }
 }
 
-function storedScopeSql(permission: string): string {
+export function storedScopeSql(permission: string, grantPredicate = ''): string {
   return `EXISTS (
     SELECT 1
     FROM access_grants ag
     JOIN roles r ON r.id = ag.role_id AND r.state = 'ACTIVE'
     JOIN role_permissions rp ON rp.role_id = r.id AND rp.permission = '${permission}'
     WHERE ag.organization_id = $1 AND ag.user_ref_id = $2
+      ${grantPredicate}
       AND ag.state = 'ACTIVE' AND ag.valid_from <= now()
       AND (ag.valid_to IS NULL OR ag.valid_to > now())
       AND (
@@ -1419,8 +1671,12 @@ function storedScopeSql(permission: string): string {
                 WHERE rl.organization_id = rd.organization_id
                   AND rl.receipt_document_id = rd.id
                   AND NOT EXISTS (SELECT 1 FROM access_grant_currency_scopes s
-                    WHERE s.access_grant_id = ag.id AND s.currency = rl.currency))
+                  WHERE s.access_grant_id = ag.id AND s.currency = rl.currency))
             ))
+          AND (ag.amount_ceiling IS NULL OR (
+            ag.amount_ceiling_currency = rd.base_currency
+            AND ag.amount_ceiling >= rd.total_base_amount
+          ))
         )
       )
   )`;
@@ -1476,6 +1732,10 @@ function scaled(value: string, scale: number): bigint {
 
 function decimalPlaces(value: string): number {
   return value.split('.')[1]?.length ?? 0;
+}
+
+function compactDecimal(value: string): string {
+  return value.replace(/(\.\d*?[1-9])0+$|\.0+$/u, '$1');
 }
 
 function decimalParts(value: string): { value: bigint; scale: number } {

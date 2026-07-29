@@ -31,8 +31,11 @@ test('receipt gate refuses missing authorization, non-TTY use, remote and arbitr
     'cashbox.view',
     'master-data.view',
     'party.view',
+    'receipt.approve',
     'receipt.create',
     'receipt.edit-draft',
+    'receipt.reject',
+    'receipt.submit',
     'receipt.view',
   ]);
   assert.throws(() => assertGateEntry([], true, true), /Explicit/u);

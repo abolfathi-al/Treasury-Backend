@@ -144,6 +144,17 @@ export class ReceiptCreateDto {
   lines!: ReceiptLineInputDto[];
 }
 
+export enum ReceiptApprovalAction {
+  APPROVE = 'APPROVE',
+  REJECT = 'REJECT',
+  RETURN = 'RETURN',
+}
+
+export class ReceiptApprovalActionDto {
+  @IsEnum(ReceiptApprovalAction) action!: ReceiptApprovalAction;
+  @IsOptional() @IsString() @MinLength(1) @MaxLength(500) reason?: string;
+}
+
 export interface ReceiptSemanticRef {
   id: string;
   label: string;
@@ -216,6 +227,54 @@ export interface ReceiptLineView {
   version: number;
 }
 
+export interface ReceiptApprovalPolicyContextView {
+  order: number;
+  firstLineNumber: number;
+  currency: string;
+  methodCategory: MethodBehaviorCategory;
+  policyId: string;
+  policy: ReceiptSemanticRef;
+  policyVersion: number;
+}
+
+export interface ReceiptApprovalActionView {
+  id: string;
+  approvalSnapshotId: string;
+  approvalSnapshotStepId?: string;
+  stepOrder?: number;
+  actorUserId: string;
+  actor: ReceiptSemanticRef;
+  delegatedFromUserId?: string;
+  delegatedFrom?: ReceiptSemanticRef;
+  action: 'APPROVED' | 'REJECTED' | 'RETURNED';
+  reason?: string;
+  actedAt: string;
+}
+
+export interface ReceiptApprovalStepView {
+  order: number;
+  roleId?: string;
+  role?: ReceiptSemanticRef;
+  approverUserId?: string;
+  approver?: ReceiptSemanticRef;
+  approvalsRequired: number;
+  approvalsRecorded: number;
+  separationRules: string[];
+  sourceContextOrders: number[];
+  state: 'WAITING' | 'CURRENT' | 'APPROVED' | 'REJECTED' | 'RETURNED';
+}
+
+export interface ReceiptApprovalSnapshotView {
+  id: string;
+  documentVersion: number;
+  amountBasis: ReceiptPositiveMoneyDto;
+  evaluatedAt: string;
+  policyContexts: ReceiptApprovalPolicyContextView[];
+  steps: ReceiptApprovalStepView[];
+  actions: ReceiptApprovalActionView[];
+  state: 'PENDING' | 'APPROVED' | 'REJECTED' | 'RETURNED';
+}
+
 export interface ReceiptView {
   id: string;
   organizationId: string;
@@ -242,9 +301,10 @@ export interface ReceiptView {
   creatorUserId: string;
   creator: ReceiptSemanticRef;
   totalBaseAmount: ReceiptPositiveMoneyDto;
+  approvalSnapshot?: ReceiptApprovalSnapshotView;
   lines: ReceiptLineView[];
-  state: 'DRAFT';
-  workflowState: 'DRAFT';
+  state: 'DRAFT' | 'SUBMITTED' | 'APPROVAL_PENDING' | 'APPROVED' | 'REJECTED';
+  workflowState: 'DRAFT' | 'SUBMITTED' | 'APPROVAL_PENDING' | 'APPROVED' | 'REJECTED';
   executionState: 'NOT_EXECUTED';
   accountingState: 'NOT_READY';
   version: number;
