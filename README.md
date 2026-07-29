@@ -1,6 +1,6 @@
 # Treasury Backend
 
-NestJS modular monolith through the owner-approved `INC-1G-CHEQUE-FOUNDATION` increment.
+NestJS modular monolith through the owner-approved `INC-2A-RECEIPT-DRAFTS` increment.
 The exact governed source is pinned in `canon-revision.json`.
 
 ## Runtime
@@ -59,8 +59,13 @@ locked transaction; then displays the single recovery code once.
   verification and semantic scope references;
 - atomic active Cheque Book creation with complete bounded available-leaf ranges,
   plus versioned `AVAILABLE`-to-`VOID`/`LOST` controls and append-only events;
+- semantic Receipt draft list/create/get/replace with one-grant authorization,
+  actor-bound idempotency, strong versions, server-derived totals and immutable
+  IDENTITY/TABLE rate snapshots, fail-closed evidence, and tenant-qualified
+  database constraints;
 - command-bound TOTP step-up for `createIdentityAccount`.
 
 There are no JWTs, generic repositories, CQRS buses, microservices, queues,
 caches, direct bank/provider connectivity, credential-storage fields, or
-runtime Method activation paths in this increment.
+Receipt submission/approval/execution/reversal routes, or runtime Method
+activation paths in this increment.

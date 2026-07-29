@@ -29,6 +29,8 @@ import {
 import { canonicalizeJson } from '../src/master-data/print-template.jcs';
 import type { PrintTemplateRepository } from '../src/master-data/print-template.repository';
 import { PrintTemplateService } from '../src/master-data/print-template.service';
+import type { ReceiptRepository } from '../src/receipts/receipt.repository';
+import { ReceiptService } from '../src/receipts/receipt.service';
 
 const shortKeyProblem = (error: unknown) => error instanceof TreasuryProblem && error.getStatus() === 422;
 
@@ -75,6 +77,27 @@ test('all business create boundaries enforce the OpenAPI Idempotency-Key length'
         pageProfile: PrintTemplatePageProfile.A4_PORTRAIT,
         templateBody,
         templateDigest: digest(canonicalizeJson(templateBody)),
+      },
+      'x',
+      'request',
+    ),
+    shortKeyProblem,
+  );
+  await assert.rejects(
+    new ReceiptService({} as ReceiptRepository).create(
+      'org',
+      'actor',
+      {
+        businessDate: '2026-07-28',
+        partyId: '00000000-0000-4000-8000-000000000001',
+        treasuryUnitId: '00000000-0000-4000-8000-000000000002',
+        baseCurrency: 'IRR',
+        lines: [{
+          lineNumber: 1,
+          methodId: '00000000-0000-4000-8000-000000000003',
+          money: { amount: '1000', currency: 'IRR' },
+          remainderTreatment: 'UNALLOCATED' as never,
+        }],
       },
       'x',
       'request',

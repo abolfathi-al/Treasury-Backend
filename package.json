@@ -8,6 +8,7 @@
     "test": "node --import tsx --test --test-concurrency=1 test/*.test.ts",
     "db:migrate": "tsx scripts/migrate.ts",
     "bootstrap:operator": "tsx scripts/bootstrap.ts",
+    "qa:receipt-final-gate": "node --import tsx scripts/receipt-final-gate.ts",
     "start": "node dist/main.js",
     "start:dev": "tsx watch src/main.ts"
   },

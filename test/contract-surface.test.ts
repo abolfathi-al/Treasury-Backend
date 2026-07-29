@@ -19,6 +19,7 @@ import { CashboxController } from '../src/cashbox-and-custody/cashbox.controller
 import { ChequeController } from '../src/cheques/cheque.controller';
 import { MasterDataController } from '../src/master-data/master-data.controller';
 import { PrintTemplateController } from '../src/master-data/print-template.controller';
+import { ReceiptController } from '../src/receipts/receipt.controller';
 
 const expectedOperations = [
   ['POST', 'v1/auth/sessions'],
@@ -68,6 +69,10 @@ const expectedOperations = [
   ['POST', 'v1/payment-gateways'],
   ['POST', 'v1/cheque-books'],
   ['POST', 'v1/cheque-books/:chequeBookId/leaves/:leafNumber/transitions'],
+  ['GET', 'v1/receipts'],
+  ['POST', 'v1/receipts'],
+  ['GET', 'v1/receipts/:resourceId'],
+  ['PUT', 'v1/receipts/:resourceId'],
 ] as const;
 
 test('all authorized operations through INC-1H are present in owner-local controllers', async () => {
@@ -81,6 +86,7 @@ test('all authorized operations through INC-1H are present in owner-local contro
     CashboxController,
     BankingController,
     ChequeController,
+    ReceiptController,
   ]) {
     const prefix = Reflect.getMetadata(PATH_METADATA, controller) as string;
     for (const name of Object.getOwnPropertyNames(controller.prototype)) {
@@ -94,6 +100,68 @@ test('all authorized operations through INC-1H are present in owner-local contro
   for (const [method, path] of expectedOperations) {
     assert.ok(operations.has(`${method} ${path}`), `${method} ${path}`);
   }
+});
+
+test('Receipt draft operations use exact one-grant permissions and expose no later command', () => {
+  for (const [handler, permission, operationId] of [
+    [ReceiptController.prototype.list, 'receipt.view', 'listReceipts'],
+    [ReceiptController.prototype.create, 'receipt.create', 'createReceipt'],
+    [ReceiptController.prototype.get, 'receipt.view', 'getReceipt'],
+    [ReceiptController.prototype.replace, 'receipt.edit-draft', 'replaceReceiptDraft'],
+  ] as const) {
+    assert.equal(Reflect.getMetadata(REQUIRED_PERMISSION, handler), permission);
+    assert.equal(Reflect.getMetadata(AUTHORIZATION_OPERATION, handler), operationId);
+    assert.equal(Reflect.getMetadata(PERMISSION_SCOPE_MODE, handler), 'ONE_GRANT_RESOURCE');
+    assert.equal(Reflect.getMetadata(STEP_UP_REQUIRED, handler), undefined);
+  }
+  for (const withheld of ['submit', 'approve', 'cancel', 'execute', 'reverse']) {
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(ReceiptController.prototype, withheld),
+      false,
+    );
+  }
+});
+
+test('Receipt migration enforces tenant identity, immutable children, and locked aggregates', async () => {
+  const migration = await readFile('migrations/0013_receipt_drafts.sql', 'utf8');
+  for (const table of [
+    'exchange_rates',
+    'attachments',
+    'receipt_documents',
+    'receipt_lines',
+    'receipt_allocations',
+    'receipt_line_attachment_links',
+  ]) {
+    assert.match(migration, new RegExp(`CREATE TABLE ${table}`, 'u'));
+  }
+  assert.match(migration, /rate_source IN \('IDENTITY', 'TABLE'\)/u);
+  assert.match(migration, /prevent_receipt_child_reparenting/u);
+  assert.match(migration, /SELECT total_base_amount INTO expected_total[\s\S]*FOR UPDATE/u);
+  assert.match(migration, /SELECT base_amount INTO line_total[\s\S]*FOR UPDATE/u);
+  assert.match(
+    migration,
+    /FOREIGN KEY \(organization_id, attachment_id, content_digest\)/u,
+  );
+  assert.match(
+    migration,
+    /FOREIGN KEY \(organization_id, cheque_bank_id\)[\s\S]*REFERENCES banks/u,
+  );
+  assert.match(
+    migration,
+    /FOREIGN KEY \(organization_id, cheque_bank_id, cheque_bank_branch_id\)[\s\S]*REFERENCES bank_branches/u,
+  );
+  assert.match(
+    migration,
+    /FOREIGN KEY \(organization_id, cheque_payer_party_id\)[\s\S]*REFERENCES parties/u,
+  );
+  assert.match(
+    migration,
+    /jsonb_typeof\(cheque_input->'bankId'\) IS NOT DISTINCT FROM 'string'/u,
+  );
+  assert.match(
+    migration,
+    /cheque_input->>'bankId' IS NOT DISTINCT FROM cheque_bank_id::text/u,
+  );
 });
 
 test('Cheque Foundation operations use exact scoped permissions without step-up', () => {
@@ -483,4 +551,7 @@ test('operator bootstrap is local-only, advisory-locked, and transactional', asy
   assert.match(bootstrap, /const secondCounter = await requireTotp/u);
   assert.match(bootstrap, /totp_last_counter/u);
   assert.match(bootstrap, /'cashbox\.handover'/u);
+  assert.match(bootstrap, /for \(const character of chunk\)/u);
+  assert.match(bootstrap, /reject\(new Error\('Bootstrap cancelled\.'\)\);\s+return;/u);
+  assert.match(bootstrap, /resolve\(value\);\s+return;/u);
 });
