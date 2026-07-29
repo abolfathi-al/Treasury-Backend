@@ -10,6 +10,43 @@ export class AccessAuthorizationService {
     private readonly repository: AccessAuthorizationRepository,
   ) {}
 
+  canOperateReceipt(
+    transaction: DatabaseTransaction,
+    organizationId: string,
+    actorUserId: string,
+    receiptId: string,
+    permission: 'receipt.execute' | 'receipt.reverse',
+  ): Promise<boolean> {
+    return this.repository.canOperateReceipt(
+      transaction,
+      organizationId,
+      actorUserId,
+      receiptId,
+      permission,
+    );
+  }
+
+  hasOrganizationPermission(
+    transaction: DatabaseTransaction,
+    organizationId: string,
+    actorUserId: string,
+    permission: string,
+  ): Promise<boolean> {
+    return this.repository.hasOrganizationPermission(
+      transaction,
+      organizationId,
+      actorUserId,
+      permission,
+    );
+  }
+
+  consumeStepUpProof(
+    transaction: DatabaseTransaction,
+    input: Parameters<AccessAuthorizationRepository['consumeStepUpProof']>[1],
+  ): Promise<boolean> {
+    return this.repository.consumeStepUpProof(transaction, input);
+  }
+
   canCreateCashboxHandover(
     transaction: DatabaseTransaction,
     organizationId: string,

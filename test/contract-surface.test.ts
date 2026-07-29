@@ -12,6 +12,7 @@ import {
   PERMISSION_SCOPE_MODE,
   REQUIRED_PERMISSION,
   STEP_UP_REQUIRED,
+  STEP_UP_REQUEST_PROPERTY,
 } from '../src/access-control/auth.decorators';
 import { IdentityController } from '../src/access-control/identity.controller';
 import { BankingController } from '../src/banking/banking.controller';
@@ -73,6 +74,9 @@ const expectedOperations = [
   ['POST', 'v1/receipts'],
   ['GET', 'v1/receipts/:resourceId'],
   ['PUT', 'v1/receipts/:resourceId'],
+  ['POST', 'v1/receipts/:resourceId/submit'],
+  ['POST', 'v1/receipts/:resourceId/execute'],
+  ['POST', 'v1/receipts/:resourceId/reverse'],
 ] as const;
 
 test('all authorized operations through INC-1H are present in owner-local controllers', async () => {
@@ -102,7 +106,7 @@ test('all authorized operations through INC-1H are present in owner-local contro
   }
 });
 
-test('Authorized Receipt operations use exact one-grant permissions and expose no later command', () => {
+test('Authorized Receipt operations use exact one-grant permissions and governed step-up', () => {
   for (const [handler, permission, operationId] of [
     [ReceiptController.prototype.list, 'receipt.view', 'listReceipts'],
     [ReceiptController.prototype.create, 'receipt.create', 'createReceipt'],
@@ -119,12 +123,50 @@ test('Authorized Receipt operations use exact one-grant permissions and expose n
     Reflect.getMetadata(REQUIRED_PERMISSION, ReceiptController.prototype.actOnApproval),
     undefined,
   );
-  for (const withheld of ['cancel', 'execute', 'reverse']) {
-    assert.equal(
-      Object.prototype.hasOwnProperty.call(ReceiptController.prototype, withheld),
-      false,
-    );
-  }
+  assert.equal(
+    Reflect.getMetadata(REQUIRED_PERMISSION, ReceiptController.prototype.execute),
+    'receipt.execute',
+  );
+  assert.equal(
+    Reflect.getMetadata(AUTHORIZATION_OPERATION, ReceiptController.prototype.execute),
+    'executeReceipt',
+  );
+  assert.equal(
+    Reflect.getMetadata(PERMISSION_SCOPE_MODE, ReceiptController.prototype.execute),
+    'ONE_GRANT_RESOURCE',
+  );
+  assert.equal(
+    Reflect.getMetadata(STEP_UP_REQUIRED, ReceiptController.prototype.execute),
+    'executeReceipt',
+  );
+  assert.equal(
+    Reflect.getMetadata(STEP_UP_REQUEST_PROPERTY, ReceiptController.prototype.execute),
+    'separationOverride',
+  );
+  assert.equal(
+    Reflect.getMetadata(REQUIRED_PERMISSION, ReceiptController.prototype.reverse),
+    'receipt.reverse',
+  );
+  assert.equal(
+    Reflect.getMetadata(AUTHORIZATION_OPERATION, ReceiptController.prototype.reverse),
+    'reverseReceipt',
+  );
+  assert.equal(
+    Reflect.getMetadata(PERMISSION_SCOPE_MODE, ReceiptController.prototype.reverse),
+    'ONE_GRANT_RESOURCE',
+  );
+  assert.equal(
+    Reflect.getMetadata(STEP_UP_REQUIRED, ReceiptController.prototype.reverse),
+    'reverseReceipt',
+  );
+  assert.equal(
+    Reflect.getMetadata(STEP_UP_REQUEST_PROPERTY, ReceiptController.prototype.reverse),
+    undefined,
+  );
+  assert.equal(
+    Object.prototype.hasOwnProperty.call(ReceiptController.prototype, 'cancel'),
+    false,
+  );
 });
 
 test('Receipt submission migration persists immutable snapshot facts and exact action constraints', async () => {

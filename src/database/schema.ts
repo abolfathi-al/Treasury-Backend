@@ -1417,6 +1417,10 @@ export const receiptDocuments: any = pgTable('receipt_documents', {
   workflowState: varchar('workflow_state', { length: 24 }).notNull().default('DRAFT'),
   executionState: varchar('execution_state', { length: 24 }).notNull().default('NOT_EXECUTED'),
   accountingState: varchar('accounting_state', { length: 24 }).notNull().default('NOT_READY'),
+  executedAt: timestamp('executed_at', { withTimezone: true }),
+  executedByUserId: uuid('executed_by_user_id'),
+  reversalReceiptId: uuid('reversal_receipt_id'),
+  reversesReceiptId: uuid('reverses_receipt_id'),
   version: bigint('version', { mode: 'number' }).notNull().default(0),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
@@ -1453,7 +1457,10 @@ export const receiptDocuments: any = pgTable('receipt_documents', {
   check('receipt_documents_origin_manual', sql`${table.origin} = 'MANUAL'`),
   check(
     'receipt_documents_state_check',
-    sql`${table.state} IN ('DRAFT', 'SUBMITTED', 'APPROVAL_PENDING', 'APPROVED', 'REJECTED')`,
+    sql`${table.state} IN (
+      'DRAFT', 'SUBMITTED', 'APPROVAL_PENDING', 'APPROVED', 'REJECTED',
+      'EXECUTED', 'REVERSED'
+    )`,
   ),
   check(
     'receipt_documents_workflow_state_check',
@@ -1461,14 +1468,31 @@ export const receiptDocuments: any = pgTable('receipt_documents', {
       'DRAFT', 'SUBMITTED', 'APPROVAL_PENDING', 'APPROVED', 'REJECTED'
     )`,
   ),
-  check('receipt_documents_workflow_matches_state', sql`${table.workflowState} = ${table.state}`),
   check(
     'receipt_documents_snapshot_state_check',
     sql`(${table.state} = 'DRAFT' AND ${table.currentApprovalSnapshotId} IS NULL)
-      OR (${table.state} <> 'DRAFT' AND ${table.currentApprovalSnapshotId} IS NOT NULL)`,
+      OR (
+        ${table.state} <> 'DRAFT'
+        AND (
+          (
+            ${table.reversesReceiptId} IS NULL
+            AND ${table.currentApprovalSnapshotId} IS NOT NULL
+          )
+          OR (
+            ${table.reversesReceiptId} IS NOT NULL
+            AND ${table.currentApprovalSnapshotId} IS NULL
+          )
+        )
+      )`,
   ),
-  check('receipt_documents_execution_unexecuted', sql`${table.executionState} = 'NOT_EXECUTED'`),
-  check('receipt_documents_accounting_not_ready', sql`${table.accountingState} = 'NOT_READY'`),
+  check(
+    'receipt_documents_execution_state_check',
+    sql`${table.executionState} IN ('NOT_EXECUTED', 'EXECUTED', 'REVERSED')`,
+  ),
+  check(
+    'receipt_documents_accounting_state_check',
+    sql`${table.accountingState} IN ('NOT_READY', 'READY')`,
+  ),
   index('receipt_documents_list_idx')
     .on(table.organizationId, table.businessDate, table.id),
 ]);
@@ -1695,6 +1719,8 @@ export const receiptLines: any = pgTable('receipt_lines', {
   description: varchar('description', { length: 1000 }),
   accountingDimensions: jsonb('accounting_dimensions').$type<Record<string, string>>(),
   state: varchar('state', { length: 16 }).notNull().default('DRAFT'),
+  executedAt: timestamp('executed_at', { withTimezone: true }),
+  executedByUserId: uuid('executed_by_user_id'),
   version: bigint('version', { mode: 'number' }).notNull().default(0),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
@@ -1851,5 +1877,181 @@ export const receiptLineAttachmentLinks = pgTable('receipt_line_attachment_links
   check(
     'receipt_line_attachment_links_digest_format',
     sql`${table.contentDigest} ~ '^[a-f0-9]{64}$'`,
+  ),
+]);
+
+export const cashboxDays = pgTable('cashbox_days', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  organizationId: uuid('organization_id').notNull().references(() => organizations.id),
+  cashboxId: uuid('cashbox_id').notNull(),
+  businessDate: date('business_date').notNull(),
+  closeCycle: integer('close_cycle').notNull().default(1),
+  state: varchar('state', { length: 24 }).notNull(),
+  version: bigint('version', { mode: 'number' }).notNull().default(0),
+}, (table) => [
+  unique().on(
+    table.organizationId,
+    table.cashboxId,
+    table.businessDate,
+    table.closeCycle,
+  ),
+]);
+
+export const movementFacts = pgTable('movement_facts', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  organizationId: uuid('organization_id').notNull().references(() => organizations.id),
+  owner: varchar('owner', { length: 64 }).notNull(),
+  sourceType: varchar('source_type', { length: 32 }).notNull(),
+  sourceId: uuid('source_id').notNull(),
+  sourceLineId: uuid('source_line_id'),
+  effectKey: varchar('effect_key', { length: 128 }).notNull(),
+  endpointType: varchar('endpoint_type', { length: 16 }).notNull(),
+  endpointId: uuid('endpoint_id').notNull(),
+  direction: varchar('direction', { length: 8 }).notNull(),
+  amount: numeric('amount', { precision: 38, scale: 8 }).notNull(),
+  currency: varchar('currency', { length: 8 }).notNull(),
+  businessDate: date('business_date').notNull(),
+  executedAt: timestamp('executed_at', { withTimezone: true }).notNull().defaultNow(),
+  reversalOfFactId: uuid('reversal_of_fact_id'),
+  state: varchar('state', { length: 16 }).notNull(),
+}, (table) => [
+  unique().on(table.organizationId, table.id),
+  unique().on(
+    table.organizationId,
+    table.owner,
+    table.sourceType,
+    table.sourceId,
+    table.sourceLineId,
+    table.effectKey,
+  ),
+  unique().on(table.organizationId, table.reversalOfFactId),
+]);
+
+export const receivedCheques = pgTable('received_cheques', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  organizationId: uuid('organization_id').notNull().references(() => organizations.id),
+  receiptLineId: uuid('receipt_line_id').notNull(),
+  issuerBankId: uuid('issuer_bank_id').notNull(),
+  issuerBankBranchId: uuid('issuer_bank_branch_id'),
+  chequeNumber: varchar('cheque_number', { length: 64 }).notNull(),
+  series: varchar('series', { length: 32 }),
+  localTrackingId: varchar('local_tracking_id', { length: 64 }),
+  issuerAccountRef: varchar('issuer_account_ref', { length: 128 }),
+  payerPartyId: uuid('payer_party_id'),
+  amount: numeric('amount', { precision: 38, scale: 8 }).notNull(),
+  currency: varchar('currency', { length: 8 }).notNull(),
+  receiptDate: date('receipt_date').notNull(),
+  dueDate: date('due_date').notNull(),
+  custodianType: varchar('custodian_type', { length: 16 }).notNull(),
+  custodianId: uuid('custodian_id').notNull(),
+  sayadId: char('sayad_id', { length: 16 }),
+  sayadStatus: varchar('sayad_status', { length: 64 }),
+  sayadSource: varchar('sayad_source', { length: 8 }),
+  sayadObservedAt: timestamp('sayad_observed_at', { withTimezone: true }),
+  sayadSourceDigest: char('sayad_source_digest', { length: 64 }),
+  issuerNationalId: varchar('issuer_national_id', { length: 32 }),
+  beneficiaryNationalId: varchar('beneficiary_national_id', { length: 32 }),
+  state: varchar('state', { length: 24 }).notNull().default('RECEIVED'),
+  version: bigint('version', { mode: 'number' }).notNull().default(0),
+}, (table) => [
+  unique().on(table.organizationId, table.id),
+  unique().on(table.organizationId, table.receiptLineId, table.id),
+  unique().on(table.organizationId, table.receiptLineId),
+  unique().on(
+    table.organizationId,
+    table.issuerBankId,
+    table.chequeNumber,
+    table.amount,
+    table.dueDate,
+  ),
+]);
+
+export const collectionItems = pgTable('collection_items', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  organizationId: uuid('organization_id').notNull().references(() => organizations.id),
+  sourceFactType: varchar('source_fact_type', { length: 32 }).notNull(),
+  sourceFactId: uuid('source_fact_id').notNull(),
+  channelType: varchar('channel_type', { length: 24 }).notNull(),
+  channelId: uuid('channel_id'),
+  providerReference: varchar('provider_reference', { length: 128 }),
+  grossAmount: numeric('gross_amount', { precision: 38, scale: 8 }).notNull(),
+  currency: varchar('currency', { length: 8 }).notNull(),
+  allocatedAmount: numeric('allocated_amount', { precision: 38, scale: 8 }).notNull().default('0'),
+  remainingAmount: numeric('remaining_amount', { precision: 38, scale: 8 }).notNull(),
+  destinationBankAccountId: uuid('destination_bank_account_id').notNull(),
+  collectedAt: timestamp('collected_at', { withTimezone: true }).notNull(),
+  expectedSettlementDate: date('expected_settlement_date'),
+  state: varchar('state', { length: 32 }).notNull().default('OPEN'),
+  version: bigint('version', { mode: 'number' }).notNull().default(0),
+}, (table) => [
+  unique().on(table.organizationId, table.id),
+  unique().on(table.organizationId, table.sourceFactType, table.sourceFactId),
+]);
+
+export const receiptExecutionEffects = pgTable('receipt_execution_effects', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  organizationId: uuid('organization_id').notNull().references(() => organizations.id),
+  receiptLineId: uuid('receipt_line_id').notNull(),
+  effectKey: varchar('effect_key', { length: 128 }).notNull(),
+  effectType: varchar('effect_type', { length: 24 }).notNull(),
+  direction: varchar('direction', { length: 8 }).notNull(),
+  amount: numeric('amount', { precision: 38, scale: 8 }).notNull(),
+  currency: varchar('currency', { length: 8 }).notNull(),
+  businessDate: date('business_date').notNull(),
+  sourceVersion: bigint('source_version', { mode: 'number' }).notNull(),
+  movementFactId: uuid('movement_fact_id'),
+  receivedChequeId: uuid('received_cheque_id'),
+  chequeEventId: uuid('cheque_event_id'),
+  collectionItemId: uuid('collection_item_id'),
+  collectionItemVersion: bigint('collection_item_version', { mode: 'number' }),
+  collectionItemState: varchar('collection_item_state', { length: 32 }),
+  reversalOfEffectId: uuid('reversal_of_effect_id'),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  unique().on(table.organizationId, table.id),
+  unique().on(table.organizationId, table.id, table.currency, table.amount),
+  unique().on(
+    table.organizationId,
+    table.receiptLineId,
+    table.effectKey,
+    table.direction,
+  ),
+  unique().on(table.organizationId, table.reversalOfEffectId),
+  unique().on(table.organizationId, table.movementFactId),
+  unique().on(table.organizationId, table.receivedChequeId),
+  unique().on(table.organizationId, table.chequeEventId),
+]);
+
+export const auditEvents = pgTable('audit_events', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  organizationId: uuid('organization_id').notNull().references(() => organizations.id),
+  requestId: varchar('request_id', { length: 128 }).notNull(),
+  sequenceNo: bigint('sequence_no', { mode: 'number' }).notNull(),
+  actorUserId: uuid('actor_user_id'),
+  entityType: varchar('entity_type', { length: 32 }).notNull(),
+  entityId: uuid('entity_id').notNull(),
+  action: varchar('action', { length: 64 }).notNull(),
+  reason: varchar('reason', { length: 500 }),
+  outcome: varchar('outcome', { length: 24 }).notNull(),
+  occurredAt: timestamp('occurred_at', { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [unique().on(table.organizationId, table.requestId, table.sequenceNo)]);
+
+export const outboxEvents = pgTable('outbox_events', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  organizationId: uuid('organization_id').notNull().references(() => organizations.id),
+  aggregateType: varchar('aggregate_type', { length: 64 }).notNull(),
+  aggregateId: uuid('aggregate_id').notNull(),
+  aggregateVersion: bigint('aggregate_version', { mode: 'number' }).notNull(),
+  eventType: varchar('event_type', { length: 128 }).notNull(),
+  payload: jsonb('payload').$type<Record<string, unknown>>().notNull(),
+  occurredAt: timestamp('occurred_at', { withTimezone: true }).notNull().defaultNow(),
+  publishedAt: timestamp('published_at', { withTimezone: true }),
+}, (table) => [
+  unique().on(
+    table.organizationId,
+    table.aggregateType,
+    table.aggregateId,
+    table.aggregateVersion,
+    table.eventType,
   ),
 ]);

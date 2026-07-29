@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import test from 'node:test';
 
+import { commandDigest, digest } from '../src/common/http';
 import { DatabaseService } from '../src/database/database.service';
 import { MethodBehaviorCategory, MethodReference } from '../src/master-data/master-data.dto';
 import {
@@ -14,6 +15,30 @@ import { ReceiptApprovalService } from '../src/receipts/receipt-approval.service
 import { ReceiptRepository } from '../src/receipts/receipt.repository';
 import { ReceiptService } from '../src/receipts/receipt.service';
 import { TreasuryProblem } from '../src/common/problem';
+import { AccessAuthorizationRepository } from '../src/access-control/access-authorization.repository';
+import { AccessAuthorizationService } from '../src/access-control/access-authorization.service';
+import {
+  ReceiptBankingEffectsRepository,
+  ReceiptBankingEffectsService,
+} from '../src/banking/receipt-banking-effects.service';
+import {
+  ReceiptCashboxEffectsRepository,
+  ReceiptCashboxEffectsService,
+} from '../src/cashbox-and-custody/receipt-cashbox-effects.service';
+import {
+  ReceiptChequeEffectsRepository,
+  ReceiptChequeEffectsService,
+} from '../src/cheques/receipt-cheque-effects.service';
+import {
+  CollectionEffectsRepository,
+  CollectionEffectsService,
+} from '../src/collection-and-settlement/collection-effects.service';
+import {
+  FoundationEffectsRepository,
+  FoundationEffectsService,
+} from '../src/foundation-effects/foundation-effects.service';
+import { ReceiptExecutionRepository } from '../src/receipts/receipt-execution.repository';
+import { ReceiptExecutionService } from '../src/receipts/receipt-execution.service';
 
 const connectionString = process.env.TEST_DATABASE_URL;
 const receiptBusinessDate = '2026-07-28';
@@ -886,6 +911,799 @@ test('Receipt draft create/read/replace is semantic, idempotent, versioned, and 
   }
 });
 
+test('Receipt execution is atomic, actor-idempotent, versioned and race-safe', {
+  skip: connectionString ? false : 'TEST_DATABASE_URL is not configured',
+}, async () => {
+  process.env.DATABASE_URL = connectionString;
+  process.env.COMMAND_DIGEST_HMAC_KEY_BASE64 = Buffer.alloc(32, 22).toString('base64');
+  const database = new DatabaseService();
+  const seeded = await seedReceiptFoundation(database);
+  const receipts = new ReceiptService(new ReceiptRepository(database));
+  const authorization = new AccessAuthorizationService(
+    new AccessAuthorizationRepository(),
+  );
+  const execution = new ReceiptExecutionService(
+    database,
+    new ReceiptExecutionRepository(),
+    receipts,
+    authorization,
+    new ReceiptCashboxEffectsService(new ReceiptCashboxEffectsRepository()),
+    new ReceiptBankingEffectsService(new ReceiptBankingEffectsRepository()),
+    new ReceiptChequeEffectsService(new ReceiptChequeEffectsRepository()),
+    new CollectionEffectsService(new CollectionEffectsRepository()),
+    new FoundationEffectsService(new FoundationEffectsRepository()),
+  );
+  const executorId = randomUUID();
+  const executorRoleId = randomUUID();
+  const executorGrantId = randomUUID();
+  const reverserId = randomUUID();
+  const reverserRoleId = randomUUID();
+  const reverserGrantId = randomUUID();
+  const reverserAccountId = randomUUID();
+  const reverserSessionId = randomUUID();
+  const unscopedBankAccountId = randomUUID();
+  const derivedPosTerminalId = randomUUID();
+  const derivedGatewayId = randomUUID();
+  let reversalReceiptId: string | undefined;
+  const suffix = executorId.slice(0, 8).toUpperCase();
+  try {
+    await database.pool.query('UPDATE cashboxes SET active_from = $2 WHERE id = $1', [
+      seeded.cashboxId,
+      '2026-01-01',
+    ]);
+    await database.pool.query(`
+      INSERT INTO user_refs (id, organization_id, subject_key, display_name)
+      VALUES ($1,$2,$3,'Receipt executor')
+    `, [executorId, seeded.organizationId, `executor-${suffix}`]);
+    await database.pool.query(`
+      INSERT INTO roles (id, organization_id, code, name)
+      VALUES ($1,$2,$3,'Receipt execution role')
+    `, [executorRoleId, seeded.organizationId, `EXEC-${suffix}`]);
+    await database.pool.query(`
+      INSERT INTO role_permissions (role_id, permission)
+      VALUES ($1,'receipt.execute'),($1,'receipt.view')
+    `, [executorRoleId]);
+    await database.pool.query(`
+      INSERT INTO user_refs (id, organization_id, subject_key, display_name)
+      VALUES ($1,$2,$3,'Receipt reverser')
+    `, [reverserId, seeded.organizationId, `reverser-${suffix}`]);
+    await database.pool.query(`
+      INSERT INTO roles (id, organization_id, code, name)
+      VALUES ($1,$2,$3,'Receipt reversal role')
+    `, [reverserRoleId, seeded.organizationId, `REVERSE-${suffix}`]);
+    await database.pool.query(`
+      INSERT INTO role_permissions (role_id, permission)
+      VALUES ($1,'receipt.reverse'),($1,'receipt.view')
+    `, [reverserRoleId]);
+    await database.pool.query(`
+      INSERT INTO identity_accounts (
+        id, user_ref_id, normalized_login, password_hash, privileged
+      ) VALUES ($1,$2,$3,'test-password-hash',false)
+    `, [reverserAccountId, reverserId, `reverser.${suffix.toLowerCase()}`]);
+    await database.pool.query(`
+      INSERT INTO auth_sessions (
+        id, identity_account_id, token_digest, xsrf_digest, authenticated_at,
+        last_rotated_at, idle_expires_at, absolute_expires_at, assurance
+      ) VALUES (
+        $1,$2,$3,$4,now(),now(),now() + interval '15 minutes',
+        now() + interval '8 hours','PASSWORD_TOTP'
+      )
+    `, [
+      reverserSessionId,
+      reverserAccountId,
+      digest(`session-${suffix}`),
+      digest(`xsrf-${suffix}`),
+    ]);
+    await database.pool.query(`
+      INSERT INTO access_grants (
+        id, organization_id, user_ref_id, role_id, scope_type, scope_id, organization_wide
+      ) VALUES ($1,$2,$3,$4,'ORGANIZATION',$2,true)
+    `, [reverserGrantId, seeded.organizationId, reverserId, reverserRoleId]);
+    const grantClient = await database.pool.connect();
+    try {
+      await grantClient.query('BEGIN');
+      await grantClient.query(`
+        INSERT INTO access_grants (
+          id, organization_id, user_ref_id, role_id, scope_type, scope_id, organization_wide
+        ) VALUES ($1,$2,$3,$4,'ORGANIZATION',$2,false)
+      `, [executorGrantId, seeded.organizationId, executorId, executorRoleId]);
+      await grantClient.query(`
+        INSERT INTO access_grant_treasury_unit_scopes (
+          access_grant_id, treasury_unit_id
+        ) VALUES ($1,$2)
+      `, [executorGrantId, seeded.treasuryUnitId]);
+      await grantClient.query('COMMIT');
+    } catch (error) {
+      await grantClient.query('ROLLBACK');
+      throw error;
+    } finally {
+      grantClient.release();
+    }
+
+    await database.pool.query(`
+      INSERT INTO bank_accounts (
+        id, organization_id, bank_id, treasury_unit_id, account_type,
+        account_number, currency, legal_owner_name, opening_date,
+        cheque_enabled, can_receive, can_pay, can_transfer, state
+      ) VALUES (
+        $1,$2,$3,$4,'CURRENT',$5,$6,'Receipt scope test owner',
+        '2026-01-01',false,true,true,true,'ACTIVE'
+      )
+    `, [
+      unscopedBankAccountId,
+      seeded.organizationId,
+      seeded.bankId,
+      seeded.treasuryUnitId,
+      `UNSCOPED-${suffix}`,
+      seeded.baseCurrency,
+    ]);
+    await database.pool.query(`
+      INSERT INTO pos_terminals (
+        id, organization_id, bank_account_id, treasury_unit_id,
+        terminal_number, merchant_number, provider_label, currency,
+        settlement_cycle, state
+      ) VALUES ($1,$2,$3,$4,$5,$6,'Scope test POS',$7,'DAILY','ACTIVE')
+    `, [
+      derivedPosTerminalId,
+      seeded.organizationId,
+      seeded.bankAccountId,
+      seeded.treasuryUnitId,
+      `POS-${suffix}`,
+      `MERCHANT-${suffix}`,
+      seeded.baseCurrency,
+    ]);
+    await database.pool.query(`
+      INSERT INTO payment_gateways (
+        id, organization_id, bank_account_id, treasury_unit_id,
+        provider_code, merchant_id, terminal_id, currency,
+        settlement_cycle, state
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'DAILY','ACTIVE')
+    `, [
+      derivedGatewayId,
+      seeded.organizationId,
+      seeded.bankAccountId,
+      seeded.treasuryUnitId,
+      `SCOPE_${suffix}`,
+      `MERCHANT-${suffix}`,
+      `GATEWAY-${suffix}`,
+      seeded.baseCurrency,
+    ]);
+    await database.pool.query(`
+      INSERT INTO access_grant_bank_account_scopes (
+        access_grant_id, bank_account_id
+      ) VALUES ($1,$2)
+    `, [executorGrantId, unscopedBankAccountId]);
+    const draft = await receipts.create(
+      seeded.organizationId,
+      seeded.actorId,
+      {
+        businessDate: receiptBusinessDate,
+        partyId: seeded.partyId,
+        treasuryUnitId: seeded.treasuryUnitId,
+        baseCurrency: seeded.baseCurrency,
+        lines: [{
+          lineNumber: 1,
+          methodId: seeded.methodId,
+          money: { amount: '1000', currency: seeded.baseCurrency },
+          cashboxId: seeded.cashboxId,
+          remainderTreatment: ReceiptRemainderTreatment.UNALLOCATED,
+        }],
+      },
+      `execution-create-${suffix}`,
+      `execution-create-request-${suffix}`,
+    );
+    const executionLine = await database.pool.query<{ id: string }>(`
+      SELECT id
+      FROM receipt_lines
+      WHERE organization_id = $1 AND receipt_document_id = $2
+    `, [seeded.organizationId, draft.id]);
+    for (const derivedReference of [
+      { category: 'POS', column: 'pos_terminal_id', id: derivedPosTerminalId },
+      { category: 'GATEWAY', column: 'payment_gateway_id', id: derivedGatewayId },
+    ]) {
+      await database.pool.query(`
+        UPDATE receipt_lines
+        SET cashbox_id = NULL,
+            ${derivedReference.column} = $1,
+            method_category = $2,
+            creates_funds_in_transit = true
+        WHERE organization_id = $3 AND id = $4
+      `, [
+        derivedReference.id,
+        derivedReference.category,
+        seeded.organizationId,
+        executionLine.rows[0]!.id,
+      ]);
+      assert.equal(
+        await database.db.transaction((transaction) =>
+          authorization.canOperateReceipt(
+            transaction,
+            seeded.organizationId,
+            executorId,
+            draft.id,
+            'receipt.execute',
+          )),
+        false,
+      );
+      await database.pool.query(`
+        UPDATE receipt_lines
+        SET ${derivedReference.column} = NULL
+        WHERE organization_id = $1 AND id = $2
+      `, [seeded.organizationId, executionLine.rows[0]!.id]);
+    }
+    await database.pool.query(`
+      UPDATE receipt_lines
+      SET cashbox_id = $1, method_category = 'CASH',
+          creates_funds_in_transit = false
+      WHERE organization_id = $2 AND id = $3
+    `, [seeded.cashboxId, seeded.organizationId, executionLine.rows[0]!.id]);
+    await database.pool.query(
+      'DELETE FROM access_grant_bank_account_scopes WHERE access_grant_id = $1',
+      [executorGrantId],
+    );
+    const snapshotId = randomUUID();
+    await database.pool.query(`
+      INSERT INTO receipt_approval_snapshots (
+        id, organization_id, receipt_document_id, document_version,
+        amount_basis, base_currency, evaluated_at
+      ) VALUES ($1,$2,$3,1,1000,$4,now())
+    `, [snapshotId, seeded.organizationId, draft.id, seeded.baseCurrency]);
+    await database.pool.query(`
+      UPDATE receipt_documents
+      SET current_approval_snapshot_id = $1, state = 'APPROVED',
+          workflow_state = 'APPROVED', version = 1
+      WHERE organization_id = $2 AND id = $3
+    `, [snapshotId, seeded.organizationId, draft.id]);
+
+    const command = {
+      organizationId: seeded.organizationId,
+      actorUserId: executorId,
+      physicalSessionId: randomUUID(),
+      receiptId: draft.id,
+      ifMatch: '"1"',
+      requestId: `execute-request-${suffix}`,
+    };
+    const partialKey = `execute-partial-${suffix}`;
+    await database.pool.query(`
+      INSERT INTO idempotency_records (
+        organization_id, scope, idempotency_key, request_digest,
+        response_status, response_body
+      ) VALUES ($1,$2,$3,$4,200,$5)
+    `, [
+      seeded.organizationId,
+      `executeReceipt:${executorId}:${draft.id}`,
+      partialKey,
+      commandDigest('executeReceipt', {
+        actorUserId: executorId,
+        receiptId: draft.id,
+        ifMatch: command.ifMatch,
+        body: null,
+      }),
+      { receiptId: draft.id, version: 2 },
+    ]);
+    await assert.rejects(
+      execution.execute({ ...command, key: partialKey }),
+      isProblemCode('TRS-GEN-007'),
+    );
+    await database.pool.query(`
+      DELETE FROM idempotency_records
+      WHERE organization_id = $1 AND scope = $2 AND idempotency_key = $3
+    `, [
+      seeded.organizationId,
+      `executeReceipt:${executorId}:${draft.id}`,
+      partialKey,
+    ]);
+    await database.pool.query(`
+      UPDATE access_grants
+      SET amount_ceiling = 999, amount_ceiling_currency = $2
+      WHERE id = $1
+    `, [executorGrantId, seeded.baseCurrency]);
+    await assert.rejects(
+      execution.execute({ ...command, key: `execute-ceiling-${suffix}` }),
+      isProblemCode('TRS-GEN-003'),
+    );
+    await database.pool.query(`
+      UPDATE access_grants
+      SET amount_ceiling = NULL, amount_ceiling_currency = NULL
+      WHERE id = $1
+    `, [executorGrantId]);
+    await assert.rejects(
+      execution.execute({
+        ...command,
+        actorUserId: seeded.actorId,
+        key: `execute-denied-${suffix}`,
+      }),
+      isProblemCode('TRS-GEN-003'),
+    );
+    await database.pool.query(`
+      INSERT INTO cashbox_days (
+        organization_id, cashbox_id, business_date, close_cycle, state
+      ) VALUES ($1,$2,$3,1,'CLOSED')
+    `, [seeded.organizationId, seeded.cashboxId, receiptBusinessDate]);
+    const rollbackKey = `execute-rollback-${suffix}`;
+    await assert.rejects(
+      execution.execute({ ...command, key: rollbackKey }),
+      isProblemCode('TRS-GEN-009'),
+    );
+    const rolledBack = await database.pool.query<{ count: string }>(`
+      SELECT (
+        (SELECT count(*) FROM receipt_execution_effects e
+          JOIN receipt_lines l ON l.id = e.receipt_line_id
+          WHERE l.receipt_document_id = $1)
+        + (SELECT count(*) FROM movement_facts WHERE source_id = $1)
+        + (SELECT count(*) FROM idempotency_records
+          WHERE organization_id = $2
+            AND scope = $3
+            AND idempotency_key = $4)
+      )::text AS count
+    `, [
+      draft.id,
+      seeded.organizationId,
+      `executeReceipt:${executorId}:${draft.id}`,
+      rollbackKey,
+    ]);
+    assert.equal(rolledBack.rows[0]!.count, '0');
+    await database.pool.query(`
+      UPDATE cashbox_days
+      SET state = 'OPEN', version = version + 1
+      WHERE organization_id = $1 AND cashbox_id = $2 AND business_date = $3
+    `, [seeded.organizationId, seeded.cashboxId, receiptBusinessDate]);
+
+    const competing = [
+      { ...command, key: `execute-a-${suffix}` },
+      { ...command, key: `execute-b-${suffix}` },
+    ];
+    const race = await Promise.allSettled(
+      competing.map((candidate) => execution.execute(candidate)),
+    );
+    const winners = race.flatMap((result, index) =>
+      result.status === 'fulfilled'
+        ? [{ index, receipt: result.value }]
+        : []);
+    const failures = race.filter(
+      (result): result is PromiseRejectedResult => result.status === 'rejected',
+    );
+    assert.equal(winners.length, 1);
+    assert.equal(failures.length, 1);
+    assert.ok(isProblemCode('TRS-GEN-006')(failures[0]!.reason));
+    const winner = winners[0]!;
+    const executed = winner.receipt;
+    assert.equal(executed.state, 'EXECUTED');
+    assert.equal(executed.version, 2);
+    assert.equal(executed.lines[0]!.executionEffects?.length, 1);
+    assert.equal(
+      executed.lines[0]!.executionEffects?.[0]?.effect?.label,
+      'Cashbox movement',
+    );
+    assert.deepEqual(
+      await receipts.get(seeded.organizationId, executorId, draft.id),
+      executed,
+    );
+    assert.deepEqual(await execution.execute(competing[winner.index]!), executed);
+
+    const incomingEffect = await database.pool.query<{
+      id: string;
+      lineId: string;
+      movementFactId: string;
+      amount: string;
+      currency: string;
+    }>(`
+      SELECT id, receipt_line_id AS "lineId",
+             movement_fact_id AS "movementFactId", amount::text, currency
+      FROM receipt_execution_effects
+      WHERE organization_id = $1 AND receipt_line_id = $2
+        AND direction = 'INCOMING'
+    `, [seeded.organizationId, executionLine.rows[0]!.id]);
+    const evidenceClient = await database.pool.connect();
+    try {
+      await evidenceClient.query('BEGIN');
+      const mismatchedFact = await evidenceClient.query<{ id: string }>(`
+        INSERT INTO movement_facts (
+          organization_id, owner, source_type, source_id, source_line_id,
+          effect_key, endpoint_type, endpoint_id, direction, amount, currency,
+          business_date, state
+        ) VALUES (
+          $1,'Cashbox','Receipt',$2,$3,$4,'CASHBOX',$5,'CREDIT',
+          999,$6,$7,'POSTED'
+        )
+        RETURNING id
+      `, [
+        seeded.organizationId,
+        randomUUID(),
+        executionLine.rows[0]!.id,
+        `incoming-mismatch-${suffix}`,
+        seeded.cashboxId,
+        incomingEffect.rows[0]!.currency,
+        receiptBusinessDate,
+      ]);
+      await assert.rejects(
+        evidenceClient.query(`
+          INSERT INTO receipt_execution_effects (
+            organization_id, receipt_line_id, effect_key, effect_type,
+            direction, amount, currency, business_date, source_version,
+            movement_fact_id
+          ) VALUES (
+            $1,$2,$3,'CASHBOX_MOVEMENT','INCOMING',$4,$5,$6,2,$7
+          )
+        `, [
+          seeded.organizationId,
+          incomingEffect.rows[0]!.lineId,
+          `incoming-mismatch-${suffix}`,
+          incomingEffect.rows[0]!.amount,
+          incomingEffect.rows[0]!.currency,
+          receiptBusinessDate,
+          mismatchedFact.rows[0]!.id,
+        ]),
+        (error: unknown) => (error as { code?: string; constraint?: string }).code === '23514'
+          && (error as { constraint?: string }).constraint
+            === 'receipt_execution_effect_movement_consistency',
+      );
+      await evidenceClient.query('ROLLBACK');
+
+      await evidenceClient.query('BEGIN');
+      const inverseFact = await evidenceClient.query<{ id: string }>(`
+        INSERT INTO movement_facts (
+          organization_id, owner, source_type, source_id, source_line_id,
+          effect_key, endpoint_type, endpoint_id, direction, amount, currency,
+          business_date, reversal_of_fact_id, state
+        ) VALUES (
+          $1,'BankAccount','Receipt',$2,$3,$4,'BANK_ACCOUNT',$5,'DEBIT',
+          $6,$7,$8,$9,'POSTED'
+        )
+        RETURNING id
+      `, [
+        seeded.organizationId,
+        randomUUID(),
+        executionLine.rows[0]!.id,
+        `mixed-evidence-${suffix}`,
+        seeded.bankAccountId,
+        incomingEffect.rows[0]!.amount,
+        incomingEffect.rows[0]!.currency,
+        receiptBusinessDate,
+        incomingEffect.rows[0]!.movementFactId,
+      ]);
+      await assert.rejects(
+        evidenceClient.query(`
+          INSERT INTO receipt_execution_effects (
+            organization_id, receipt_line_id, effect_key, effect_type,
+            direction, amount, currency, business_date, source_version,
+            movement_fact_id, reversal_of_effect_id
+          ) VALUES (
+            $1,$2,$3,'BANK_MOVEMENT','REVERSAL',$4,$5,$6,3,$7,$8
+          )
+        `, [
+          seeded.organizationId,
+          incomingEffect.rows[0]!.lineId,
+          `mixed-evidence-${suffix}`,
+          incomingEffect.rows[0]!.amount,
+          incomingEffect.rows[0]!.currency,
+          receiptBusinessDate,
+          inverseFact.rows[0]!.id,
+          incomingEffect.rows[0]!.id,
+        ]),
+        (error: unknown) => (error as { code?: string; constraint?: string }).code === '23514'
+          && (error as { constraint?: string }).constraint
+            === 'receipt_execution_effect_reversal_target_consistency',
+      );
+      await evidenceClient.query('ROLLBACK');
+
+      await evidenceClient.query('BEGIN');
+      const receivedChequeId = randomUUID();
+      const incomingChequeEffectId = randomUUID();
+      const invalidChequeEventId = randomUUID();
+      await evidenceClient.query(`
+        INSERT INTO received_cheques (
+          id, organization_id, receipt_line_id, issuer_bank_id,
+          cheque_number, amount, currency, receipt_date, due_date,
+          custodian_type, custodian_id, state
+        ) VALUES (
+          $1,$2,$3,$4,$5,$6,$7,$8,$8,'CASHBOX',$9,'RECEIVED'
+        )
+      `, [
+        receivedChequeId,
+        seeded.organizationId,
+        incomingEffect.rows[0]!.lineId,
+        seeded.bankId,
+        `STATE-${suffix}`,
+        incomingEffect.rows[0]!.amount,
+        incomingEffect.rows[0]!.currency,
+        receiptBusinessDate,
+        seeded.cashboxId,
+      ]);
+      await evidenceClient.query(`
+        INSERT INTO receipt_execution_effects (
+          id, organization_id, receipt_line_id, effect_key, effect_type,
+          direction, amount, currency, business_date, source_version,
+          received_cheque_id
+        ) VALUES (
+          $1,$2,$3,$4,'RECEIVED_CHEQUE','INCOMING',$5,$6,$7,2,$8
+        )
+      `, [
+        incomingChequeEffectId,
+        seeded.organizationId,
+        incomingEffect.rows[0]!.lineId,
+        `cheque-incoming-${suffix}`,
+        incomingEffect.rows[0]!.amount,
+        incomingEffect.rows[0]!.currency,
+        receiptBusinessDate,
+        receivedChequeId,
+      ]);
+      await evidenceClient.query(`
+        INSERT INTO cheque_events (
+          id, cheque_type, cheque_id, sequence_no, from_state, to_state,
+          actor_user_id, occurred_at, idempotency_key
+        ) VALUES (
+          $1,'RECEIVED',$2,1,'RECEIVED','IN_CUSTODY',$3,now(),$4
+        )
+      `, [
+        invalidChequeEventId,
+        receivedChequeId,
+        seeded.actorId,
+        `invalid-state-${suffix}`,
+      ]);
+      await assert.rejects(
+        evidenceClient.query(`
+          INSERT INTO receipt_execution_effects (
+            organization_id, receipt_line_id, effect_key, effect_type,
+            direction, amount, currency, business_date, source_version,
+            cheque_event_id, reversal_of_effect_id
+          ) VALUES (
+            $1,$2,$3,'RECEIVED_CHEQUE','REVERSAL',$4,$5,$6,3,$7,$8
+          )
+        `, [
+          seeded.organizationId,
+          incomingEffect.rows[0]!.lineId,
+          `cheque-reversal-${suffix}`,
+          incomingEffect.rows[0]!.amount,
+          incomingEffect.rows[0]!.currency,
+          receiptBusinessDate,
+          invalidChequeEventId,
+          incomingChequeEffectId,
+        ]),
+        (error: unknown) => (error as { code?: string; constraint?: string }).code === '23514'
+          && (error as { constraint?: string }).constraint
+            === 'receipt_execution_effect_cheque_event_consistency',
+      );
+    } finally {
+      await evidenceClient.query('ROLLBACK');
+      evidenceClient.release();
+    }
+
+    const counts = await database.pool.query<{
+      effects: string;
+      facts: string;
+      audits: string;
+      events: string;
+    }>(`
+      SELECT
+        (SELECT count(*) FROM receipt_execution_effects e
+          JOIN receipt_lines l ON l.id = e.receipt_line_id
+          WHERE l.receipt_document_id = $1)::text AS effects,
+        (SELECT count(*) FROM movement_facts WHERE source_id = $1)::text AS facts,
+        (SELECT count(*) FROM audit_events WHERE entity_id = $1)::text AS audits,
+        (SELECT count(*) FROM outbox_events WHERE aggregate_id = $1)::text AS events
+    `, [draft.id]);
+    assert.deepEqual(counts.rows[0], {
+      effects: '1',
+      facts: '1',
+      audits: '1',
+      events: '1',
+    });
+
+    const reverseBody = {
+      reason: 'Correction required',
+      businessDate: receiptBusinessDate,
+    };
+    const reverseKey = `reverse-key-${suffix}`;
+    const reversePath = `/v1/receipts/${draft.id}/reverse`;
+    const reverseStep = await receiptStep(
+      database,
+      reverserAccountId,
+      reverserSessionId,
+      'reverseReceipt',
+      reversePath,
+      reverseBody,
+      reverseKey,
+    );
+    const reverseCommand = {
+      organizationId: seeded.organizationId,
+      actorUserId: reverserId,
+      physicalSessionId: reverserSessionId,
+      receiptId: draft.id,
+      key: reverseKey,
+      ifMatch: '"2"',
+      requestId: `reverse-request-${suffix}`,
+      stepUp: reverseStep,
+    };
+    await database.pool.query(`
+      UPDATE cashbox_days
+      SET state = 'CLOSED', version = version + 1
+      WHERE organization_id = $1 AND cashbox_id = $2 AND business_date = $3
+    `, [seeded.organizationId, seeded.cashboxId, receiptBusinessDate]);
+    await assert.rejects(
+      execution.reverse(reverseCommand, reverseBody),
+      isProblemCode('TRS-GEN-009'),
+    );
+    await database.pool.query(`
+      UPDATE cashbox_days
+      SET state = 'OPEN', version = version + 1
+      WHERE organization_id = $1 AND cashbox_id = $2 AND business_date = $3
+    `, [seeded.organizationId, seeded.cashboxId, receiptBusinessDate]);
+    const reversed = await execution.reverse(reverseCommand, reverseBody);
+    reversalReceiptId = reversed.reversalReceipt.id;
+    assert.equal(reversed.originalReceipt.state, 'REVERSED');
+    assert.equal(reversed.originalReceipt.version, 3);
+    assert.equal(reversed.reversalReceipt.state, 'EXECUTED');
+    assert.equal(reversed.reversalReceipt.version, 1);
+    assert.equal(reversed.reversalReceipt.lines[0]!.executionEffects?.length, 1);
+    assert.deepEqual(
+      await execution.reverse(reverseCommand, reverseBody),
+      reversed,
+    );
+    assert.deepEqual(
+      await execution.execute(competing[winner.index]!),
+      executed,
+    );
+    const storedExecuteResponse = await database.pool.query<{
+      etag: string | null;
+    }>(`
+      SELECT response_body ->> 'etag' AS etag
+      FROM idempotency_records
+      WHERE organization_id = $1
+        AND scope = $2
+        AND idempotency_key = $3
+    `, [
+      seeded.organizationId,
+      `executeReceipt:${executorId}:${draft.id}`,
+      competing[winner.index]!.key,
+    ]);
+    assert.equal(storedExecuteResponse.rows[0]!.etag, '"2"');
+    const consumedProof = await database.pool.query<{ consumedAt: Date | null }>(`
+      SELECT consumed_at AS "consumedAt"
+      FROM auth_step_up_proofs
+      WHERE token_digest = $1
+    `, [digest(reverseStep.proofId)]);
+    assert.ok(consumedProof.rows[0]!.consumedAt);
+  } finally {
+    const grantCleanupClient = await database.pool.connect();
+    try {
+      await grantCleanupClient.query('BEGIN');
+      await grantCleanupClient.query(
+        'DELETE FROM access_grant_treasury_unit_scopes WHERE access_grant_id = $1',
+        [executorGrantId],
+      );
+      await grantCleanupClient.query(
+        'DELETE FROM access_grant_bank_account_scopes WHERE access_grant_id = $1',
+        [executorGrantId],
+      );
+      await grantCleanupClient.query(
+        'DELETE FROM access_grants WHERE id = $1',
+        [executorGrantId],
+      );
+      await grantCleanupClient.query('COMMIT');
+    } catch (error) {
+      await grantCleanupClient.query('ROLLBACK');
+      throw error;
+    } finally {
+      grantCleanupClient.release();
+    }
+    await database.pool.query('DELETE FROM role_permissions WHERE role_id = $1', [executorRoleId]);
+    await database.pool.query('DELETE FROM roles WHERE id = $1', [executorRoleId]);
+    await database.pool.query('DELETE FROM access_grants WHERE id = $1', [reverserGrantId]);
+    await database.pool.query('DELETE FROM role_permissions WHERE role_id = $1', [reverserRoleId]);
+    await database.pool.query('DELETE FROM roles WHERE id = $1', [reverserRoleId]);
+    if (reversalReceiptId) {
+      await cleanupReceiptReversal(database, seeded.organizationId, reversalReceiptId);
+    }
+    await cleanupReceiptFoundation(database, seeded);
+    await database.pool.query('DELETE FROM pos_terminals WHERE id = $1', [derivedPosTerminalId]);
+    await database.pool.query('DELETE FROM payment_gateways WHERE id = $1', [derivedGatewayId]);
+    await database.pool.query('DELETE FROM bank_accounts WHERE id = $1', [unscopedBankAccountId]);
+    await database.pool.query('DELETE FROM user_refs WHERE id = $1', [executorId]);
+    await database.pool.query(`
+      DELETE FROM auth_step_up_proofs
+      WHERE challenge_id IN (
+        SELECT id FROM auth_challenges WHERE identity_account_id = $1
+      )
+    `, [reverserAccountId]);
+    await database.pool.query(
+      'DELETE FROM auth_challenges WHERE identity_account_id = $1',
+      [reverserAccountId],
+    );
+    await database.pool.query('DELETE FROM auth_sessions WHERE id = $1', [reverserSessionId]);
+    await database.pool.query('DELETE FROM identity_accounts WHERE id = $1', [reverserAccountId]);
+    await database.pool.query('DELETE FROM user_refs WHERE id = $1', [reverserId]);
+    await database.onModuleDestroy();
+  }
+});
+
+async function receiptStep(
+  database: DatabaseService,
+  accountId: string,
+  sessionId: string,
+  operationId: string,
+  path: string,
+  body: unknown,
+  idempotencyKey: string,
+) {
+  const proofId = randomUUID();
+  const bodyDigest = commandDigest(operationId, body);
+  const challenge = await database.pool.query<{ id: string }>(`
+    INSERT INTO auth_challenges (
+      identity_account_id, session_id, token_digest, kind, http_method,
+      http_path, request_body_digest, idempotency_key, expires_at
+    ) VALUES ($1,$2,$3,'STEP_UP','POST',$4,$5,$6,now() + interval '5 minutes')
+    RETURNING id
+  `, [
+    accountId,
+    sessionId,
+    digest(`challenge:${proofId}`),
+    path,
+    bodyDigest,
+    idempotencyKey,
+  ]);
+  await database.pool.query(`
+    INSERT INTO auth_step_up_proofs (challenge_id, token_digest, expires_at)
+    VALUES ($1,$2,now() + interval '5 minutes')
+  `, [challenge.rows[0]!.id, digest(proofId)]);
+  return {
+    proofId,
+    command: {
+      operationId,
+      method: 'POST',
+      path,
+      bodyDigest,
+      idempotencyKey,
+    },
+  };
+}
+
+async function cleanupReceiptReversal(
+  database: DatabaseService,
+  organizationId: string,
+  reversalReceiptId: string,
+): Promise<void> {
+  const client = await database.pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query(`SET LOCAL session_replication_role = replica`);
+    await client.query('SET CONSTRAINTS ALL DEFERRED');
+    await client.query(`
+      UPDATE receipt_documents
+      SET state = 'EXECUTED',
+          execution_state = 'EXECUTED',
+          reversal_receipt_id = NULL
+      WHERE organization_id = $1 AND reversal_receipt_id = $2
+    `, [organizationId, reversalReceiptId]);
+    await client.query(`
+      DELETE FROM receipt_execution_effects effects
+      USING receipt_lines lines
+      WHERE effects.organization_id = $1
+        AND effects.receipt_line_id = lines.id
+        AND lines.organization_id = $1
+        AND lines.receipt_document_id = $2
+    `, [organizationId, reversalReceiptId]);
+    await client.query(`
+      DELETE FROM movement_facts
+      WHERE organization_id = $1 AND source_id = $2
+    `, [organizationId, reversalReceiptId]);
+    await client.query(`
+      DELETE FROM receipt_lines
+      WHERE organization_id = $1 AND receipt_document_id = $2
+    `, [organizationId, reversalReceiptId]);
+    await client.query(`
+      DELETE FROM receipt_documents
+      WHERE organization_id = $1 AND id = $2
+    `, [organizationId, reversalReceiptId]);
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
 async function seedReceiptFoundation(database: DatabaseService) {
   const existingOrganization = await database.pool.query<{
     id: string;
@@ -1150,7 +1968,15 @@ async function cleanupReceiptFoundation(
     await client.query('SET CONSTRAINTS ALL DEFERRED');
     await client.query(`
       UPDATE receipt_documents
-      SET state = 'DRAFT', workflow_state = 'DRAFT', current_approval_snapshot_id = NULL
+      SET state = 'DRAFT',
+          workflow_state = 'DRAFT',
+          execution_state = 'NOT_EXECUTED',
+          accounting_state = 'NOT_READY',
+          current_approval_snapshot_id = NULL,
+          executed_at = NULL,
+          executed_by_user_id = NULL,
+          reversal_receipt_id = NULL,
+          reverses_receipt_id = NULL
       WHERE organization_id = $1 AND creator_user_id = $2
     `, [seeded.organizationId, seeded.actorId]);
     await client.query(`
@@ -1196,6 +2022,64 @@ async function cleanupReceiptFoundation(
         AND documents.creator_user_id = $2
     `, [seeded.organizationId, seeded.actorId]);
     await client.query(`
+      DELETE FROM receipt_execution_effects effects
+      USING receipt_lines lines, receipt_documents documents
+      WHERE effects.organization_id = $1
+        AND effects.receipt_line_id = lines.id
+        AND lines.organization_id = $1
+        AND lines.receipt_document_id = documents.id
+        AND documents.organization_id = $1
+        AND documents.creator_user_id = $2
+    `, [seeded.organizationId, seeded.actorId]);
+    await client.query(`
+      DELETE FROM movement_facts facts
+      USING receipt_documents documents
+      WHERE facts.organization_id = $1
+        AND facts.source_type = 'Receipt'
+        AND facts.source_id = documents.id
+        AND documents.organization_id = $1
+        AND documents.creator_user_id = $2
+    `, [seeded.organizationId, seeded.actorId]);
+    await client.query(`
+      DELETE FROM received_cheques cheques
+      USING receipt_lines lines, receipt_documents documents
+      WHERE cheques.organization_id = $1
+        AND cheques.receipt_line_id = lines.id
+        AND lines.organization_id = $1
+        AND lines.receipt_document_id = documents.id
+        AND documents.organization_id = $1
+        AND documents.creator_user_id = $2
+    `, [seeded.organizationId, seeded.actorId]);
+    await client.query(`
+      DELETE FROM collection_items items
+      USING receipt_lines lines, receipt_documents documents
+      WHERE items.organization_id = $1
+        AND items.source_fact_type = 'ReceiptLine'
+        AND items.source_fact_id = lines.id
+        AND lines.organization_id = $1
+        AND lines.receipt_document_id = documents.id
+        AND documents.organization_id = $1
+        AND documents.creator_user_id = $2
+    `, [seeded.organizationId, seeded.actorId]);
+    await client.query(`
+      DELETE FROM audit_events events
+      USING receipt_documents documents
+      WHERE events.organization_id = $1
+        AND events.entity_type = 'Receipt'
+        AND events.entity_id = documents.id
+        AND documents.organization_id = $1
+        AND documents.creator_user_id = $2
+    `, [seeded.organizationId, seeded.actorId]);
+    await client.query(`
+      DELETE FROM outbox_events events
+      USING receipt_documents documents
+      WHERE events.organization_id = $1
+        AND events.aggregate_type = 'Receipt'
+        AND events.aggregate_id = documents.id
+        AND documents.organization_id = $1
+        AND documents.creator_user_id = $2
+    `, [seeded.organizationId, seeded.actorId]);
+    await client.query(`
       DELETE FROM receipt_allocations allocations
       USING receipt_lines lines, receipt_documents documents
       WHERE allocations.organization_id = $1
@@ -1214,10 +2098,6 @@ async function cleanupReceiptFoundation(
         AND documents.creator_user_id = $2
     `, [seeded.organizationId, seeded.actorId]);
     await client.query(`
-      DELETE FROM receipt_documents
-      WHERE organization_id = $1 AND creator_user_id = $2
-    `, [seeded.organizationId, seeded.actorId]);
-    await client.query(`
       DELETE FROM idempotency_records
       WHERE organization_id = $1
         AND (
@@ -1225,6 +2105,16 @@ async function cleanupReceiptFoundation(
           OR scope LIKE $3
           OR scope LIKE $4
           OR scope LIKE $5
+          OR (
+            (
+              scope LIKE 'executeReceipt:%'
+              OR scope LIKE 'reverseReceipt:%'
+            )
+            AND split_part(scope, ':', 3) IN (
+              SELECT id::text FROM receipt_documents
+              WHERE organization_id = $1 AND creator_user_id = $6
+            )
+          )
         )
     `, [
       seeded.organizationId,
@@ -1232,7 +2122,12 @@ async function cleanupReceiptFoundation(
       `replaceReceiptDraft:${seeded.actorId}:%`,
       `submitReceipt:${seeded.actorId}:%`,
       `actOnReceiptApproval:${seeded.actorId}:%`,
+      seeded.actorId,
     ]);
+    await client.query(`
+      DELETE FROM receipt_documents
+      WHERE organization_id = $1 AND creator_user_id = $2
+    `, [seeded.organizationId, seeded.actorId]);
     await client.query(`
       DELETE FROM exchange_rates WHERE recorded_by = $1 OR approved_by = $1
     `, [seeded.actorId]);
@@ -1264,6 +2159,10 @@ async function cleanupReceiptFoundation(
     );
     await client.query(
       'DELETE FROM cashbox_currency_controls WHERE organization_id = $1 AND cashbox_id = $2',
+      [seeded.organizationId, seeded.cashboxId],
+    );
+    await client.query(
+      'DELETE FROM cashbox_days WHERE organization_id = $1 AND cashbox_id = $2',
       [seeded.organizationId, seeded.cashboxId],
     );
     await client.query(

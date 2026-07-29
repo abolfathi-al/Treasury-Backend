@@ -1101,9 +1101,8 @@ export class AuthRepository implements OnModuleInit, OnModuleDestroy {
               SELECT 1
               FROM idempotency_records i
               WHERE i.organization_id = $7
-                AND i.scope = $8
+                AND (i.scope = $8 OR i.scope LIKE $8 || ':%')
                 AND i.idempotency_key = $6
-                AND i.request_digest = $5
                 AND i.response_body IS NOT NULL
             )
           )
