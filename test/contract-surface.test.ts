@@ -580,4 +580,7 @@ test('operator bootstrap is local-only, advisory-locked, and transactional', asy
   assert.match(bootstrap, /const secondCounter = await requireTotp/u);
   assert.match(bootstrap, /totp_last_counter/u);
   assert.match(bootstrap, /'cashbox\.handover'/u);
+  assert.match(bootstrap, /for \(const character of chunk\)/u);
+  assert.match(bootstrap, /reject\(new Error\('Bootstrap cancelled\.'\)\);\s+return;/u);
+  assert.match(bootstrap, /resolve\(value\);\s+return;/u);
 });

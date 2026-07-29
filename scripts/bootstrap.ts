@@ -51,7 +51,9 @@ async function bootstrap(): Promise<void> {
   const passwordConfirmation = await readSecret('Confirm administrator password: ');
   if (password !== passwordConfirmation.normalize('NFC')) throw new Error('Passwords do not match.');
 
-  const encryptionKeyEncoded = await readSecret('TOTP encryption key (32 bytes, base64): ');
+  const encryptionKeyEncoded = process.env.RECEIPT_QA_IN_MEMORY_TOTP_KEY === '1'
+    ? process.env.TOTP_ENCRYPTION_KEY_BASE64 ?? ''
+    : await readSecret('TOTP encryption key (32 bytes, base64): ');
   const encryptionKey = Buffer.from(encryptionKeyEncoded, 'base64');
   if (encryptionKey.length !== 32) throw new Error('TOTP encryption key must decode to exactly 32 bytes.');
 
@@ -237,18 +239,19 @@ async function readSecret(label: string): Promise<string> {
   process.stdin.setEncoding('utf8');
   return new Promise((resolve, reject) => {
     let value = '';
-    const onData = (character: string) => {
-      if (character === '\u0003') {
+    const onData = (chunk: string) => {
+      const result = consumeSecretChunk(value, chunk);
+      value = result.value;
+      if (result.outcome === 'cancel') {
         cleanup();
         reject(new Error('Bootstrap cancelled.'));
-      } else if (character === '\r' || character === '\n') {
+        return;
+      }
+      if (result.outcome === 'submit') {
         cleanup();
         process.stdout.write('\n');
         resolve(value);
-      } else if (character === '\u007f') {
-        value = value.slice(0, -1);
-      } else if (character >= ' ') {
-        value += character;
+        return;
       }
     };
     const cleanup = () => {
@@ -258,6 +261,21 @@ async function readSecret(label: string): Promise<string> {
     };
     process.stdin.on('data', onData);
   });
+}
+
+export function consumeSecretChunk(
+  value: string,
+  chunk: string,
+): { value: string; outcome: 'continue' | 'submit' | 'cancel' } {
+  for (const character of chunk) {
+    if (character === '\u0003') return { value, outcome: 'cancel' };
+    if (character === '\r' || character === '\n') {
+      return { value, outcome: 'submit' };
+    }
+    if (character === '\u007f') value = value.slice(0, -1);
+    else if (character >= ' ') value += character;
+  }
+  return { value, outcome: 'continue' };
 }
 
 async function requireTotp(
@@ -281,7 +299,9 @@ function required(value: string): string {
   return normalized;
 }
 
-void bootstrap().catch((error: unknown) => {
-  console.error(error instanceof Error ? error.message : error);
-  process.exitCode = 1;
-});
+if (require.main === module) {
+  void bootstrap().catch((error: unknown) => {
+    console.error(error instanceof Error ? error.message : error);
+    process.exitCode = 1;
+  });
+}

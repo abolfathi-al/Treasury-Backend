@@ -1,12 +1,33 @@
 import { Inject, Injectable } from '@nestjs/common';
+import { and, eq } from 'drizzle-orm';
 import type { PoolClient } from 'pg';
 
-import { DatabaseService } from '../database/database.service';
+import {
+  DatabaseService,
+  type DatabaseTransaction,
+} from '../database/database.service';
+import { userRefs } from '../database/schema';
 import { IdentityAccountCreateDto, UserRefCreateDto } from './identity.dto';
 
 @Injectable()
 export class IdentityRepository {
   constructor(@Inject(DatabaseService) private readonly database: DatabaseService) {}
+
+  async findUserRefState(
+    transaction: DatabaseTransaction,
+    organizationId: string,
+    userId: string,
+  ): Promise<{ state: string } | undefined> {
+    const rows = await transaction
+      .select({ state: userRefs.state })
+      .from(userRefs)
+      .where(and(
+        eq(userRefs.organizationId, organizationId),
+        eq(userRefs.id, userId),
+      ))
+      .for('share');
+    return rows[0];
+  }
 
   async listUserRefs(organizationId: string, limit: number, cursor?: string) {
     const result = await this.database.pool.query(`
