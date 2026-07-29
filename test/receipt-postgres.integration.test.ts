@@ -5,9 +5,12 @@ import test from 'node:test';
 import { DatabaseService } from '../src/database/database.service';
 import { MethodBehaviorCategory, MethodReference } from '../src/master-data/master-data.dto';
 import {
+  ReceiptApprovalAction,
   ReceiptAllocationObjectType,
   ReceiptRemainderTreatment,
 } from '../src/receipts/receipt.dto';
+import { ReceiptApprovalRepository } from '../src/receipts/receipt-approval.repository';
+import { ReceiptApprovalService } from '../src/receipts/receipt-approval.service';
 import { ReceiptRepository } from '../src/receipts/receipt.repository';
 import { ReceiptService } from '../src/receipts/receipt.service';
 import { TreasuryProblem } from '../src/common/problem';
@@ -22,7 +25,12 @@ test('Receipt draft create/read/replace is semantic, idempotent, versioned, and 
   process.env.COMMAND_DIGEST_HMAC_KEY_BASE64 = Buffer.alloc(32, 22).toString('base64');
   const database = new DatabaseService();
   const seeded = await seedReceiptFoundation(database);
-  const service = new ReceiptService(new ReceiptRepository(database));
+    const service = new ReceiptService(new ReceiptRepository(database));
+    const approvalService = new ReceiptApprovalService(
+      database,
+      new ReceiptApprovalRepository(),
+      new ReceiptRepository(database),
+    );
   try {
     const draft = {
       businessDate: receiptBusinessDate,
@@ -356,7 +364,7 @@ test('Receipt draft create/read/replace is semantic, idempotent, versioned, and 
     assert.equal(foreignCreated.lines[0]!.rateSnapshot.rateRecordId, rateIds[0]);
     assert.equal(foreignCreated.lines[0]!.baseAmount.amount, '84000.00000000');
     await database.pool.query(
-      `UPDATE exchange_rates SET state = 'RETIRED' WHERE id = $1`,
+      `UPDATE exchange_rates SET rate = 42000.000000000000000001 WHERE id = $1`,
       [rateIds[0]],
     );
     assert.deepEqual(
@@ -368,6 +376,21 @@ test('Receipt draft create/read/replace is semantic, idempotent, versioned, and 
         'receipt-rate-approved-request',
       ),
       foreignCreated,
+    );
+    await assert.rejects(
+      approvalService.submit(
+        seeded.organizationId,
+        seeded.actorId,
+        foreignCreated.id,
+        'receipt-rate-submit',
+        '"0"',
+        'receipt-rate-submit-request',
+      ),
+      isProblemCode('TRS-MST-003'),
+    );
+    assert.equal(
+      (await service.get(seeded.organizationId, seeded.actorId, foreignCreated.id)).version,
+      0,
     );
 
     const changed = {
@@ -501,6 +524,362 @@ test('Receipt draft create/read/replace is semantic, idempotent, versioned, and 
     } finally {
       client.release();
     }
+
+    await database.pool.query(
+      `DELETE FROM role_permissions WHERE role_id = $1 AND permission = 'receipt.submit'`,
+      [seeded.roleId],
+    );
+    await assert.rejects(
+      approvalService.submit(
+        seeded.organizationId,
+        seeded.actorId,
+        replaced.id,
+        'receipt-submit-denied',
+        '"1"',
+        'receipt-submit-denied-request',
+      ),
+      isProblemCode('TRS-GEN-003'),
+    );
+    await database.pool.query(
+      `INSERT INTO role_permissions (role_id, permission) VALUES ($1,'receipt.submit')`,
+      [seeded.roleId],
+    );
+    await assert.rejects(
+      approvalService.submit(
+        seeded.organizationId,
+        seeded.actorId,
+        replaced.id,
+        'receipt-submit-stale',
+        '"0"',
+        'receipt-submit-stale-request',
+      ),
+      isProblemCode('TRS-GEN-006'),
+    );
+    await database.pool.query(
+      `UPDATE cashboxes SET state = 'SUSPENDED' WHERE id = $1`,
+      [seeded.cashboxId],
+    );
+    await assert.rejects(
+      approvalService.submit(
+        seeded.organizationId,
+        seeded.actorId,
+        replaced.id,
+        'receipt-submit-inactive-destination',
+        '"1"',
+        'receipt-submit-inactive-destination-request',
+      ),
+      isProblemCode('TRS-MST-001'),
+    );
+    await database.pool.query(
+      `UPDATE cashboxes SET state = 'ACTIVE' WHERE id = $1`,
+      [seeded.cashboxId],
+    );
+    await database.pool.query(`
+      UPDATE access_grants
+      SET amount_ceiling = 1, amount_ceiling_currency = $2
+      WHERE id = $1
+    `, [seeded.grantId, seeded.baseCurrency]);
+    await assert.rejects(
+      approvalService.submit(
+        seeded.organizationId,
+        seeded.actorId,
+        replaced.id,
+        'receipt-submit-over-ceiling',
+        '"1"',
+        'receipt-submit-over-ceiling-request',
+      ),
+      isProblemCode('TRS-GEN-003'),
+    );
+    await database.pool.query(`
+      UPDATE access_grants
+      SET amount_ceiling = NULL, amount_ceiling_currency = NULL
+      WHERE id = $1
+    `, [seeded.grantId]);
+    assert.equal(
+      (await service.get(seeded.organizationId, seeded.actorId, replaced.id)).version,
+      1,
+    );
+    const ambiguousPolicyId = randomUUID();
+    await database.pool.query(`
+      INSERT INTO receipt_approval_policies (
+        id, organization_id, code, name, document_type,
+        currency, method_category, version, state
+      ) VALUES ($1,$2,$3,'Ambiguous cash approval','RECEIPT',$4,'CASH',1,'ACTIVE')
+    `, [
+      ambiguousPolicyId,
+      seeded.organizationId,
+      `RCP-AMB-${ambiguousPolicyId.slice(0, 8).toUpperCase()}`,
+      seeded.baseCurrency,
+    ]);
+    await assert.rejects(
+      approvalService.submit(
+        seeded.organizationId,
+        seeded.actorId,
+        replaced.id,
+        'receipt-submit-ambiguous',
+        '"1"',
+        'receipt-submit-ambiguous-request',
+      ),
+      isProblemCode('TRS-RCP-005'),
+    );
+    assert.equal(
+      (await service.get(seeded.organizationId, seeded.actorId, replaced.id)).version,
+      1,
+    );
+    await database.pool.query(
+      'DELETE FROM receipt_approval_policies WHERE id = $1',
+      [ambiguousPolicyId],
+    );
+
+    const submitted = await approvalService.submit(
+      seeded.organizationId,
+      seeded.actorId,
+      replaced.id,
+      'receipt-submit-key',
+      '"1"',
+      'receipt-submit-request',
+    );
+    assert.equal(submitted.state, 'APPROVAL_PENDING');
+    assert.equal(submitted.version, 2);
+    assert.equal(submitted.approvalSnapshot?.documentVersion, 2);
+    assert.equal(submitted.approvalSnapshot?.steps[0]?.state, 'CURRENT');
+    assert.equal(submitted.approvalSnapshot?.steps[1]?.state, 'WAITING');
+    assert.equal(submitted.approvalSnapshot?.policyContexts[0]?.policy.label, 'Cash approval');
+    assert.deepEqual(
+      await approvalService.submit(
+        seeded.organizationId,
+        seeded.actorId,
+        replaced.id,
+        'receipt-submit-key',
+        '"1"',
+        'receipt-submit-replay',
+      ),
+      submitted,
+    );
+    await assert.rejects(
+      approvalService.submit(
+        seeded.organizationId,
+        seeded.actorId,
+        replaced.id,
+        'receipt-submit-key',
+        '"2"',
+        'receipt-submit-conflict',
+      ),
+      isProblemCode('TRS-GEN-007'),
+    );
+    const approvalAttempts = await Promise.allSettled([
+      approvalService.act(
+        seeded.organizationId,
+        seeded.actorId,
+        replaced.id,
+        { action: ReceiptApprovalAction.APPROVE },
+        'receipt-approve-a',
+        '"2"',
+        'receipt-approve-a-request',
+      ),
+      approvalService.act(
+        seeded.organizationId,
+        seeded.actorId,
+        replaced.id,
+        { action: ReceiptApprovalAction.APPROVE },
+        'receipt-approve-b',
+        '"2"',
+        'receipt-approve-b-request',
+      ),
+    ]);
+    assert.equal(
+      approvalAttempts.filter(({ status }) => status === 'fulfilled').length,
+      1,
+      approvalAttempts.map((attempt) => attempt.status === 'rejected'
+        ? String(attempt.reason)
+        : 'fulfilled').join(' | '),
+    );
+    const staleAttempt = approvalAttempts.find(({ status }) => status === 'rejected');
+    assert.ok(staleAttempt?.status === 'rejected');
+    assert.ok(isProblemCode('TRS-GEN-006')(staleAttempt.reason));
+    const afterFirstApproval = await service.get(
+      seeded.organizationId, seeded.actorId, replaced.id,
+    );
+    assert.equal(afterFirstApproval.state, 'APPROVAL_PENDING');
+    assert.equal(afterFirstApproval.version, 3);
+    assert.equal(afterFirstApproval.approvalSnapshot?.steps[0]?.state, 'APPROVED');
+    assert.equal(afterFirstApproval.approvalSnapshot?.steps[1]?.state, 'CURRENT');
+    const approved = await approvalService.act(
+      seeded.organizationId,
+      seeded.actorId,
+      replaced.id,
+      { action: ReceiptApprovalAction.APPROVE },
+      'receipt-approve-second',
+      '"3"',
+      'receipt-approve-second-request',
+    );
+    assert.equal(approved.state, 'APPROVED');
+    assert.equal(approved.version, 4);
+    assert.equal(approved.approvalSnapshot?.documentVersion, 2);
+    assert.equal(approved.approvalSnapshot?.steps[1]?.state, 'APPROVED');
+    assert.equal(approved.approvalSnapshot?.actions[0]?.action, 'APPROVED');
+    await assert.rejects(
+      database.pool.query(
+        `DELETE FROM receipt_approval_actions WHERE id = $1`,
+        [approved.approvalSnapshot!.actions[0]!.id],
+      ),
+      (error: unknown) => (error as { code?: string }).code === '23514',
+    );
+
+    const zeroStepDraft = await service.create(
+      seeded.organizationId,
+      seeded.actorId,
+      {
+        businessDate: receiptBusinessDate,
+        partyId: seeded.partyId,
+        treasuryUnitId: seeded.treasuryUnitId,
+        baseCurrency: seeded.baseCurrency,
+        lines: [{
+          lineNumber: 1,
+          methodId: seeded.anchorlessMethodId,
+          money: { amount: '1000', currency: seeded.baseCurrency },
+          remainderTreatment: ReceiptRemainderTreatment.UNALLOCATED,
+        }],
+      },
+      'receipt-zero-create',
+      'receipt-zero-create-request',
+    );
+    const zeroStepApproved = await approvalService.submit(
+      seeded.organizationId,
+      seeded.actorId,
+      zeroStepDraft.id,
+      'receipt-zero-submit',
+      '"0"',
+      'receipt-zero-submit-request',
+    );
+    assert.equal(zeroStepApproved.state, 'APPROVED');
+    assert.deepEqual(zeroStepApproved.approvalSnapshot?.steps, []);
+    const returned = await approvalService.act(
+      seeded.organizationId,
+      seeded.actorId,
+      zeroStepDraft.id,
+      { action: ReceiptApprovalAction.RETURN, reason: 'Correct the draft.' },
+      'receipt-zero-return',
+      '"1"',
+      'receipt-zero-return-request',
+    );
+    assert.equal(returned.state, 'DRAFT');
+    assert.equal(returned.version, 2);
+    assert.equal(returned.approvalSnapshot, undefined);
+
+    const rejectedDraft = await service.create(
+      seeded.organizationId,
+      seeded.actorId,
+      {
+        businessDate: receiptBusinessDate,
+        partyId: seeded.partyId,
+        treasuryUnitId: seeded.treasuryUnitId,
+        baseCurrency: seeded.baseCurrency,
+        lines: [{
+          lineNumber: 1,
+          methodId: seeded.methodId,
+          money: { amount: '2000', currency: seeded.baseCurrency },
+          cashboxId: seeded.cashboxId,
+          remainderTreatment: ReceiptRemainderTreatment.UNALLOCATED,
+        }],
+      },
+      'receipt-reject-create',
+      'receipt-reject-create-request',
+    );
+    const rejectionPending = await approvalService.submit(
+      seeded.organizationId,
+      seeded.actorId,
+      rejectedDraft.id,
+      'receipt-reject-submit',
+      '"0"',
+      'receipt-reject-submit-request',
+    );
+    const rejectedReceipt = await approvalService.act(
+      seeded.organizationId,
+      seeded.actorId,
+      rejectedDraft.id,
+      { action: ReceiptApprovalAction.REJECT, reason: 'Evidence is insufficient.' },
+      'receipt-reject-action',
+      `"${rejectionPending.version}"`,
+      'receipt-reject-action-request',
+    );
+    assert.equal(rejectedReceipt.state, 'REJECTED');
+    assert.equal(rejectedReceipt.approvalSnapshot?.steps[0]?.state, 'REJECTED');
+    assert.equal(rejectedReceipt.approvalSnapshot?.actions[0]?.reason, 'Evidence is insufficient.');
+
+    const returnedStepDraft = await service.create(
+      seeded.organizationId,
+      seeded.actorId,
+      {
+        businessDate: receiptBusinessDate,
+        partyId: seeded.partyId,
+        treasuryUnitId: seeded.treasuryUnitId,
+        baseCurrency: seeded.baseCurrency,
+        lines: [{
+          lineNumber: 1,
+          methodId: seeded.methodId,
+          money: { amount: '3000', currency: seeded.baseCurrency },
+          cashboxId: seeded.cashboxId,
+          remainderTreatment: ReceiptRemainderTreatment.UNALLOCATED,
+        }],
+      },
+      'receipt-return-create',
+      'receipt-return-create-request',
+    );
+    const returnPending = await approvalService.submit(
+      seeded.organizationId,
+      seeded.actorId,
+      returnedStepDraft.id,
+      'receipt-return-submit',
+      '"0"',
+      'receipt-return-submit-request',
+    );
+    const returnedStep = await approvalService.act(
+      seeded.organizationId,
+      seeded.actorId,
+      returnedStepDraft.id,
+      { action: ReceiptApprovalAction.RETURN, reason: 'Correct the evidence.' },
+      'receipt-return-action',
+      `"${returnPending.version}"`,
+      'receipt-return-action-request',
+    );
+    assert.equal(returnedStep.state, 'DRAFT');
+    assert.equal(returnedStep.approvalSnapshot, undefined);
+
+    const mixedDraft = await service.create(
+      seeded.organizationId,
+      seeded.actorId,
+      {
+        businessDate: receiptBusinessDate,
+        partyId: seeded.partyId,
+        treasuryUnitId: seeded.treasuryUnitId,
+        baseCurrency: seeded.baseCurrency,
+        lines: [{
+          lineNumber: 1,
+          methodId: seeded.methodId,
+          money: { amount: '4000', currency: seeded.baseCurrency },
+          cashboxId: seeded.cashboxId,
+          remainderTreatment: ReceiptRemainderTreatment.UNALLOCATED,
+        }, {
+          lineNumber: 2,
+          methodId: seeded.anchorlessMethodId,
+          money: { amount: '5000', currency: seeded.baseCurrency },
+          remainderTreatment: ReceiptRemainderTreatment.UNALLOCATED,
+        }],
+      },
+      'receipt-mixed-create',
+      'receipt-mixed-create-request',
+    );
+    const mixed = await approvalService.submit(
+      seeded.organizationId,
+      seeded.actorId,
+      mixedDraft.id,
+      'receipt-mixed-submit',
+      '"0"',
+      'receipt-mixed-submit-request',
+    );
+    assert.equal(mixed.approvalSnapshot?.policyContexts.length, 2);
+    assert.equal(mixed.approvalSnapshot?.steps.length, 2);
   } finally {
     await cleanupReceiptFoundation(database, seeded);
     await database.onModuleDestroy();
@@ -538,6 +917,8 @@ async function seedReceiptFoundation(database: DatabaseService) {
   const bankAccountId = randomUUID();
   const roleId = randomUUID();
   const grantId = randomUUID();
+  const cashApprovalPolicyId = randomUUID();
+  const zeroStepPolicyId = randomUUID();
   const foreignCurrency = `X${treasuryUnitId.replaceAll('-', '').slice(0, 7).toUpperCase()}`;
   const suffix = treasuryUnitId.slice(0, 8).toUpperCase();
   const client = await database.pool.connect();
@@ -665,8 +1046,33 @@ async function seedReceiptFoundation(database: DatabaseService) {
       VALUES ($1,$2,$3,'ثبت‌کننده دریافت')
     `, [roleId, organizationId, `RCP-ROLE-${suffix}`]);
     await client.query(`
+      INSERT INTO receipt_approval_policies (
+        id, organization_id, code, name, document_type,
+        currency, method_category, version, state
+      ) VALUES
+        ($1,$2,$3,'Cash approval','RECEIPT',$5,'CASH',1,'ACTIVE'),
+        ($4,$2,$6,'Offset no approval','RECEIPT',$5,'OFFSET',1,'ACTIVE')
+    `, [
+      cashApprovalPolicyId,
+      organizationId,
+      `RCP-CASH-${suffix}`,
+      zeroStepPolicyId,
+      baseCurrency,
+      `RCP-OFFSET-${suffix}`,
+    ]);
+    await client.query(`
+      INSERT INTO receipt_approval_policy_steps (
+        organization_id, policy_id, step_order, role_id,
+        approver_user_id, approvals_required, separation_rules
+      ) VALUES
+        ($1,$2,1,$3,NULL,1,'{}'),
+        ($1,$2,2,NULL,$4,1,'{}')
+    `, [organizationId, cashApprovalPolicyId, roleId, actorId]);
+    await client.query(`
       INSERT INTO role_permissions (role_id, permission)
-      VALUES ($1,'receipt.create'),($1,'receipt.view'),($1,'receipt.edit-draft')
+      VALUES
+        ($1,'receipt.create'),($1,'receipt.view'),($1,'receipt.edit-draft'),
+        ($1,'receipt.submit'),($1,'receipt.approve'),($1,'receipt.reject')
     `, [roleId]);
     await client.query(`
       INSERT INTO access_grants (
@@ -697,6 +1103,8 @@ async function seedReceiptFoundation(database: DatabaseService) {
       baseCurrency,
       roleId,
       grantId,
+      cashApprovalPolicyId,
+      zeroStepPolicyId,
       createdOrganization,
       receiptBusinessDate,
       initialReceiptCounter,
@@ -728,6 +1136,8 @@ async function cleanupReceiptFoundation(
     foreignCurrency: string;
     roleId: string;
     grantId: string;
+    cashApprovalPolicyId: string;
+    zeroStepPolicyId: string;
     createdOrganization: boolean;
     receiptBusinessDate: string;
     initialReceiptCounter: string | null;
@@ -736,7 +1146,45 @@ async function cleanupReceiptFoundation(
   const client = await database.pool.connect();
   try {
     await client.query('BEGIN');
+    await client.query(`SET LOCAL session_replication_role = replica`);
     await client.query('SET CONSTRAINTS ALL DEFERRED');
+    await client.query(`
+      UPDATE receipt_documents
+      SET state = 'DRAFT', workflow_state = 'DRAFT', current_approval_snapshot_id = NULL
+      WHERE organization_id = $1 AND creator_user_id = $2
+    `, [seeded.organizationId, seeded.actorId]);
+    await client.query(`
+      DELETE FROM receipt_approval_actions
+      WHERE organization_id = $1 AND approval_snapshot_id IN (
+        SELECT id FROM receipt_approval_snapshots
+        WHERE organization_id = $1 AND receipt_document_id IN (
+          SELECT id FROM receipt_documents
+          WHERE organization_id = $1 AND creator_user_id = $2
+        )
+      )
+    `, [seeded.organizationId, seeded.actorId]);
+    for (const table of [
+      'receipt_approval_snapshot_steps',
+      'receipt_approval_snapshot_contexts',
+    ]) {
+      await client.query(`
+        DELETE FROM ${table}
+        WHERE organization_id = $1 AND approval_snapshot_id IN (
+          SELECT id FROM receipt_approval_snapshots
+          WHERE organization_id = $1 AND receipt_document_id IN (
+            SELECT id FROM receipt_documents
+            WHERE organization_id = $1 AND creator_user_id = $2
+          )
+        )
+      `, [seeded.organizationId, seeded.actorId]);
+    }
+    await client.query(`
+      DELETE FROM receipt_approval_snapshots
+      WHERE organization_id = $1 AND receipt_document_id IN (
+        SELECT id FROM receipt_documents
+        WHERE organization_id = $1 AND creator_user_id = $2
+      )
+    `, [seeded.organizationId, seeded.actorId]);
     await client.query(`
       DELETE FROM receipt_line_attachment_links links
       USING receipt_lines lines, receipt_documents documents
@@ -775,11 +1223,15 @@ async function cleanupReceiptFoundation(
         AND (
           scope = $2
           OR scope LIKE $3
+          OR scope LIKE $4
+          OR scope LIKE $5
         )
     `, [
       seeded.organizationId,
       `createReceipt:${seeded.actorId}`,
       `replaceReceiptDraft:${seeded.actorId}:%`,
+      `submitReceipt:${seeded.actorId}:%`,
+      `actOnReceiptApproval:${seeded.actorId}:%`,
     ]);
     await client.query(`
       DELETE FROM exchange_rates WHERE recorded_by = $1 OR approved_by = $1
@@ -796,6 +1248,14 @@ async function cleanupReceiptFoundation(
       await client.query(`DELETE FROM ${table} WHERE access_grant_id = $1`, [seeded.grantId]);
     }
     await client.query('DELETE FROM access_grants WHERE id = $1', [seeded.grantId]);
+    await client.query(
+      'DELETE FROM receipt_approval_policy_steps WHERE policy_id = ANY($1::uuid[])',
+      [[seeded.cashApprovalPolicyId, seeded.zeroStepPolicyId]],
+    );
+    await client.query(
+      'DELETE FROM receipt_approval_policies WHERE id = ANY($1::uuid[])',
+      [[seeded.cashApprovalPolicyId, seeded.zeroStepPolicyId]],
+    );
     await client.query('DELETE FROM role_permissions WHERE role_id = $1', [seeded.roleId]);
     await client.query('DELETE FROM roles WHERE id = $1', [seeded.roleId]);
     await client.query(
@@ -960,4 +1420,9 @@ async function cleanupReceiptFoundation(
   } finally {
     client.release();
   }
+}
+
+function isProblemCode(code: string) {
+  return (error: unknown) => error instanceof TreasuryProblem
+    && (error.getResponse() as { code?: string }).code === code;
 }

@@ -102,24 +102,53 @@ test('all authorized operations through INC-1H are present in owner-local contro
   }
 });
 
-test('Receipt draft operations use exact one-grant permissions and expose no later command', () => {
+test('Authorized Receipt operations use exact one-grant permissions and expose no later command', () => {
   for (const [handler, permission, operationId] of [
     [ReceiptController.prototype.list, 'receipt.view', 'listReceipts'],
     [ReceiptController.prototype.create, 'receipt.create', 'createReceipt'],
     [ReceiptController.prototype.get, 'receipt.view', 'getReceipt'],
     [ReceiptController.prototype.replace, 'receipt.edit-draft', 'replaceReceiptDraft'],
+    [ReceiptController.prototype.submit, 'receipt.submit', 'submitReceipt'],
   ] as const) {
     assert.equal(Reflect.getMetadata(REQUIRED_PERMISSION, handler), permission);
     assert.equal(Reflect.getMetadata(AUTHORIZATION_OPERATION, handler), operationId);
     assert.equal(Reflect.getMetadata(PERMISSION_SCOPE_MODE, handler), 'ONE_GRANT_RESOURCE');
     assert.equal(Reflect.getMetadata(STEP_UP_REQUIRED, handler), undefined);
   }
-  for (const withheld of ['submit', 'approve', 'cancel', 'execute', 'reverse']) {
+  assert.equal(
+    Reflect.getMetadata(REQUIRED_PERMISSION, ReceiptController.prototype.actOnApproval),
+    undefined,
+  );
+  for (const withheld of ['cancel', 'execute', 'reverse']) {
     assert.equal(
       Object.prototype.hasOwnProperty.call(ReceiptController.prototype, withheld),
       false,
     );
   }
+});
+
+test('Receipt submission migration persists immutable snapshot facts and exact action constraints', async () => {
+  const migration = await readFile('migrations/0014_receipt_submit_approval.sql', 'utf8');
+  for (const table of [
+    'receipt_approval_policies',
+    'receipt_approval_policy_steps',
+    'receipt_approval_snapshots',
+    'receipt_approval_snapshot_contexts',
+    'receipt_approval_snapshot_steps',
+    'receipt_approval_actions',
+  ]) {
+    assert.match(migration, new RegExp(`CREATE TABLE ${table}`, 'u'));
+  }
+  assert.match(migration, /VALUES \('receipt.reject'\)/u);
+  assert.match(migration, /current_approval_snapshot_id/u);
+  assert.match(migration, /action IN \('APPROVED', 'REJECTED', 'RETURNED'\)/u);
+  assert.match(migration, /receipt_approval_actions_actor_step_key/u);
+  assert.match(migration, /receipt_documents_snapshot_state_check/u);
+  assert.match(migration, /prevent_receipt_approval_fact_updates/u);
+  assert.match(
+    migration,
+    /BEFORE UPDATE OR DELETE ON receipt_approval_actions/u,
+  );
 });
 
 test('Receipt migration enforces tenant identity, immutable children, and locked aggregates', async () => {
