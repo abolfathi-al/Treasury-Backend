@@ -3,12 +3,59 @@ import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
 import { stepUpRequiredForBody } from '../src/access-control/auth.guard';
+import { ReceiptExecutionService } from '../src/receipts/receipt-execution.service';
 
 test('executeReceipt requires step-up only for the governed override envelope', () => {
   assert.equal(stepUpRequiredForBody(undefined, 'separationOverride'), false);
   assert.equal(stepUpRequiredForBody({}, 'separationOverride'), false);
   assert.equal(stepUpRequiredForBody({ separationOverride: {} }, 'separationOverride'), true);
   assert.equal(stepUpRequiredForBody({}, undefined), true);
+});
+
+test('reverseReceipt permits only Canon-safe lifecycle and accounting combinations', () => {
+  const policy = Object.create(ReceiptExecutionService.prototype) as unknown as {
+    isReversalBlocked(document: {
+      state: string;
+      accountingState: string;
+      reversalReceiptId: string | null;
+    }): boolean;
+  };
+  for (const [state, accountingState] of [
+    ['EXECUTED', 'READY'],
+    ['ACCOUNTING_READY', 'READY'],
+    ['ACCOUNTING_POSTED', 'RETURNED'],
+    ['ACCOUNTING_POSTED', 'CORRECTED'],
+  ]) {
+    assert.equal(policy.isReversalBlocked({
+      state,
+      accountingState,
+      reversalReceiptId: null,
+    }), false, `${state} + ${accountingState} must be reversible`);
+  }
+  for (const accountingState of ['QUEUED', 'SENDING', 'SENDING_UNKNOWN', 'ACCEPTED']) {
+    assert.equal(policy.isReversalBlocked({
+      state: 'EXECUTED',
+      accountingState,
+      reversalReceiptId: null,
+    }), true, `${accountingState} must block reversal`);
+  }
+  for (const accountingState of ['NOT_READY', 'MAPPING_REQUIRED', 'READY', 'FAILED']) {
+    assert.equal(policy.isReversalBlocked({
+      state: 'ACCOUNTING_POSTED',
+      accountingState,
+      reversalReceiptId: null,
+    }), true, `ACCOUNTING_POSTED + ${accountingState} must block reversal`);
+  }
+  assert.equal(policy.isReversalBlocked({
+    state: 'APPROVED',
+    accountingState: 'NOT_READY',
+    reversalReceiptId: null,
+  }), true);
+  assert.equal(policy.isReversalBlocked({
+    state: 'EXECUTED',
+    accountingState: 'READY',
+    reversalReceiptId: '00000000-0000-4000-8000-000000000000',
+  }), true);
 });
 
 test('INC-2C migration owns exact effects, linkage, uniqueness and append-only evidence', async () => {

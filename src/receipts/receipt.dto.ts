@@ -356,10 +356,22 @@ export interface ReceiptView {
     | 'APPROVED'
     | 'REJECTED'
     | 'EXECUTED'
+    | 'ACCOUNTING_READY'
+    | 'ACCOUNTING_POSTED'
     | 'REVERSED';
   workflowState: 'DRAFT' | 'SUBMITTED' | 'APPROVAL_PENDING' | 'APPROVED' | 'REJECTED';
   executionState: 'NOT_EXECUTED' | 'EXECUTED' | 'REVERSED';
-  accountingState: 'NOT_READY' | 'READY';
+  accountingState:
+    | 'NOT_READY'
+    | 'MAPPING_REQUIRED'
+    | 'READY'
+    | 'QUEUED'
+    | 'SENDING'
+    | 'SENDING_UNKNOWN'
+    | 'ACCEPTED'
+    | 'FAILED'
+    | 'RETURNED'
+    | 'CORRECTED';
   version: number;
   createdAt: string;
   updatedAt: string;

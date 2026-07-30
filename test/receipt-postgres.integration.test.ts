@@ -1516,6 +1516,90 @@ test('Receipt execution is atomic, actor-idempotent, versioned and race-safe', {
       stepUp: reverseStep,
     };
     await database.pool.query(`
+      UPDATE receipt_documents
+      SET state = 'ACCOUNTING_POSTED', accounting_state = 'ACCEPTED'
+      WHERE organization_id = $1 AND id = $2
+    `, [seeded.organizationId, draft.id]);
+    const reversalSnapshot = async () => (await database.pool.query<{
+      state: string;
+      accountingState: string;
+      version: string;
+      reversalReceiptId: string | null;
+      reversalDocuments: string;
+      reverseIdempotencyRecords: string;
+      reverseAudits: string;
+      reverseEvents: string;
+      proofConsumedAt: string | null;
+    }>(`
+      SELECT
+        document.state,
+        document.accounting_state AS "accountingState",
+        document.version::text AS version,
+        document.reversal_receipt_id::text AS "reversalReceiptId",
+        (
+          SELECT count(*)::text
+          FROM receipt_documents reversal
+          WHERE reversal.organization_id = document.organization_id
+            AND reversal.reverses_receipt_id = document.id
+        ) AS "reversalDocuments",
+        (
+          SELECT count(*)::text
+          FROM idempotency_records record
+          WHERE record.organization_id = document.organization_id
+            AND record.scope = $3
+            AND record.idempotency_key = $4
+        ) AS "reverseIdempotencyRecords",
+        (
+          SELECT count(*)::text
+          FROM audit_events audit
+          WHERE audit.organization_id = document.organization_id
+            AND audit.entity_id = document.id
+            AND audit.action = 'RECEIPT_REVERSED'
+        ) AS "reverseAudits",
+        (
+          SELECT count(*)::text
+          FROM outbox_events event
+          WHERE event.organization_id = document.organization_id
+            AND event.aggregate_id = document.id
+            AND event.event_type = 'treasury.receipt.reversed.v1'
+        ) AS "reverseEvents",
+        (
+          SELECT proof.consumed_at::text
+          FROM auth_step_up_proofs proof
+          WHERE proof.token_digest = $5
+        ) AS "proofConsumedAt"
+      FROM receipt_documents document
+      WHERE document.organization_id = $1 AND document.id = $2
+    `, [
+      seeded.organizationId,
+      draft.id,
+      `reverseReceipt:${reverserId}:${draft.id}`,
+      reverseKey,
+      digest(reverseStep.proofId),
+    ])).rows[0]!;
+    const beforeBlockedReversal = await reversalSnapshot();
+    await assert.rejects(
+      execution.reverse(reverseCommand, reverseBody),
+      isProblemCode('TRS-RCP-006'),
+    );
+    assert.deepEqual(await reversalSnapshot(), beforeBlockedReversal);
+    assert.deepEqual(beforeBlockedReversal, {
+      state: 'ACCOUNTING_POSTED',
+      accountingState: 'ACCEPTED',
+      version: '2',
+      reversalReceiptId: null,
+      reversalDocuments: '0',
+      reverseIdempotencyRecords: '0',
+      reverseAudits: '0',
+      reverseEvents: '0',
+      proofConsumedAt: null,
+    });
+    await database.pool.query(`
+      UPDATE receipt_documents
+      SET state = 'ACCOUNTING_READY', accounting_state = 'READY'
+      WHERE organization_id = $1 AND id = $2
+    `, [seeded.organizationId, draft.id]);
+    await database.pool.query(`
       UPDATE cashbox_days
       SET state = 'CLOSED', version = version + 1
       WHERE organization_id = $1 AND cashbox_id = $2 AND business_date = $3

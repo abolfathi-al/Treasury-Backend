@@ -1459,7 +1459,7 @@ export const receiptDocuments: any = pgTable('receipt_documents', {
     'receipt_documents_state_check',
     sql`${table.state} IN (
       'DRAFT', 'SUBMITTED', 'APPROVAL_PENDING', 'APPROVED', 'REJECTED',
-      'EXECUTED', 'REVERSED'
+      'EXECUTED', 'ACCOUNTING_READY', 'ACCOUNTING_POSTED', 'REVERSED'
     )`,
   ),
   check(
@@ -1491,7 +1491,10 @@ export const receiptDocuments: any = pgTable('receipt_documents', {
   ),
   check(
     'receipt_documents_accounting_state_check',
-    sql`${table.accountingState} IN ('NOT_READY', 'READY')`,
+    sql`${table.accountingState} IN (
+      'NOT_READY', 'MAPPING_REQUIRED', 'READY', 'QUEUED', 'SENDING',
+      'SENDING_UNKNOWN', 'ACCEPTED', 'FAILED', 'RETURNED', 'CORRECTED'
+    )`,
   ),
   index('receipt_documents_list_idx')
     .on(table.organizationId, table.businessDate, table.id),

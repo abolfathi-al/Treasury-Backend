@@ -36,6 +36,18 @@ const TRANSIT = new Set([
   'FOREIGN_REMITTANCE',
 ]);
 const NON_TRANSIT_ONLY = new Set(['CASH', 'CHEQUE', 'OFFSET', 'OTHER_CONTROLLED']);
+const REVERSIBLE_RECEIPT_STATES = new Set([
+  'EXECUTED',
+  'ACCOUNTING_READY',
+  'ACCOUNTING_POSTED',
+]);
+const REVERSAL_BLOCKED_ACCOUNTING_STATES = new Set([
+  'QUEUED',
+  'SENDING',
+  'SENDING_UNKNOWN',
+  'ACCEPTED',
+]);
+const REVERSIBLE_POSTED_ACCOUNTING_STATES = new Set(['RETURNED', 'CORRECTED']);
 
 interface CommandContext {
   organizationId: string;
@@ -234,10 +246,7 @@ export class ReceiptExecutionService {
         context.receiptId,
       );
       if (!original) throw new Error('RESOURCE_HIDDEN');
-      if (
-        original.document.state !== 'EXECUTED'
-        || original.document.reversalReceiptId
-      ) throw new Error('REVERSAL_BLOCKED');
+      if (this.isReversalBlocked(original.document)) throw new Error('REVERSAL_BLOCKED');
       if (Number(original.document.version) !== expectedVersion) throw new Error('STALE_VERSION');
 
       const priorActors = new Set([
@@ -325,6 +334,16 @@ export class ReceiptExecutionService {
       originalReceipt: await this.view(context, result.receiptId),
       reversalReceipt: await this.view(context, result.reversalReceiptId!),
     };
+  }
+
+  private isReversalBlocked(document: LockedReceipt['document']): boolean {
+    if (
+      document.reversalReceiptId
+      || !REVERSIBLE_RECEIPT_STATES.has(document.state)
+      || REVERSAL_BLOCKED_ACCOUNTING_STATES.has(document.accountingState)
+    ) return true;
+    return document.state === 'ACCOUNTING_POSTED'
+      && !REVERSIBLE_POSTED_ACCOUNTING_STATES.has(document.accountingState);
   }
 
   private async executeLine(
