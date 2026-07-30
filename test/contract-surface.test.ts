@@ -18,6 +18,7 @@ import { IdentityController } from '../src/access-control/identity.controller';
 import { BankingController } from '../src/banking/banking.controller';
 import { CashboxController } from '../src/cashbox-and-custody/cashbox.controller';
 import { ChequeController } from '../src/cheques/cheque.controller';
+import { CollectionItemsController } from '../src/collection-and-settlement/collection-items.controller';
 import { MasterDataController } from '../src/master-data/master-data.controller';
 import { PrintTemplateController } from '../src/master-data/print-template.controller';
 import { ReceiptController } from '../src/receipts/receipt.controller';
@@ -68,6 +69,7 @@ const expectedOperations = [
   ['POST', 'v1/pos-terminals'],
   ['GET', 'v1/payment-gateways'],
   ['POST', 'v1/payment-gateways'],
+  ['GET', 'v1/collection-items'],
   ['POST', 'v1/cheque-books'],
   ['POST', 'v1/cheque-books/:chequeBookId/leaves/:leafNumber/transitions'],
   ['GET', 'v1/receipts'],
@@ -90,6 +92,7 @@ test('all authorized operations through INC-1H are present in owner-local contro
     CashboxController,
     BankingController,
     ChequeController,
+    CollectionItemsController,
     ReceiptController,
   ]) {
     const prefix = Reflect.getMetadata(PATH_METADATA, controller) as string;
@@ -104,6 +107,20 @@ test('all authorized operations through INC-1H are present in owner-local contro
   for (const [method, path] of expectedOperations) {
     assert.ok(operations.has(`${method} ${path}`), `${method} ${path}`);
   }
+});
+
+test('Collection Item queue uses the exact one-grant permission contract', () => {
+  const handler = CollectionItemsController.prototype.list;
+  assert.equal(Reflect.getMetadata(REQUIRED_PERMISSION, handler), 'collection.view');
+  assert.equal(
+    Reflect.getMetadata(AUTHORIZATION_OPERATION, handler),
+    'listCollectionItems',
+  );
+  assert.equal(
+    Reflect.getMetadata(PERMISSION_SCOPE_MODE, handler),
+    'ONE_GRANT_RESOURCE',
+  );
+  assert.equal(Reflect.getMetadata(STEP_UP_REQUIRED, handler), undefined);
 });
 
 test('Authorized Receipt operations use exact one-grant permissions and governed step-up', () => {

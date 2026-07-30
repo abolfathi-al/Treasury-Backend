@@ -8,14 +8,17 @@ import { collectionItems } from '../database/schema';
 export interface CollectionItemCommand {
   organizationId: string;
   receiptLineId: string;
+  branchId?: string;
+  treasuryUnitId: string;
   channelType: string;
   channelId?: string;
   providerReference?: string;
+  collectedPartyId: string;
   amount: string;
   currency: string;
   destinationBankAccountId: string;
   collectedAt: Date;
-  expectedSettlementDate?: string;
+  expectedSettlementDate: string;
 }
 
 @Injectable()
@@ -30,9 +33,12 @@ export class CollectionEffectsRepository {
       organizationId: command.organizationId,
       sourceFactType: 'RECEIPT_LINE',
       sourceFactId: command.receiptLineId,
+      branchId: command.branchId,
+      treasuryUnitId: command.treasuryUnitId,
       channelType: command.channelType,
       channelId: command.channelId,
       providerReference: command.providerReference,
+      collectedPartyId: command.collectedPartyId,
       grossAmount: command.amount,
       currency: command.currency,
       allocatedAmount: '0',
