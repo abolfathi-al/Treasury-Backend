@@ -1073,6 +1073,94 @@ test('Receipt execution is atomic, actor-idempotent, versioned and race-safe', {
         access_grant_id, bank_account_id
       ) VALUES ($1,$2)
     `, [executorGrantId, unscopedBankAccountId]);
+    const cancelled = await receipts.create(
+      seeded.organizationId,
+      seeded.actorId,
+      {
+        businessDate: receiptBusinessDate,
+        partyId: seeded.partyId,
+        treasuryUnitId: seeded.treasuryUnitId,
+        baseCurrency: seeded.baseCurrency,
+        lines: [{
+          lineNumber: 1,
+          methodId: seeded.methodId,
+          money: { amount: '1000', currency: seeded.baseCurrency },
+          cashboxId: seeded.cashboxId,
+          remainderTreatment: ReceiptRemainderTreatment.UNALLOCATED,
+        }],
+      },
+      `cancelled-create-${suffix}`,
+      `cancelled-create-request-${suffix}`,
+    );
+    await database.pool.query(`
+      UPDATE receipt_documents
+      SET state = 'CANCELLED', workflow_state = 'CANCELLED', version = 1
+      WHERE organization_id = $1 AND id = $2
+    `, [seeded.organizationId, cancelled.id]);
+    const cancelledWithoutSnapshot = await receipts.get(
+      seeded.organizationId,
+      reverserId,
+      cancelled.id,
+    );
+    assert.equal(cancelledWithoutSnapshot.state, 'CANCELLED');
+    assert.equal(cancelledWithoutSnapshot.workflowState, 'CANCELLED');
+    assert.equal(cancelledWithoutSnapshot.executionState, 'NOT_EXECUTED');
+    assert.equal(cancelledWithoutSnapshot.approvalSnapshot, undefined);
+    const cancelledSnapshotId = randomUUID();
+    await database.pool.query(`
+      INSERT INTO receipt_approval_snapshots (
+        id, organization_id, receipt_document_id, document_version,
+        amount_basis, base_currency, evaluated_at
+      ) VALUES ($1,$2,$3,1,1000,$4,now())
+    `, [
+      cancelledSnapshotId,
+      seeded.organizationId,
+      cancelled.id,
+      seeded.baseCurrency,
+    ]);
+    await database.pool.query(`
+      UPDATE receipt_documents
+      SET current_approval_snapshot_id = $1
+      WHERE organization_id = $2 AND id = $3
+    `, [cancelledSnapshotId, seeded.organizationId, cancelled.id]);
+    const cancelledWithSnapshot = await receipts.get(
+      seeded.organizationId,
+      reverserId,
+      cancelled.id,
+    );
+    assert.equal(cancelledWithSnapshot.approvalSnapshot?.id, cancelledSnapshotId);
+    const cancelledReverseKey = `cancelled-reverse-${suffix}`;
+    await assert.rejects(
+      execution.reverse({
+        organizationId: seeded.organizationId,
+        actorUserId: reverserId,
+        physicalSessionId: reverserSessionId,
+        receiptId: cancelled.id,
+        key: cancelledReverseKey,
+        ifMatch: '"1"',
+        requestId: `cancelled-reverse-request-${suffix}`,
+      }, {
+        reason: 'Cancelled receipts cannot be reversed',
+        businessDate: receiptBusinessDate,
+      }),
+      isProblemCode('TRS-RCP-006'),
+    );
+    assert.deepEqual(
+      await receipts.get(seeded.organizationId, reverserId, cancelled.id),
+      cancelledWithSnapshot,
+    );
+    const cancelledReverseRecords = await database.pool.query<{ count: string }>(`
+      SELECT count(*)::text AS count
+      FROM idempotency_records
+      WHERE organization_id = $1
+        AND scope = $2
+        AND idempotency_key = $3
+    `, [
+      seeded.organizationId,
+      `reverseReceipt:${reverserId}:${cancelled.id}`,
+      cancelledReverseKey,
+    ]);
+    assert.equal(cancelledReverseRecords.rows[0]!.count, '0');
     const draft = await receipts.create(
       seeded.organizationId,
       seeded.actorId,

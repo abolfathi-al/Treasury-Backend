@@ -1459,18 +1459,19 @@ export const receiptDocuments: any = pgTable('receipt_documents', {
     'receipt_documents_state_check',
     sql`${table.state} IN (
       'DRAFT', 'SUBMITTED', 'APPROVAL_PENDING', 'APPROVED', 'REJECTED',
-      'EXECUTED', 'ACCOUNTING_READY', 'ACCOUNTING_POSTED', 'REVERSED'
+      'EXECUTED', 'ACCOUNTING_READY', 'ACCOUNTING_POSTED', 'CANCELLED', 'REVERSED'
     )`,
   ),
   check(
     'receipt_documents_workflow_state_check',
     sql`${table.workflowState} IN (
-      'DRAFT', 'SUBMITTED', 'APPROVAL_PENDING', 'APPROVED', 'REJECTED'
+      'DRAFT', 'SUBMITTED', 'APPROVAL_PENDING', 'APPROVED', 'REJECTED', 'CANCELLED'
     )`,
   ),
   check(
     'receipt_documents_snapshot_state_check',
     sql`(${table.state} = 'DRAFT' AND ${table.currentApprovalSnapshotId} IS NULL)
+      OR (${table.state} = 'CANCELLED' AND ${table.reversesReceiptId} IS NULL)
       OR (
         ${table.state} <> 'DRAFT'
         AND (

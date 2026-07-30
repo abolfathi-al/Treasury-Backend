@@ -358,8 +358,15 @@ export interface ReceiptView {
     | 'EXECUTED'
     | 'ACCOUNTING_READY'
     | 'ACCOUNTING_POSTED'
+    | 'CANCELLED'
     | 'REVERSED';
-  workflowState: 'DRAFT' | 'SUBMITTED' | 'APPROVAL_PENDING' | 'APPROVED' | 'REJECTED';
+  workflowState:
+    | 'DRAFT'
+    | 'SUBMITTED'
+    | 'APPROVAL_PENDING'
+    | 'APPROVED'
+    | 'REJECTED'
+    | 'CANCELLED';
   executionState: 'NOT_EXECUTED' | 'EXECUTED' | 'REVERSED';
   accountingState:
     | 'NOT_READY'

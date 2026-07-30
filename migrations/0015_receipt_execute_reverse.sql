@@ -32,11 +32,13 @@ ALTER TABLE receipt_documents
   ADD CONSTRAINT receipt_documents_state_check CHECK (
     state IN (
       'DRAFT', 'SUBMITTED', 'APPROVAL_PENDING', 'APPROVED', 'REJECTED',
-      'EXECUTED', 'ACCOUNTING_READY', 'ACCOUNTING_POSTED', 'REVERSED'
+      'EXECUTED', 'ACCOUNTING_READY', 'ACCOUNTING_POSTED', 'CANCELLED', 'REVERSED'
     )
   ),
   ADD CONSTRAINT receipt_documents_workflow_state_check CHECK (
-    workflow_state IN ('DRAFT', 'SUBMITTED', 'APPROVAL_PENDING', 'APPROVED', 'REJECTED')
+    workflow_state IN (
+      'DRAFT', 'SUBMITTED', 'APPROVAL_PENDING', 'APPROVED', 'REJECTED', 'CANCELLED'
+    )
   ),
   ADD CONSTRAINT receipt_documents_execution_state_check CHECK (
     execution_state IN ('NOT_EXECUTED', 'EXECUTED', 'REVERSED')
@@ -49,6 +51,7 @@ ALTER TABLE receipt_documents
   ),
   ADD CONSTRAINT receipt_documents_snapshot_state_check CHECK (
     (state = 'DRAFT' AND current_approval_snapshot_id IS NULL)
+    OR (state = 'CANCELLED' AND reverses_receipt_id IS NULL)
     OR (
       state <> 'DRAFT'
       AND (

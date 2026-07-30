@@ -52,6 +52,11 @@ test('reverseReceipt permits only Canon-safe lifecycle and accounting combinatio
     reversalReceiptId: null,
   }), true);
   assert.equal(policy.isReversalBlocked({
+    state: 'CANCELLED',
+    accountingState: 'NOT_READY',
+    reversalReceiptId: null,
+  }), true);
+  assert.equal(policy.isReversalBlocked({
     state: 'EXECUTED',
     accountingState: 'READY',
     reversalReceiptId: '00000000-0000-4000-8000-000000000000',
@@ -60,6 +65,10 @@ test('reverseReceipt permits only Canon-safe lifecycle and accounting combinatio
 
 test('INC-2C migration owns exact effects, linkage, uniqueness and append-only evidence', async () => {
   const migration = await readFile('migrations/0015_receipt_execute_reverse.sql', 'utf8');
+  assert.match(
+    migration,
+    /state = 'CANCELLED' AND reverses_receipt_id IS NULL/u,
+  );
   for (const table of [
     'movement_facts',
     'received_cheques',
