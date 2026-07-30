@@ -4,9 +4,18 @@ import {
   CollectionEffectsRepository,
   CollectionEffectsService,
 } from './collection-effects.service';
+import { CollectionItemsController } from './collection-items.controller';
+import { CollectionItemsRepository } from './collection-items.repository';
+import { CollectionItemsService } from './collection-items.service';
 
 @Module({
-  providers: [CollectionEffectsRepository, CollectionEffectsService],
+  controllers: [CollectionItemsController],
+  providers: [
+    CollectionEffectsRepository,
+    CollectionEffectsService,
+    CollectionItemsRepository,
+    CollectionItemsService,
+  ],
   exports: [CollectionEffectsService],
 })
 export class CollectionEffectsModule {}

@@ -118,3 +118,14 @@ test('INC-2C execution path is Drizzle-first and keeps raw pg out of new reposit
   }
   assert.match(sources[0]!, /InferSelectModel/u);
 });
+
+test('INC-2D Receipt writer requires immutable Collection destination anchors and date', async () => {
+  const source = await readFile('src/receipts/receipt-execution.service.ts', 'utf8');
+  assert.match(source, /!line\.effectiveBankAccountId \|\| !line\.dueDate/u);
+  assert.match(source, /this\.banking\.collectionDestination/u);
+  assert.match(source, /branchId: destination\.branchId/u);
+  assert.match(source, /treasuryUnitId: destination\.treasuryUnitId/u);
+  assert.match(source, /collectedPartyId: receipt\.document\.partyId/u);
+  assert.match(source, /expectedSettlementDate: line\.dueDate/u);
+  assert.doesNotMatch(source, /expectedSettlementDate: line\.dueDate \?\?/u);
+});

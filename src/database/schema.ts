@@ -1975,21 +1975,113 @@ export const collectionItems = pgTable('collection_items', {
   organizationId: uuid('organization_id').notNull().references(() => organizations.id),
   sourceFactType: varchar('source_fact_type', { length: 32 }).notNull(),
   sourceFactId: uuid('source_fact_id').notNull(),
+  branchId: uuid('branch_id'),
+  treasuryUnitId: uuid('treasury_unit_id').notNull(),
   channelType: varchar('channel_type', { length: 24 }).notNull(),
   channelId: uuid('channel_id'),
   providerReference: varchar('provider_reference', { length: 128 }),
+  collectedPartyId: uuid('collected_party_id'),
   grossAmount: numeric('gross_amount', { precision: 38, scale: 8 }).notNull(),
   currency: varchar('currency', { length: 8 }).notNull(),
   allocatedAmount: numeric('allocated_amount', { precision: 38, scale: 8 }).notNull().default('0'),
   remainingAmount: numeric('remaining_amount', { precision: 38, scale: 8 }).notNull(),
   destinationBankAccountId: uuid('destination_bank_account_id').notNull(),
   collectedAt: timestamp('collected_at', { withTimezone: true }).notNull(),
-  expectedSettlementDate: date('expected_settlement_date'),
+  expectedSettlementDate: date('expected_settlement_date').notNull(),
   state: varchar('state', { length: 32 }).notNull().default('OPEN'),
   version: bigint('version', { mode: 'number' }).notNull().default(0),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
 }, (table) => [
   unique().on(table.organizationId, table.id),
   unique().on(table.organizationId, table.sourceFactType, table.sourceFactId),
+  foreignKey({
+    columns: [table.organizationId, table.branchId],
+    foreignColumns: [branches.organizationId, branches.id],
+    name: 'collection_items_branch_fk',
+  }),
+  foreignKey({
+    columns: [table.organizationId, table.treasuryUnitId],
+    foreignColumns: [treasuryUnits.organizationId, treasuryUnits.id],
+    name: 'collection_items_treasury_unit_fk',
+  }),
+  foreignKey({
+    columns: [table.organizationId, table.collectedPartyId],
+    foreignColumns: [parties.organizationId, parties.id],
+    name: 'collection_items_collected_party_fk',
+  }),
+  foreignKey({
+    columns: [table.organizationId, table.destinationBankAccountId],
+    foreignColumns: [bankAccounts.organizationId, bankAccounts.id],
+    name: 'collection_items_destination_account_fk',
+  }),
+  foreignKey({
+    columns: [table.organizationId, table.currency],
+    foreignColumns: [currencies.organizationId, currencies.code],
+    name: 'collection_items_currency_fk',
+  }),
+  check(
+    'collection_items_source_type_check',
+    sql`${table.sourceFactType} IN ('RECEIPT_LINE', 'CHEQUE_EVENT')`,
+  ),
+  check(
+    'collection_items_channel_type_check',
+    sql`${table.channelType} IN (
+      'BANK_TRANSFER', 'DIRECT_DEPOSIT', 'POS', 'GATEWAY',
+      'CARD_TRANSFER', 'WALLET', 'FOREIGN_REMITTANCE', 'DEPOSITED_CHEQUE'
+    )`,
+  ),
+  check(
+    'collection_items_state_check',
+    sql`${table.state} IN (
+      'OPEN', 'PARTIALLY_ALLOCATED', 'ALLOCATED', 'SETTLED',
+      'REOPENED_AFTER_REVERSAL', 'DELAYED', 'DISPUTED',
+      'RETURNED', 'CANCELLED'
+    )`,
+  ),
+  check('collection_items_gross_positive', sql`${table.grossAmount} > 0`),
+  check('collection_items_allocated_nonnegative', sql`${table.allocatedAmount} >= 0`),
+  check('collection_items_remaining_nonnegative', sql`${table.remainingAmount} >= 0`),
+  check(
+    'collection_items_money_balance',
+    sql`${table.allocatedAmount} + ${table.remainingAmount} = ${table.grossAmount}`,
+  ),
+  check(
+    'collection_items_state_money_shape',
+    sql`(
+      ${table.state} IN ('OPEN', 'REOPENED_AFTER_REVERSAL')
+      AND ${table.allocatedAmount} = 0
+      AND ${table.remainingAmount} = ${table.grossAmount}
+    ) OR (
+      ${table.state} = 'PARTIALLY_ALLOCATED'
+      AND ${table.allocatedAmount} > 0
+      AND ${table.remainingAmount} > 0
+    ) OR (
+      ${table.state} IN ('ALLOCATED', 'SETTLED')
+      AND ${table.allocatedAmount} = ${table.grossAmount}
+      AND ${table.remainingAmount} = 0
+    ) OR ${table.state} IN ('DELAYED', 'DISPUTED', 'RETURNED', 'CANCELLED')`,
+  ),
+  check('collection_items_version_nonnegative', sql`${table.version} >= 0`),
+  uniqueIndex('uq_collection_item_provider_reference')
+    .on(
+      table.organizationId,
+      table.channelType,
+      sql`(
+        CASE
+          WHEN ${table.channelId} IS NOT NULL
+            THEN 'CHANNEL:' || ${table.channelId}::text
+          ELSE 'BANK_ACCOUNT:' || ${table.destinationBankAccountId}::text
+        END
+      )`,
+      table.providerReference,
+    )
+    .where(sql`${table.providerReference} IS NOT NULL`),
+  index('collection_items_queue_idx').on(
+    table.organizationId,
+    table.collectedAt.desc(),
+    table.id.desc(),
+  ),
 ]);
 
 export const receiptExecutionEffects = pgTable('receipt_execution_effects', {

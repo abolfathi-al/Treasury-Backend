@@ -34,6 +34,12 @@ import {
   CollectionEffectsService,
 } from '../src/collection-and-settlement/collection-effects.service';
 import {
+  CollectionItemsRepository,
+} from '../src/collection-and-settlement/collection-items.repository';
+import {
+  CollectionItemsService,
+} from '../src/collection-and-settlement/collection-items.service';
+import {
   FoundationEffectsRepository,
   FoundationEffectsService,
 } from '../src/foundation-effects/foundation-effects.service';
@@ -961,7 +967,7 @@ test('Receipt execution is atomic, actor-idempotent, versioned and race-safe', {
     `, [executorRoleId, seeded.organizationId, `EXEC-${suffix}`]);
     await database.pool.query(`
       INSERT INTO role_permissions (role_id, permission)
-      VALUES ($1,'receipt.execute'),($1,'receipt.view')
+      VALUES ($1,'receipt.execute'),($1,'receipt.view'),($1,'collection.view')
     `, [executorRoleId]);
     await database.pool.query(`
       INSERT INTO user_refs (id, organization_id, subject_key, display_name)
@@ -1368,6 +1374,41 @@ test('Receipt execution is atomic, actor-idempotent, versioned and race-safe', {
       executed,
     );
     assert.deepEqual(await execution.execute(competing[winner.index]!), executed);
+
+    const collectionItemId = randomUUID();
+    await database.pool.query(`
+      INSERT INTO collection_items (
+        id, organization_id, source_fact_type, source_fact_id,
+        treasury_unit_id, channel_type, provider_reference,
+        collected_party_id, gross_amount, currency, allocated_amount,
+        remaining_amount, destination_bank_account_id, collected_at,
+        expected_settlement_date, state, version
+      ) VALUES (
+        $1,$2,'RECEIPT_LINE',$3,$4,'BANK_TRANSFER',$5,$6,1000,$7,0,1000,
+        $8,now(),'2026-07-29','OPEN',0
+      )
+    `, [
+      collectionItemId,
+      seeded.organizationId,
+      executionLine.rows[0]!.id,
+      seeded.treasuryUnitId,
+      `LIST-${suffix}`,
+      seeded.partyId,
+      seeded.baseCurrency,
+      seeded.bankAccountId,
+    ]);
+    try {
+      const collectionPage = await new CollectionItemsService(
+        new CollectionItemsRepository(database),
+      ).list(seeded.organizationId, executorId, { limit: '10' });
+      assert.equal(collectionPage.items.length, 1);
+      assert.equal(collectionPage.items[0]!.id, collectionItemId);
+    } finally {
+      await database.pool.query(
+        'DELETE FROM collection_items WHERE organization_id = $1 AND id = $2',
+        [seeded.organizationId, collectionItemId],
+      );
+    }
 
     const incomingEffect = await database.pool.query<{
       id: string;

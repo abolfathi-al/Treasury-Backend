@@ -399,25 +399,31 @@ export class ReceiptExecutionService {
         custodianId: line.cashboxId ?? receipt.document.treasuryUnitId,
       });
     } else if (TRANSIT.has(category) && line.createsFundsInTransit) {
-      if (!line.effectiveBankAccountId) throw new Error('EFFECT_MAPPING');
-      if (!await this.banking.receivable(
+      if (!line.effectiveBankAccountId || !line.dueDate) {
+        throw new Error('EFFECT_MAPPING');
+      }
+      const destination = await this.banking.collectionDestination(
         transaction,
         receipt.document.organizationId,
         line.effectiveBankAccountId,
         line.currency,
-      )) throw new Error('BANK_UNAVAILABLE');
+      );
+      if (!destination) throw new Error('BANK_UNAVAILABLE');
       effectType = 'COLLECTION_ITEM';
       collectionItemId = await this.collections.create(transaction, {
         organizationId: receipt.document.organizationId,
         receiptLineId: line.id,
+        branchId: destination.branchId,
+        treasuryUnitId: destination.treasuryUnitId,
         channelType: category,
         channelId: line.posTerminalId ?? line.paymentGatewayId ?? undefined,
         providerReference: line.trackingNumber ?? undefined,
+        collectedPartyId: receipt.document.partyId,
         amount: line.amount,
         currency: line.currency,
         destinationBankAccountId: line.effectiveBankAccountId,
         collectedAt: executedAt,
-        expectedSettlementDate: line.dueDate ?? undefined,
+        expectedSettlementDate: line.dueDate,
       });
     } else if (TRANSIT.has(category) && !line.createsFundsInTransit) {
       if (!line.effectiveBankAccountId) throw new Error('EFFECT_MAPPING');
@@ -697,6 +703,7 @@ export class ReceiptExecutionService {
         SCOPE_DENIED: ['TRS-GEN-003', 403],
         INVALID_APPROVAL_EVIDENCE: ['TRS-GEN-005', 409],
         STATE_CONFLICT: ['TRS-GEN-005', 409],
+        COLLECTION_IDENTITY_CONFLICT: ['TRS-GEN-005', 409],
         STALE_VERSION: ['TRS-GEN-006', 409],
         IDEMPOTENCY_CONFLICT: ['TRS-GEN-007', 409],
         CASHBOX_DATE_CLOSED: ['TRS-GEN-009', 409],
