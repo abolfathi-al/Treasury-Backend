@@ -336,7 +336,8 @@ test('INC-2D migration and repository preserve tenant, money and one-grant laws'
     /UPDATE collection_items[\s\S]+btrim\(provider_reference\) = '';[\s\S]+CREATE UNIQUE INDEX uq_collection_item_provider_reference/u,
   );
   assert.doesNotMatch(migration, /collection_items_channel_identity_check/u);
-  assert.match(repository, /EXISTS \(\s+SELECT 1\s+FROM access_grants AS grant/u);
+  assert.match(repository, /EXISTS \(\s+SELECT 1\s+FROM access_grants AS access_grant/u);
+  assert.doesNotMatch(repository, /FROM access_grants AS grant\b/u);
   assert.doesNotMatch(repository, /\bpool\.query\b|\bclient\.query\b|\bany\b/u);
 });
 

@@ -374,74 +374,74 @@ export class CollectionItemsRepository {
     );
     return sql<boolean>`EXISTS (
       SELECT 1
-        FROM access_grants AS grant
+        FROM access_grants AS access_grant
         JOIN roles AS role
-          ON role.id = grant.role_id
-         AND role.organization_id = grant.organization_id
+          ON role.id = access_grant.role_id
+         AND role.organization_id = access_grant.organization_id
          AND role.state = 'ACTIVE'
         JOIN role_permissions AS permission
           ON permission.role_id = role.id
          AND permission.permission = 'collection.view'
-       WHERE grant.organization_id = ${organizationId}
-         AND grant.user_ref_id = ${actorUserId}
-         AND grant.id IN (${grantIds})
-         AND grant.state = 'ACTIVE'
-         AND grant.valid_from <= now()
-         AND (grant.valid_to IS NULL OR grant.valid_to > now())
-         AND grant.amount_ceiling IS NULL
+       WHERE access_grant.organization_id = ${organizationId}
+         AND access_grant.user_ref_id = ${actorUserId}
+         AND access_grant.id IN (${grantIds})
+         AND access_grant.state = 'ACTIVE'
+         AND access_grant.valid_from <= now()
+         AND (access_grant.valid_to IS NULL OR access_grant.valid_to > now())
+         AND access_grant.amount_ceiling IS NULL
          AND NOT EXISTS (
            SELECT 1 FROM access_grant_cashbox_scopes AS scope
-           WHERE scope.access_grant_id = grant.id
+           WHERE scope.access_grant_id = access_grant.id
          )
          AND NOT EXISTS (
            SELECT 1 FROM access_grant_document_type_scopes AS scope
-           WHERE scope.access_grant_id = grant.id
+           WHERE scope.access_grant_id = access_grant.id
          )
          AND NOT EXISTS (
            SELECT 1 FROM access_grant_method_category_scopes AS scope
-           WHERE scope.access_grant_id = grant.id
+           WHERE scope.access_grant_id = access_grant.id
          )
          AND (
            NOT EXISTS (
              SELECT 1 FROM access_grant_branch_scopes AS scope
-             WHERE scope.access_grant_id = grant.id
+             WHERE scope.access_grant_id = access_grant.id
            )
            OR EXISTS (
              SELECT 1 FROM access_grant_branch_scopes AS scope
-             WHERE scope.access_grant_id = grant.id
+             WHERE scope.access_grant_id = access_grant.id
                AND scope.branch_id = ${collectionItems.branchId}
            )
          )
          AND (
            NOT EXISTS (
              SELECT 1 FROM access_grant_treasury_unit_scopes AS scope
-             WHERE scope.access_grant_id = grant.id
+             WHERE scope.access_grant_id = access_grant.id
            )
            OR EXISTS (
              SELECT 1 FROM access_grant_treasury_unit_scopes AS scope
-             WHERE scope.access_grant_id = grant.id
+             WHERE scope.access_grant_id = access_grant.id
                AND scope.treasury_unit_id = ${collectionItems.treasuryUnitId}
            )
          )
          AND (
            NOT EXISTS (
              SELECT 1 FROM access_grant_bank_account_scopes AS scope
-             WHERE scope.access_grant_id = grant.id
+             WHERE scope.access_grant_id = access_grant.id
            )
            OR EXISTS (
              SELECT 1 FROM access_grant_bank_account_scopes AS scope
-             WHERE scope.access_grant_id = grant.id
+             WHERE scope.access_grant_id = access_grant.id
                AND scope.bank_account_id = ${collectionItems.destinationBankAccountId}
            )
          )
          AND (
            NOT EXISTS (
              SELECT 1 FROM access_grant_currency_scopes AS scope
-             WHERE scope.access_grant_id = grant.id
+             WHERE scope.access_grant_id = access_grant.id
            )
            OR EXISTS (
              SELECT 1 FROM access_grant_currency_scopes AS scope
-             WHERE scope.access_grant_id = grant.id
+             WHERE scope.access_grant_id = access_grant.id
                AND scope.currency = ${collectionItems.currency}
            )
          )
