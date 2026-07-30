@@ -884,11 +884,58 @@ export class SettlementRepository {
             SELECT 1 FROM delegations AS delegation
             WHERE delegation.organization_id = access_grant.organization_id
               AND delegation.access_grant_id = access_grant.id
-              AND delegation.grantor_user_id = access_grant.user_ref_id
-              AND delegation.delegate_user_id = ${actorUserId}
-              AND delegation.revoked_at IS NULL
-              AND delegation.valid_from <= now()
-              AND delegation.valid_to > now()
+              AND delegation_is_current(delegation.id, access_grant.id, ${actorUserId})
+              AND (
+                delegation.branch_id IS NULL
+                OR (
+                  EXISTS (
+                    SELECT 1
+                    FROM settlement_allocations allocation
+                    JOIN collection_items item
+                      ON item.organization_id = allocation.organization_id
+                     AND item.id = allocation.collection_item_id
+                    WHERE allocation.organization_id = ${settlementBatches.organizationId}
+                      AND allocation.settlement_batch_id = ${settlementBatches.id}
+                      AND item.branch_id IS NOT NULL
+                  )
+                  AND NOT EXISTS (
+                    SELECT 1
+                    FROM settlement_allocations allocation
+                    JOIN collection_items item
+                      ON item.organization_id = allocation.organization_id
+                     AND item.id = allocation.collection_item_id
+                    WHERE allocation.organization_id = ${settlementBatches.organizationId}
+                      AND allocation.settlement_batch_id = ${settlementBatches.id}
+                      AND item.branch_id IS DISTINCT FROM delegation.branch_id
+                  )
+                )
+              )
+              AND (
+                delegation.treasury_unit_id IS NULL
+                OR NOT EXISTS (
+                  SELECT 1
+                  FROM settlement_allocations allocation
+                  JOIN collection_items item
+                    ON item.organization_id = allocation.organization_id
+                   AND item.id = allocation.collection_item_id
+                  WHERE allocation.organization_id = ${settlementBatches.organizationId}
+                    AND allocation.settlement_batch_id = ${settlementBatches.id}
+                    AND item.treasury_unit_id <> delegation.treasury_unit_id
+                )
+              )
+              AND (delegation.document_type IS NULL OR delegation.document_type = 'SETTLEMENT')
+              AND delegation.method_category IS NULL
+              AND (
+                delegation.currency IS NULL
+                OR delegation.currency = ${settlementBatches.currency}
+              )
+              AND (
+                delegation.amount_ceiling IS NULL
+                OR (
+                  delegation.amount_ceiling_currency = ${settlementBatches.currency}
+                  AND delegation.amount_ceiling >= ${settlementBatches.grossAmount}
+                )
+              )
           )
         )
         AND (

@@ -46,10 +46,23 @@ export class AccessAuthorizationRepository {
         FROM access_grants ag
         JOIN roles r ON r.id = ag.role_id AND r.state = 'ACTIVE'
         JOIN role_permissions rp ON rp.role_id = r.id AND rp.permission = ${permission}
+        JOIN LATERAL (
+          SELECT NULL::uuid AS delegation_id, NULL::uuid AS branch_id,
+                 NULL::uuid AS treasury_unit_id, NULL::varchar AS document_type,
+                 NULL::varchar AS method_category, NULL::varchar AS currency,
+                 NULL::numeric AS amount_ceiling, NULL::varchar AS amount_ceiling_currency
+          WHERE ag.user_ref_id = ${actorUserId}
+          UNION ALL
+          SELECT d.id, d.branch_id, d.treasury_unit_id, d.document_type,
+                 d.method_category, d.currency, d.amount_ceiling, d.amount_ceiling_currency
+          FROM delegations d
+          WHERE d.organization_id = ag.organization_id
+            AND d.access_grant_id = ag.id
+            AND delegation_is_current(d.id, ag.id, ${actorUserId})
+        ) authority ON true
         JOIN receipt_documents rd
           ON rd.organization_id = ag.organization_id AND rd.id = ${receiptId}
         WHERE ag.organization_id = ${organizationId}
-          AND ag.user_ref_id = ${actorUserId}
           AND ag.state = 'ACTIVE'
           AND ag.valid_from <= now()
           AND (ag.valid_to IS NULL OR ag.valid_to > now())
@@ -143,6 +156,29 @@ export class AccessAuthorizationRepository {
                 )
               )
           )
+          AND (authority.branch_id IS NULL OR authority.branch_id = rd.branch_id)
+          AND (authority.treasury_unit_id IS NULL
+            OR authority.treasury_unit_id = rd.treasury_unit_id)
+          AND (authority.document_type IS NULL OR authority.document_type = 'RECEIPT')
+          AND (authority.method_category IS NULL OR NOT EXISTS (
+            SELECT 1 FROM receipt_lines rl
+            WHERE rl.organization_id = rd.organization_id
+              AND rl.receipt_document_id = rd.id
+              AND rl.method_category <> authority.method_category
+          ))
+          AND (authority.currency IS NULL OR (
+            authority.currency = rd.base_currency
+            AND NOT EXISTS (
+              SELECT 1 FROM receipt_lines rl
+              WHERE rl.organization_id = rd.organization_id
+                AND rl.receipt_document_id = rd.id
+                AND rl.currency <> authority.currency
+            )
+          ))
+          AND (authority.amount_ceiling IS NULL OR (
+            authority.amount_ceiling_currency = rd.base_currency
+            AND authority.amount_ceiling >= rd.total_base_amount
+          ))
       ) AS allowed
     `);
     return result.rows[0]!.allowed;
@@ -215,8 +251,21 @@ export class AccessAuthorizationRepository {
         FROM access_grants ag
         JOIN roles r ON r.id = ag.role_id AND r.state = 'ACTIVE'
         JOIN role_permissions rp ON rp.role_id = r.id AND rp.permission = 'cashbox.handover'
+        JOIN LATERAL (
+          SELECT NULL::uuid AS delegation_id, NULL::uuid AS branch_id,
+                 NULL::uuid AS treasury_unit_id, NULL::varchar AS document_type,
+                 NULL::varchar AS method_category, NULL::varchar AS currency,
+                 NULL::numeric AS amount_ceiling
+          WHERE ag.user_ref_id = ${actorUserId}
+          UNION ALL
+          SELECT d.id, d.branch_id, d.treasury_unit_id, d.document_type,
+                 d.method_category, d.currency, d.amount_ceiling
+          FROM delegations d
+          WHERE d.organization_id = ag.organization_id
+            AND d.access_grant_id = ag.id
+            AND delegation_is_current(d.id, ag.id, ${actorUserId})
+        ) authority ON true
         WHERE ag.organization_id = ${organizationId}
-          AND ag.user_ref_id = ${actorUserId}
           AND ag.state = 'ACTIVE'
           AND ag.valid_from <= now()
           AND (ag.valid_to IS NULL OR ag.valid_to > now())
@@ -228,8 +277,15 @@ export class AccessAuthorizationRepository {
             OR EXISTS (
               SELECT 1 FROM access_grant_cashbox_scopes s
               WHERE s.access_grant_id = ag.id AND s.cashbox_id = ${context.cashboxId}
-            )
+              )
           )
+          AND (authority.branch_id IS NULL OR authority.branch_id = ${context.branchId}::uuid)
+          AND (authority.treasury_unit_id IS NULL
+            OR authority.treasury_unit_id = ${context.treasuryUnitId}::uuid)
+          AND authority.document_type IS NULL
+          AND authority.method_category IS NULL
+          AND authority.currency IS NULL
+          AND authority.amount_ceiling IS NULL
           AND (
             NOT EXISTS (
               SELECT 1 FROM access_grant_branch_scopes s
@@ -277,46 +333,59 @@ export class AccessAuthorizationRepository {
     const result = await transaction.execute<PaymentGrant>(sql`
       SELECT ag.id,
              ag.user_ref_id AS "grantUserId",
-             CASE WHEN ag.user_ref_id = ${actorUserId}
+             CASE WHEN authority.delegation_id IS NULL
                THEN NULL ELSE ag.user_ref_id END AS "delegatedFromUserId",
-             ag.amount_ceiling::text AS "amountCeiling",
-             ag.amount_ceiling_currency AS "amountCeilingCurrency",
-             ARRAY(SELECT s.branch_id::text FROM access_grant_branch_scopes s
-                   WHERE s.access_grant_id = ag.id ORDER BY s.branch_id) AS "branchIds",
-             ARRAY(SELECT s.treasury_unit_id::text FROM access_grant_treasury_unit_scopes s
-                   WHERE s.access_grant_id = ag.id ORDER BY s.treasury_unit_id) AS "treasuryUnitIds",
+             CASE
+               WHEN authority.delegation_id IS NULL THEN ag.amount_ceiling
+               WHEN ag.amount_ceiling IS NULL THEN authority.amount_ceiling
+               WHEN authority.amount_ceiling IS NULL THEN ag.amount_ceiling
+               ELSE LEAST(ag.amount_ceiling, authority.amount_ceiling)
+             END::text AS "amountCeiling",
+             CASE WHEN authority.delegation_id IS NULL THEN ag.amount_ceiling_currency
+               ELSE COALESCE(authority.amount_ceiling_currency, ag.amount_ceiling_currency)
+             END AS "amountCeilingCurrency",
+             CASE WHEN authority.branch_id IS NOT NULL THEN ARRAY[authority.branch_id::text]
+               ELSE ARRAY(SELECT s.branch_id::text FROM access_grant_branch_scopes s
+                 WHERE s.access_grant_id = ag.id ORDER BY s.branch_id) END AS "branchIds",
+             CASE WHEN authority.treasury_unit_id IS NOT NULL THEN ARRAY[authority.treasury_unit_id::text]
+               ELSE ARRAY(SELECT s.treasury_unit_id::text FROM access_grant_treasury_unit_scopes s
+                 WHERE s.access_grant_id = ag.id ORDER BY s.treasury_unit_id) END AS "treasuryUnitIds",
              ARRAY(SELECT s.cashbox_id::text FROM access_grant_cashbox_scopes s
                    WHERE s.access_grant_id = ag.id ORDER BY s.cashbox_id) AS "cashboxIds",
              ARRAY(SELECT s.bank_account_id::text FROM access_grant_bank_account_scopes s
                    WHERE s.access_grant_id = ag.id ORDER BY s.bank_account_id) AS "bankAccountIds",
-             ARRAY(SELECT s.document_type FROM access_grant_document_type_scopes s
-                   WHERE s.access_grant_id = ag.id ORDER BY s.document_type) AS "documentTypes",
-             ARRAY(SELECT s.method_category FROM access_grant_method_category_scopes s
-                   WHERE s.access_grant_id = ag.id ORDER BY s.method_category) AS "methodCategories",
-             ARRAY(SELECT s.currency FROM access_grant_currency_scopes s
-                   WHERE s.access_grant_id = ag.id ORDER BY s.currency) AS currencies
+             CASE WHEN authority.document_type IS NOT NULL THEN ARRAY[authority.document_type]
+               ELSE ARRAY(SELECT s.document_type FROM access_grant_document_type_scopes s
+                 WHERE s.access_grant_id = ag.id ORDER BY s.document_type) END AS "documentTypes",
+             CASE WHEN authority.method_category IS NOT NULL THEN ARRAY[authority.method_category]
+               ELSE ARRAY(SELECT s.method_category FROM access_grant_method_category_scopes s
+                 WHERE s.access_grant_id = ag.id ORDER BY s.method_category) END AS "methodCategories",
+             CASE WHEN authority.currency IS NOT NULL THEN ARRAY[authority.currency]
+               ELSE ARRAY(SELECT s.currency FROM access_grant_currency_scopes s
+                 WHERE s.access_grant_id = ag.id ORDER BY s.currency) END AS currencies
       FROM access_grants ag
       JOIN roles r ON r.id = ag.role_id AND r.state = 'ACTIVE'
       JOIN role_permissions rp ON rp.role_id = r.id AND rp.permission = ${permission}
+      JOIN LATERAL (
+        SELECT NULL::uuid AS delegation_id, NULL::uuid AS branch_id,
+               NULL::uuid AS treasury_unit_id, NULL::varchar AS document_type,
+               NULL::varchar AS method_category, NULL::varchar AS currency,
+               NULL::numeric AS amount_ceiling, NULL::varchar AS amount_ceiling_currency
+        WHERE ag.user_ref_id = ${actorUserId}
+        UNION ALL
+        SELECT d.id, d.branch_id, d.treasury_unit_id, d.document_type,
+               d.method_category, d.currency, d.amount_ceiling, d.amount_ceiling_currency
+        FROM delegations d
+        WHERE d.organization_id = ag.organization_id
+          AND d.access_grant_id = ag.id
+          AND delegation_is_current(d.id, ag.id, ${actorUserId})
+      ) authority ON true
       WHERE ag.organization_id = ${organizationId}
-        AND (
-          ag.user_ref_id = ${actorUserId}
-          OR EXISTS (
-            SELECT 1 FROM delegations d
-            WHERE d.organization_id = ag.organization_id
-              AND d.access_grant_id = ag.id
-              AND d.grantor_user_id = ag.user_ref_id
-              AND d.delegate_user_id = ${actorUserId}
-              AND d.revoked_at IS NULL
-              AND d.valid_from <= now()
-              AND d.valid_to > now()
-          )
-        )
         AND (${roleId ?? null}::uuid IS NULL OR ag.role_id = ${roleId ?? null}::uuid)
         AND ag.state = 'ACTIVE'
         AND ag.valid_from <= now()
         AND (ag.valid_to IS NULL OR ag.valid_to > now())
-      ORDER BY ag.id
+      ORDER BY ag.id, authority.delegation_id NULLS FIRST
     `);
     return result.rows;
   }
@@ -351,8 +420,21 @@ export class AccessAuthorizationRepository {
           FROM access_grants ag
           JOIN roles r ON r.id = ag.role_id AND r.state = 'ACTIVE'
           JOIN role_permissions rp ON rp.role_id = r.id AND rp.permission = 'payment.view'
+          JOIN LATERAL (
+            SELECT NULL::uuid AS delegation_id, NULL::uuid AS branch_id,
+                   NULL::uuid AS treasury_unit_id, NULL::varchar AS document_type,
+                   NULL::varchar AS method_category, NULL::varchar AS currency,
+                   NULL::numeric AS amount_ceiling, NULL::varchar AS amount_ceiling_currency
+            WHERE ag.user_ref_id = ${actorUserId}
+            UNION ALL
+            SELECT d.id, d.branch_id, d.treasury_unit_id, d.document_type,
+                   d.method_category, d.currency, d.amount_ceiling, d.amount_ceiling_currency
+            FROM delegations d
+            WHERE d.organization_id = ag.organization_id
+              AND d.access_grant_id = ag.id
+              AND delegation_is_current(d.id, ag.id, ${actorUserId})
+          ) authority ON true
           WHERE ag.organization_id = pd.organization_id
-            AND ag.user_ref_id = ${actorUserId}
             AND ag.state = 'ACTIVE'
             AND ag.valid_from <= now()
             AND (ag.valid_to IS NULL OR ag.valid_to > now())
@@ -430,6 +512,30 @@ export class AccessAuthorizationRepository {
                                     WHERE s.access_grant_id = ag.id AND s.currency = pl.currency))
                 )
             )
+            AND (authority.branch_id IS NULL
+              OR authority.branch_id = COALESCE(pd.branch_id, tu.branch_id))
+            AND (authority.treasury_unit_id IS NULL
+              OR authority.treasury_unit_id = pd.treasury_unit_id)
+            AND (authority.document_type IS NULL OR authority.document_type = 'PAYMENT')
+            AND (authority.method_category IS NULL OR NOT EXISTS (
+              SELECT 1 FROM payment_lines pl
+              WHERE pl.organization_id = pd.organization_id
+                AND pl.payment_document_id = pd.id
+                AND pl.method_category <> authority.method_category
+            ))
+            AND (authority.currency IS NULL OR (
+              authority.currency = pd.base_currency
+              AND NOT EXISTS (
+                SELECT 1 FROM payment_lines pl
+                WHERE pl.organization_id = pd.organization_id
+                  AND pl.payment_document_id = pd.id
+                  AND pl.currency <> authority.currency
+              )
+            ))
+            AND (authority.amount_ceiling IS NULL OR (
+              authority.amount_ceiling_currency = pd.base_currency
+              AND authority.amount_ceiling >= pd.total_base_amount
+            ))
         )
       ORDER BY pd.business_date DESC, pd.id DESC
       LIMIT ${limit}
@@ -471,11 +577,19 @@ export class AccessAuthorizationRepository {
                 SELECT 1 FROM delegations d
                 WHERE d.organization_id = ag.organization_id
                   AND d.access_grant_id = ag.id
-                  AND d.grantor_user_id = ag.user_ref_id
-                  AND d.delegate_user_id = ${actorUserId}
-                  AND d.revoked_at IS NULL
-                  AND d.valid_from <= now()
-                  AND d.valid_to > now()
+                  AND delegation_is_current(d.id, ag.id, ${actorUserId})
+                  AND (d.branch_id IS NULL OR d.branch_id = ae.branch_id)
+                  AND (d.treasury_unit_id IS NULL OR d.treasury_unit_id = ae.treasury_unit_id)
+                  AND (d.document_type IS NULL OR d.document_type = ae.document_type)
+                  AND d.method_category IS NULL
+                  AND (d.currency IS NULL OR d.currency = ae.base_currency)
+                  AND (
+                    d.amount_ceiling IS NULL
+                    OR (
+                      d.amount_ceiling_currency = ae.base_currency
+                      AND ae.aggregate_base_amount <= d.amount_ceiling
+                    )
+                  )
               )
             )
             AND ag.state = 'ACTIVE'

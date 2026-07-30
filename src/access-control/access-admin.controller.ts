@@ -14,6 +14,8 @@ import {
 import { requestId } from '../common/http';
 import {
   AccessGrantCreateDto,
+  ApprovalPolicyCreateDto,
+  DelegationCreateDto,
   RoleCreateDto,
   SessionRevokeDto,
 } from './access-admin.dto';
@@ -125,6 +127,72 @@ export class AccessAdminController {
     @Body() body: AccessGrantCreateDto,
   ) {
     return this.service.createAccessGrant(
+      request.auth!.organizationId,
+      body,
+      key,
+      requestId(request.header('X-Request-Id')),
+      request.auth!,
+      request.stepUp!,
+    );
+  }
+
+  @Get('approval-policies')
+  @RequirePermission('access-control.view', 'listApprovalPolicies', 'ONE_GRANT_RESOURCE')
+  listApprovalPolicies(
+    @Req() request: TreasuryRequest,
+    @Query('limit') limit?: string,
+    @Query('cursor') cursor?: string,
+  ) {
+    return this.service.listApprovalPolicies(
+      request.auth!.organizationId,
+      request.auth!.session.userId,
+      limit,
+      cursor,
+    );
+  }
+
+  @Post('approval-policies')
+  @RequirePermission('approval-policy.manage', 'createApprovalPolicy', 'ONE_GRANT_RESOURCE')
+  @RequireStepUp('createApprovalPolicy')
+  createApprovalPolicy(
+    @Req() request: TreasuryRequest,
+    @Headers('Idempotency-Key') key: string,
+    @Body() body: ApprovalPolicyCreateDto,
+  ) {
+    return this.service.createApprovalPolicy(
+      request.auth!.organizationId,
+      body,
+      key,
+      requestId(request.header('X-Request-Id')),
+      request.auth!,
+      request.stepUp!,
+    );
+  }
+
+  @Get('delegations')
+  @RequirePermission('access-control.view', 'listDelegations', 'ONE_GRANT_RESOURCE')
+  listDelegations(
+    @Req() request: TreasuryRequest,
+    @Query('limit') limit?: string,
+    @Query('cursor') cursor?: string,
+  ) {
+    return this.service.listDelegations(
+      request.auth!.organizationId,
+      request.auth!.session.userId,
+      limit,
+      cursor,
+    );
+  }
+
+  @Post('delegations')
+  @RequirePermission('delegation.manage', 'createDelegation', 'ONE_GRANT_RESOURCE')
+  @RequireStepUp('createDelegation')
+  createDelegation(
+    @Req() request: TreasuryRequest,
+    @Headers('Idempotency-Key') key: string,
+    @Body() body: DelegationCreateDto,
+  ) {
+    return this.service.createDelegation(
       request.auth!.organizationId,
       body,
       key,

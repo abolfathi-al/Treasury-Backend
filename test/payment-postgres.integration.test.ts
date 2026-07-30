@@ -32,6 +32,25 @@ import { PaymentService } from '../src/payments/payment.service';
 
 const connectionString = process.env.TEST_DATABASE_URL;
 
+async function forcePolicyState(
+  database: DatabaseService,
+  policyId: string,
+  state: 'ACTIVE' | 'RETIRED',
+): Promise<void> {
+  const client = await database.pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query('SET LOCAL session_replication_role = replica');
+    await client.query('UPDATE approval_policies SET state = $1 WHERE id = $2', [state, policyId]);
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
 test('INC-3A/3B payments preserve draft, approval, aggregation, and concurrency invariants', {
   skip: connectionString ? false : 'TEST_DATABASE_URL is not configured',
 }, async () => {
@@ -397,7 +416,8 @@ test('INC-3A/3B payments preserve draft, approval, aggregation, and concurrency 
       '"1"',
       'payment-approve-replay',
     ), approved[0]);
-    await database.pool.query(`UPDATE delegations SET revoked_at = now(), revoked_by_user_id = $1
+    await database.pool.query(`UPDATE delegations SET revoked_at = now(), revoked_by_user_id = $1,
+      revocation_reason = 'Integration-test revocation'
       WHERE id = $2`, [seeded.approverId, seeded.approvalDelegationId]);
     await assert.rejects(
       database.pool.query(`UPDATE delegations SET reason = 'Broadened after creation' WHERE id = $1`, [
@@ -427,8 +447,7 @@ test('INC-3A/3B payments preserve draft, approval, aggregation, and concurrency 
       'payment-unresolved-draft',
       'payment-unresolved-draft',
     );
-    await database.pool.query(`UPDATE payment_approval_policies SET state = 'RETIRED'
-      WHERE id = $1`, [seeded.approvalPolicyId]);
+    await forcePolicyState(database, seeded.approvalPolicyId, 'RETIRED');
     await assert.rejects(approvalService.submit(
       seeded.organizationId,
       seeded.actorId,
@@ -446,8 +465,7 @@ test('INC-3A/3B payments preserve draft, approval, aggregation, and concurrency 
       'payment-unresolved-submit',
     ]);
     assert.equal(unresolvedIdempotency.rows[0]!.count, '0');
-    await database.pool.query(`UPDATE payment_approval_policies SET state = 'ACTIVE'
-      WHERE id = $1`, [seeded.approvalPolicyId]);
+    await forcePolicyState(database, seeded.approvalPolicyId, 'ACTIVE');
 
     const aggregateDraft = await service.create(
       seeded.organizationId,
@@ -876,6 +894,9 @@ async function seed(database: DatabaseService) {
   const approverId = randomUUID();
   const requesterId = randomUUID();
   const delegateId = randomUUID();
+  const approverAccountId = randomUUID();
+  const requesterAccountId = randomUUID();
+  const delegateAccountId = randomUUID();
   const executorId = randomUUID();
   const reverserId = randomUUID();
   const executorGrantId = randomUUID();
@@ -985,6 +1006,20 @@ async function seed(database: DatabaseService) {
       INSERT INTO user_refs (id, organization_id, subject_key, display_name)
       VALUES ($1,$3,$4,'INC-3C executor'),($2,$3,$5,'INC-3C reverser')
     `, [executorId, reverserId, organizationId, `executor-${suffix}`, `reverser-${suffix}`]);
+    await client.query(`
+      INSERT INTO identity_accounts (
+        id, user_ref_id, normalized_login, password_hash, privileged
+      ) VALUES
+        ($1,$4,$7,'test-password-hash',false),
+        ($2,$5,$8,'test-password-hash',false),
+        ($3,$6,$9,'test-password-hash',false)
+    `, [
+      approverAccountId, requesterAccountId, delegateAccountId,
+      approverId, requesterId, delegateId,
+      `approver.${suffix.toLowerCase()}`,
+      `requester.${suffix.toLowerCase()}`,
+      `delegate.${suffix.toLowerCase()}`,
+    ]);
     await client.query(`
       INSERT INTO identity_accounts (
         id, user_ref_id, normalized_login, password_hash, privileged
@@ -1260,33 +1295,40 @@ async function seed(database: DatabaseService) {
     }
     await client.query(`
       INSERT INTO delegations (
-        id, organization_id, access_grant_id, grantor_user_id, delegate_user_id,
-        reason, valid_from, valid_to
-      ) VALUES
-        ($1,$3,$4,$5,$6,'Requester separation proof',now() - interval '1 minute',now() + interval '1 day'),
-        ($2,$3,$4,$5,$7,'Temporary approval cover',now() - interval '1 minute',now() + interval '1 day')
+        id, organization_id, access_grant_id, source_grant_version, source_scope_digest,
+        grantor_user_id, delegate_user_id, currency, reason, valid_from, valid_to
+      )
+      SELECT $1::uuid,$3::uuid,$4::uuid,ag.version,access_grant_scope_digest(ag.id),$5::uuid,$6::uuid,$8,
+             'Requester separation proof',now() - interval '1 minute',now() + interval '1 day'
+      FROM access_grants ag WHERE ag.id = $4
+      UNION ALL
+      SELECT $2::uuid,$3::uuid,$4::uuid,ag.version,access_grant_scope_digest(ag.id),$5::uuid,$7::uuid,$8,
+             'Temporary approval cover',now() - interval '1 minute',now() + interval '1 day'
+      FROM access_grants ag WHERE ag.id = $4
     `, [
       requesterDelegationId, approvalDelegationId, organizationId, approvalGrantId,
-      approverId, requesterId, delegateId,
+      approverId, requesterId, delegateId, baseCurrency,
     ]);
     await client.query(`
-      INSERT INTO payment_approval_policies (
-        id, organization_id, code, name, document_type, treasury_unit_id, method_category,
-        aggregation_window_kind, aggregation_keys, version, state
-      ) VALUES ($1,$2,$3,'INC-3B beneficiary approval','PAYMENT',$4,NULL,'BUSINESS_DATE',
-        ARRAY['BENEFICIARY']::varchar[],1,'ACTIVE'),
-        ($5,$2,$6,'INC-3C bank beneficiary approval','PAYMENT',$4,'BANK_TRANSFER','BUSINESS_DATE',
-        ARRAY['BENEFICIARY']::varchar[],1,'ACTIVE')
+      INSERT INTO approval_policies (
+        id, organization_id, code, name, document_type, organization_wide,
+        treasury_unit_id, method_category, aggregation_window_kind, aggregation_keys,
+        aggregation_override_second_approval, policy_version, state
+      ) VALUES ($1,$2,$3,'INC-3B beneficiary approval','PAYMENT',false,$4,NULL,'BUSINESS_DATE',
+        '["BENEFICIARY"]'::jsonb,true,1,'ACTIVE'),
+        ($5,$2,$6,'INC-3C bank beneficiary approval','PAYMENT',false,$4,'BANK_TRANSFER','BUSINESS_DATE',
+        '["BENEFICIARY"]'::jsonb,true,1,'ACTIVE')
     `, [
       approvalPolicyId, organizationId, `PAP-${suffix}`, treasuryUnitId,
       bankApprovalPolicyId, `PAB-${suffix}`,
     ]);
     await client.query(`
-      INSERT INTO payment_approval_policy_steps (
-        organization_id, policy_id, step_order, role_id, approvals_required, separation_rules
+      INSERT INTO approval_steps (
+        organization_id, approval_policy_id, step_order, required_role_id,
+        approvals_required, separation_rules
       ) VALUES
-        ($1,$2,1,$4,1,ARRAY['CREATOR_NOT_APPROVER','REQUESTER_NOT_APPROVER']::varchar[]),
-        ($1,$3,1,$4,1,ARRAY['CREATOR_NOT_APPROVER']::varchar[])
+        ($1,$2,1,$4,1,'["CREATOR_NOT_APPROVER","REQUESTER_NOT_APPROVER"]'::jsonb),
+        ($1,$3,1,$4,1,'["CREATOR_NOT_APPROVER"]'::jsonb)
     `, [organizationId, approvalPolicyId, bankApprovalPolicyId, approvalRoleId]);
     await client.query('COMMIT');
     return {
@@ -1301,6 +1343,9 @@ async function seed(database: DatabaseService) {
       approverId,
       requesterId,
       delegateId,
+      approverAccountId,
+      requesterAccountId,
+      delegateAccountId,
       executorId,
       reverserId,
       executorGrantId,
@@ -1353,6 +1398,9 @@ async function cleanup(
     approverId,
     requesterId,
     delegateId,
+    approverAccountId,
+    requesterAccountId,
+    delegateAccountId,
     executorId,
     reverserId,
     executorGrantId,
@@ -1579,10 +1627,10 @@ async function cleanup(
       executorBankGrantId,
       reverserBankGrantId,
     ]);
-    await client.query('DELETE FROM payment_approval_policy_steps WHERE policy_id IN ($1, $2)', [
+    await client.query('DELETE FROM approval_steps WHERE approval_policy_id IN ($1, $2)', [
       approvalPolicyId, bankApprovalPolicyId,
     ]);
-    await client.query('DELETE FROM payment_approval_policies WHERE id IN ($1, $2)', [
+    await client.query('DELETE FROM approval_policies WHERE id IN ($1, $2)', [
       approvalPolicyId, bankApprovalPolicyId,
     ]);
     await client.query('DELETE FROM role_permissions WHERE role_id IN ($1, $2, $3, $4)', [
@@ -1623,7 +1671,12 @@ async function cleanup(
       reverserAccountId,
     ]);
     await client.query('DELETE FROM auth_sessions WHERE id = $1', [reverserSessionId]);
-    await client.query('DELETE FROM identity_accounts WHERE id = $1', [reverserAccountId]);
+    await client.query('DELETE FROM identity_accounts WHERE id IN ($1, $2, $3, $4)', [
+      reverserAccountId,
+      approverAccountId,
+      requesterAccountId,
+      delegateAccountId,
+    ]);
     await client.query('DELETE FROM user_refs WHERE id IN ($1, $2, $3, $4, $5, $6)', [
       actorId,
       approverId,

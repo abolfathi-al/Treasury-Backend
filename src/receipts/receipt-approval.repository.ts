@@ -2,7 +2,12 @@ import { Injectable } from '@nestjs/common';
 import type { PoolClient } from 'pg';
 
 import { ReceiptView } from './receipt.dto';
-import { storedScopeSql } from './receipt.repository';
+import { storedAuthoritySql, storedScopeSql } from './receipt.repository';
+
+export interface ReceiptApprovalAuthority {
+  grantUserId: string;
+  delegatedFromUserId: string | null;
+}
 
 export interface ApprovalReceipt {
   id: string;
@@ -151,6 +156,42 @@ export class ReceiptApprovalRepository {
     return result.rows[0]!.allowed;
   }
 
+  async approvalAuthority(
+    client: PoolClient,
+    organizationId: string,
+    actorUserId: string,
+    receiptId: string,
+    permission: 'receipt.approve' | 'receipt.reject',
+    roleId?: string,
+    requiredApproverUserId?: string | null,
+  ): Promise<ReceiptApprovalAuthority | undefined> {
+    const parameters: Array<string> = [organizationId, actorUserId, receiptId];
+    let authorityPredicate = '';
+    if (roleId) {
+      parameters.push(roleId);
+      authorityPredicate += ` AND ag.role_id = $${parameters.length}`;
+    }
+    if (requiredApproverUserId) {
+      parameters.push(requiredApproverUserId);
+      authorityPredicate += ` AND ag.user_ref_id = $${parameters.length}`;
+    }
+    const projection = `ag.user_ref_id AS "grantUserId",
+      CASE WHEN authority.delegation_id IS NULL
+        THEN NULL ELSE ag.user_ref_id END AS "delegatedFromUserId"`;
+    const result = await client.query<ReceiptApprovalAuthority>(`
+      SELECT DISTINCT receipt_authority.*
+      FROM receipt_documents rd
+      JOIN LATERAL (
+        ${storedAuthoritySql(permission, authorityPredicate, projection)}
+      ) receipt_authority ON true
+      WHERE rd.organization_id = $1 AND rd.id = $3
+    `, parameters);
+    const direct = result.rows.find(({ delegatedFromUserId }) => delegatedFromUserId === null);
+    if (direct) return direct;
+    const grantors = new Set(result.rows.map(({ delegatedFromUserId }) => delegatedFromUserId));
+    return grantors.size === 1 ? result.rows[0] : undefined;
+  }
+
   async lines(
     client: PoolClient,
     organizationId: string,
@@ -186,16 +227,17 @@ export class ReceiptApprovalRepository {
       SELECT id, code, name, branch_id AS "branchId",
              treasury_unit_id AS "treasuryUnitId", currency,
              method_category AS "methodCategory",
-             amount_minimum::text AS "amountMinimum",
-             amount_maximum::text AS "amountMaximum", version
-      FROM receipt_approval_policies
+             minimum_base_amount::text AS "amountMinimum",
+             maximum_base_amount::text AS "amountMaximum",
+             policy_version AS version
+      FROM approval_policies
       WHERE organization_id = $1 AND document_type = 'RECEIPT' AND state = 'ACTIVE'
         AND (branch_id IS NULL OR branch_id = $2)
         AND (treasury_unit_id IS NULL OR treasury_unit_id = $3)
         AND (currency IS NULL OR currency = $4)
         AND (method_category IS NULL OR method_category = $5)
-        AND (amount_minimum IS NULL OR amount_minimum <= $6::numeric)
-        AND (amount_maximum IS NULL OR amount_maximum >= $6::numeric)
+        AND (minimum_base_amount IS NULL OR minimum_base_amount <= $6::numeric)
+        AND (maximum_base_amount IS NULL OR maximum_base_amount >= $6::numeric)
       ORDER BY id, version
       FOR SHARE
     `, [
@@ -208,16 +250,16 @@ export class ReceiptApprovalRepository {
     ]);
     if (policies.rows.length === 0) return [];
     const steps = await client.query<ApprovalPolicyStep & { policyId: string }>(`
-      SELECT s.id, s.policy_id AS "policyId", s.step_order AS "stepOrder",
-             s.role_id AS "roleId", NULL::text AS "roleName",
+      SELECT s.id, s.approval_policy_id AS "policyId", s.step_order AS "stepOrder",
+             s.required_role_id AS "roleId", NULL::text AS "roleName",
              NULL::text AS "roleState",
-             s.approver_user_id AS "approverUserId",
+             s.named_approver_id AS "approverUserId",
              NULL::text AS "approverName", NULL::text AS "approverState",
              s.approvals_required AS "approvalsRequired",
              s.separation_rules AS "separationRules"
-      FROM receipt_approval_policy_steps s
-      WHERE s.organization_id = $1 AND s.policy_id = ANY($2::uuid[])
-      ORDER BY s.policy_id, s.step_order
+      FROM approval_steps s
+      WHERE s.organization_id = $1 AND s.approval_policy_id = ANY($2::uuid[])
+      ORDER BY s.approval_policy_id, s.step_order
       FOR SHARE
     `, [organizationId, policies.rows.map(({ id }) => id)]);
     const roleIds = steps.rows.flatMap(({ roleId }) => roleId ? [roleId] : []);
@@ -376,20 +418,22 @@ export class ReceiptApprovalRepository {
     snapshotId: string,
     step: CurrentApprovalStep | undefined,
     actorUserId: string,
+    delegatedFromUserId: string | null,
     action: 'APPROVED' | 'REJECTED' | 'RETURNED',
     reason: string | undefined,
   ): Promise<void> {
     await client.query(`
       INSERT INTO receipt_approval_actions (
         organization_id, approval_snapshot_id, approval_snapshot_step_id,
-        step_order, actor_user_id, action, reason
-      ) VALUES ($1,$2,$3,$4,$5,$6,$7)
+        step_order, actor_user_id, delegated_from_user_id, action, reason
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
     `, [
       organizationId,
       snapshotId,
       step?.id ?? null,
       step?.order ?? null,
       actorUserId,
+      delegatedFromUserId,
       action,
       reason ?? null,
     ]);
