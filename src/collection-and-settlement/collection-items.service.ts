@@ -57,10 +57,11 @@ export class CollectionItemsService {
   ): Promise<CollectionItemPage> {
     const filters = this.filters(query);
     const limit = this.limit(query.limit);
+    const cursorValue = this.scalar(query.cursor, 'cursor');
     const scope = await this.repository.currentScope(organizationId, actorUserId);
     if (scope.length === 0) throw new TreasuryProblem('TRS-GEN-003', 403);
     const scopeFingerprint = commandDigest('listCollectionItems.scope', scope);
-    const cursor = query.cursor ? this.cursor(query.cursor) : undefined;
+    const cursor = cursorValue ? this.cursor(cursorValue) : undefined;
 
     if (cursor) {
       const expected = {
@@ -127,16 +128,21 @@ export class CollectionItemsService {
       ? []
       : Array.isArray(query.state) ? query.state : [query.state];
     if (
-      rawStates.some((state) => !COLLECTION_ITEM_STATES.includes(state as CollectionItemState))
+      rawStates.some(
+        (state) => typeof state !== 'string'
+          || !COLLECTION_ITEM_STATES.includes(state as CollectionItemState),
+      )
       || new Set(rawStates).size !== rawStates.length
     ) this.validation('state must contain unique supported Collection Item states.');
     const states = [...rawStates].sort() as CollectionItemState[];
 
-    const collectedAtFrom = query.collectedAtFrom
-      ? this.instant(query.collectedAtFrom, 'collectedAtFrom')
+    const rawCollectedAtFrom = this.scalar(query.collectedAtFrom, 'collectedAtFrom');
+    const rawCollectedAtTo = this.scalar(query.collectedAtTo, 'collectedAtTo');
+    const collectedAtFrom = rawCollectedAtFrom
+      ? this.instant(rawCollectedAtFrom, 'collectedAtFrom')
       : undefined;
-    const collectedAtTo = query.collectedAtTo
-      ? this.instant(query.collectedAtTo, 'collectedAtTo')
+    const collectedAtTo = rawCollectedAtTo
+      ? this.instant(rawCollectedAtTo, 'collectedAtTo')
       : undefined;
     if (
       collectedAtFrom
@@ -144,11 +150,19 @@ export class CollectionItemsService {
       && new Date(collectedAtFrom).getTime() >= new Date(collectedAtTo).getTime()
     ) this.validation('collectedAtFrom must be strictly earlier than collectedAtTo.');
 
-    const expectedSettlementDateFrom = query.expectedSettlementDateFrom
-      ? this.date(query.expectedSettlementDateFrom, 'expectedSettlementDateFrom')
+    const rawExpectedDateFrom = this.scalar(
+      query.expectedSettlementDateFrom,
+      'expectedSettlementDateFrom',
+    );
+    const rawExpectedDateTo = this.scalar(
+      query.expectedSettlementDateTo,
+      'expectedSettlementDateTo',
+    );
+    const expectedSettlementDateFrom = rawExpectedDateFrom
+      ? this.date(rawExpectedDateFrom, 'expectedSettlementDateFrom')
       : undefined;
-    const expectedSettlementDateTo = query.expectedSettlementDateTo
-      ? this.date(query.expectedSettlementDateTo, 'expectedSettlementDateTo')
+    const expectedSettlementDateTo = rawExpectedDateTo
+      ? this.date(rawExpectedDateTo, 'expectedSettlementDateTo')
       : undefined;
     if (
       expectedSettlementDateFrom
@@ -160,13 +174,16 @@ export class CollectionItemsService {
       );
     }
 
-    const destinationBankAccountId = query.destinationBankAccountId;
+    const destinationBankAccountId = this.scalar(
+      query.destinationBankAccountId,
+      'destinationBankAccountId',
+    );
     if (destinationBankAccountId && !UUID.test(destinationBankAccountId)) {
       this.validation('destinationBankAccountId is malformed.');
     }
-    const currency = query.currency?.toUpperCase();
+    const currency = this.scalar(query.currency, 'currency')?.toUpperCase();
     if (currency && !CURRENCY.test(currency)) this.validation('currency is malformed.');
-    const channelType = query.channelType;
+    const channelType = this.scalar(query.channelType, 'channelType');
     if (
       channelType
       && !COLLECTION_ITEM_CHANNEL_TYPES.includes(channelType as CollectionItemChannelType)
@@ -185,10 +202,19 @@ export class CollectionItemsService {
   }
 
   private limit(raw?: string): number {
-    if (!raw) return 50;
-    const value = Number(raw);
+    const normalized = this.scalar(raw, 'limit');
+    if (!normalized) return 50;
+    const value = Number(normalized);
     if (!Number.isInteger(value) || value < 1 || value > 500) {
       this.validation('limit must be an integer from 1 through 500.');
+    }
+    return value;
+  }
+
+  private scalar(value: unknown, field: string): string | undefined {
+    if (value === undefined) return undefined;
+    if (typeof value !== 'string' || value.length === 0) {
+      this.validation(`${field} must be provided exactly once as a string.`);
     }
     return value;
   }

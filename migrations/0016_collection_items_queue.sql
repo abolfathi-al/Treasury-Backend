@@ -74,6 +74,9 @@ END;
 $$;
 
 ALTER TABLE collection_items
+  DROP CONSTRAINT collection_items_state_check;
+
+ALTER TABLE collection_items
   ALTER COLUMN treasury_unit_id SET NOT NULL,
   ALTER COLUMN expected_settlement_date SET NOT NULL,
   ALTER COLUMN created_at SET NOT NULL,
@@ -87,17 +90,6 @@ ALTER TABLE collection_items
       channel_type IN (
         'BANK_TRANSFER', 'DIRECT_DEPOSIT', 'POS', 'GATEWAY',
         'CARD_TRANSFER', 'WALLET', 'FOREIGN_REMITTANCE', 'DEPOSITED_CHEQUE'
-      )
-    ),
-  ADD CONSTRAINT collection_items_channel_identity_check
-    CHECK (
-      (
-        channel_type IN ('POS', 'GATEWAY')
-        AND channel_id IS NOT NULL
-      )
-      OR (
-        channel_type NOT IN ('POS', 'GATEWAY')
-        AND channel_id IS NULL
       )
     ),
   ADD CONSTRAINT collection_items_state_check

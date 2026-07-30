@@ -2032,16 +2032,6 @@ export const collectionItems = pgTable('collection_items', {
     )`,
   ),
   check(
-    'collection_items_channel_identity_check',
-    sql`(
-      ${table.channelType} IN ('POS', 'GATEWAY')
-      AND ${table.channelId} IS NOT NULL
-    ) OR (
-      ${table.channelType} NOT IN ('POS', 'GATEWAY')
-      AND ${table.channelId} IS NULL
-    )`,
-  ),
-  check(
     'collection_items_state_check',
     sql`${table.state} IN (
       'OPEN', 'PARTIALLY_ALLOCATED', 'ALLOCATED', 'SETTLED',

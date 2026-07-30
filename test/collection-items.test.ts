@@ -3,7 +3,15 @@ import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
 import { TreasuryProblem } from '../src/common/problem';
-import { CollectionItemView } from '../src/collection-and-settlement/collection-items.dto';
+import {
+  CollectionEffectsRepository,
+  CollectionEffectsService,
+  CollectionItemCommand,
+} from '../src/collection-and-settlement/collection-effects.service';
+import {
+  CollectionItemQuery,
+  CollectionItemView,
+} from '../src/collection-and-settlement/collection-items.dto';
 import {
   CollectionItemsRepository,
   CollectionScopeSnapshot,
@@ -13,6 +21,7 @@ import { CollectionItemsService } from '../src/collection-and-settlement/collect
 const ORGANIZATION_ID = '00000000-0000-4000-8000-000000000001';
 const ACTOR_ID = '00000000-0000-4000-8000-000000000002';
 const ITEM_ID = '00000000-0000-4000-8000-000000000003';
+const RECEIPT_LINE_ID = '00000000-0000-4000-8000-000000000004';
 
 process.env.COMMAND_DIGEST_HMAC_KEY_BASE64 = Buffer.alloc(32, 7).toString('base64');
 
@@ -64,6 +73,72 @@ function item(): CollectionItemView {
     version: 0,
     createdAt: '2026-07-30T01:00:00.000Z',
     updatedAt: '2026-07-30T01:00:00.000Z',
+  };
+}
+
+function collectionCommand(
+  overrides: Partial<CollectionItemCommand> = {},
+): CollectionItemCommand {
+  return {
+    organizationId: ORGANIZATION_ID,
+    receiptLineId: RECEIPT_LINE_ID,
+    treasuryUnitId: '00000000-0000-4000-8000-000000000005',
+    channelType: 'BANK_TRANSFER',
+    providerReference: 'provider-1',
+    collectedPartyId: '00000000-0000-4000-8000-000000000007',
+    amount: '100',
+    currency: 'IRR',
+    destinationBankAccountId: '00000000-0000-4000-8000-000000000006',
+    collectedAt: new Date('2026-07-30T01:00:00.000Z'),
+    expectedSettlementDate: '2026-07-31',
+    ...overrides,
+  };
+}
+
+function existingCollection(command = collectionCommand()) {
+  return {
+    id: ITEM_ID,
+    organizationId: command.organizationId,
+    sourceFactType: 'RECEIPT_LINE',
+    sourceFactId: command.receiptLineId,
+    branchId: command.branchId ?? null,
+    treasuryUnitId: command.treasuryUnitId,
+    channelType: command.channelType,
+    channelId: command.channelId ?? null,
+    providerReference: command.providerReference ?? null,
+    collectedPartyId: command.collectedPartyId,
+    grossAmount: '100.00000000',
+    currency: command.currency,
+    allocatedAmount: '0.00000000',
+    remainingAmount: '100.00000000',
+    destinationBankAccountId: command.destinationBankAccountId,
+    collectedAt: command.collectedAt,
+    expectedSettlementDate: command.expectedSettlementDate,
+    state: 'OPEN',
+    version: 0,
+    createdAt: command.collectedAt,
+    updatedAt: command.collectedAt,
+  };
+}
+
+function collectionEffectsMock(options: {
+  insertedId?: string;
+  insertError?: unknown;
+  existing?: ReturnType<typeof existingCollection>;
+}) {
+  let insertedCommand: CollectionItemCommand | undefined;
+  const repository = {
+    insert: async (_transaction: unknown, command: CollectionItemCommand) => {
+      insertedCommand = command;
+      if (options.insertError) throw options.insertError;
+      return options.insertedId;
+    },
+    bySource: async () => options.existing,
+    reversibleSnapshot: async () => undefined,
+  } as unknown as CollectionEffectsRepository;
+  return {
+    service: new CollectionEffectsService(repository),
+    insertedCommand: () => insertedCommand,
   };
 }
 
@@ -166,6 +241,71 @@ test('listCollectionItems rejects invalid exact ranges and malformed filters', a
   }
 });
 
+test('listCollectionItems rejects repeated or non-string scalar query shapes', async () => {
+  const service = new CollectionItemsService(repositoryMock().repository);
+  const malformed: CollectionItemQuery[] = [
+    { collectedAtFrom: ['2026-07-30T00:00:00Z'] as unknown as string },
+    { collectedAtTo: { value: '2026-07-30T00:00:00Z' } as unknown as string },
+    { expectedSettlementDateFrom: ['2026-07-30'] as unknown as string },
+    { expectedSettlementDateTo: ['2026-07-31'] as unknown as string },
+    { destinationBankAccountId: [ITEM_ID] as unknown as string },
+    { currency: ['IRR', 'USD'] as unknown as string },
+    { channelType: ['BANK_TRANSFER'] as unknown as string },
+    { limit: ['50'] as unknown as string },
+    { cursor: ['cursor'] as unknown as string },
+    { state: [{ value: 'OPEN' }] as unknown as string[] },
+  ];
+  for (const query of malformed) {
+    await assert.rejects(
+      service.list(ORGANIZATION_ID, ACTOR_ID, query),
+      problem('TRS-GEN-001', 422),
+    );
+  }
+});
+
+test('Collection Effect creation normalizes provider references and replays exact source payload', async () => {
+  const command = collectionCommand({ providerReference: '  provider-1  ' });
+  const existingCommand = { ...command, providerReference: 'provider-1' };
+  const mock = collectionEffectsMock({ existing: existingCollection(existingCommand) });
+  const transaction = {} as Parameters<CollectionEffectsService['create']>[0];
+
+  assert.equal(await mock.service.create(transaction, command), ITEM_ID);
+  assert.equal(mock.insertedCommand()?.providerReference, 'provider-1');
+
+  const emptyReference = collectionEffectsMock({ insertedId: ITEM_ID });
+  await emptyReference.service.create(
+    transaction,
+    collectionCommand({ providerReference: '   ' }),
+  );
+  assert.equal(emptyReference.insertedCommand()?.providerReference, undefined);
+});
+
+test('Collection Effect creation rejects changed source payload and provider-scope conflicts', async () => {
+  const transaction = {} as Parameters<CollectionEffectsService['create']>[0];
+  const changedPayload = collectionEffectsMock({
+    existing: existingCollection(collectionCommand({
+      treasuryUnitId: '00000000-0000-4000-8000-000000000099',
+    })),
+  });
+  await assert.rejects(
+    changedPayload.service.create(transaction, collectionCommand()),
+    (error: unknown) => error instanceof Error
+      && error.message === 'COLLECTION_IDENTITY_CONFLICT',
+  );
+
+  const providerConflict = collectionEffectsMock({
+    insertError: {
+      code: '23505',
+      constraint: 'uq_collection_item_provider_reference',
+    },
+  });
+  await assert.rejects(
+    providerConflict.service.create(transaction, collectionCommand()),
+    (error: unknown) => error instanceof Error
+      && error.message === 'COLLECTION_IDENTITY_CONFLICT',
+  );
+});
+
 test('INC-2D migration and repository preserve tenant, money and one-grant laws', async () => {
   const [migration, repository] = await Promise.all([
     readFile('migrations/0016_collection_items_queue.sql', 'utf8'),
@@ -180,6 +320,19 @@ test('INC-2D migration and repository preserve tenant, money and one-grant laws'
   assert.match(migration, /collection_item_source_fact_consistency/u);
   assert.match(migration, /uq_collection_item_provider_reference/u);
   assert.match(migration, /expected_settlement_date SET NOT NULL/u);
+  assert.match(
+    migration,
+    /DROP CONSTRAINT collection_items_state_check;[\s\S]+ADD CONSTRAINT collection_items_state_check/u,
+  );
+  assert.doesNotMatch(migration, /collection_items_channel_identity_check/u);
   assert.match(repository, /EXISTS \(\s+SELECT 1\s+FROM access_grants AS grant/u);
   assert.doesNotMatch(repository, /\bpool\.query\b|\bclient\.query\b|\bany\b/u);
+});
+
+test('Receipt execution maps Collection provider identity conflicts to its declared 409', async () => {
+  const source = await readFile('src/receipts/receipt-execution.service.ts', 'utf8');
+  assert.match(
+    source,
+    /COLLECTION_IDENTITY_CONFLICT: \['TRS-GEN-005', 409\]/u,
+  );
 });
