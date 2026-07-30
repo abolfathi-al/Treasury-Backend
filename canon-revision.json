@@ -1,18 +1,20 @@
 {
   "repository": "Treasury-Canon",
-  "revision": "52fc4783d10589af051fac47e0d0d16aae1e805d",
+  "revision": "0f47f37a91e2be110b75ac89c26a017c545a59dc",
   "canon_root": "canon-v4",
   "authorized_delivery_slice": "SLICE-2-RECEIPT",
-  "authorized_increment": "INC-2D-COLLECTION-ITEMS",
+  "authorized_increment": "INC-2E-RECEIPT-REPORTING",
   "requirements": [
-    "REQ-COL-001",
-    "REQ-COL-002",
-    "REQ-COL-003"
+    "REQ-RPT-001",
+    "REQ-RPT-005",
+    "REQ-RPT-007"
   ],
   "acceptance_scenarios": [
-    "SCN-COL-001"
+    "SCN-RPT-004",
+    "SCN-RPT-010",
+    "SCN-RPT-011"
   ],
   "authorized_operations": [
-    "listCollectionItems"
+    "runOperationalReport"
   ]
 }
