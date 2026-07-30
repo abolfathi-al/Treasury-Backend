@@ -135,6 +135,11 @@ ALTER TABLE collection_items
     FOREIGN KEY (organization_id, collected_party_id)
     REFERENCES parties(organization_id, id);
 
+UPDATE collection_items
+   SET provider_reference = NULL
+ WHERE provider_reference IS NOT NULL
+   AND btrim(provider_reference) = '';
+
 CREATE UNIQUE INDEX uq_collection_item_provider_reference
   ON collection_items (
     organization_id,

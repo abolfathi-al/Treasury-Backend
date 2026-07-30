@@ -160,13 +160,9 @@ export class CollectionEffectsService {
       && existing.collectedPartyId === command.collectedPartyId
       && this.decimal(existing.grossAmount) === this.decimal(command.amount)
       && existing.currency === command.currency
-      && this.decimal(existing.allocatedAmount) === '0'
-      && this.decimal(existing.remainingAmount) === this.decimal(command.amount)
       && existing.destinationBankAccountId === command.destinationBankAccountId
       && existing.collectedAt.getTime() === command.collectedAt.getTime()
-      && existing.expectedSettlementDate === command.expectedSettlementDate
-      && existing.state === 'OPEN'
-      && Number(existing.version) === 0;
+      && existing.expectedSettlementDate === command.expectedSettlementDate;
   }
 
   private decimal(value: string): string {

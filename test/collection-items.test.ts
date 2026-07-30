@@ -266,7 +266,14 @@ test('listCollectionItems rejects repeated or non-string scalar query shapes', a
 test('Collection Effect creation normalizes provider references and replays exact source payload', async () => {
   const command = collectionCommand({ providerReference: '  provider-1  ' });
   const existingCommand = { ...command, providerReference: 'provider-1' };
-  const mock = collectionEffectsMock({ existing: existingCollection(existingCommand) });
+  const existing = {
+    ...existingCollection(existingCommand),
+    allocatedAmount: '40.00000000',
+    remainingAmount: '60.00000000',
+    state: 'PARTIALLY_ALLOCATED',
+    version: 3,
+  };
+  const mock = collectionEffectsMock({ existing });
   const transaction = {} as Parameters<CollectionEffectsService['create']>[0];
 
   assert.equal(await mock.service.create(transaction, command), ITEM_ID);
@@ -323,6 +330,10 @@ test('INC-2D migration and repository preserve tenant, money and one-grant laws'
   assert.match(
     migration,
     /DROP CONSTRAINT collection_items_state_check;[\s\S]+ADD CONSTRAINT collection_items_state_check/u,
+  );
+  assert.match(
+    migration,
+    /UPDATE collection_items[\s\S]+btrim\(provider_reference\) = '';[\s\S]+CREATE UNIQUE INDEX uq_collection_item_provider_reference/u,
   );
   assert.doesNotMatch(migration, /collection_items_channel_identity_check/u);
   assert.match(repository, /EXISTS \(\s+SELECT 1\s+FROM access_grants AS grant/u);
