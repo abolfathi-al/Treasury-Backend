@@ -23,6 +23,7 @@ import {
   PUBLIC_OPERATION,
   REQUIRED_PERMISSION,
   STEP_UP_REQUIRED,
+  STEP_UP_REQUEST_PROPERTY,
 } from './auth.decorators';
 import { AuthService, SessionContext } from './auth.service';
 
@@ -93,7 +94,13 @@ export class AuthGuard implements CanActivate {
       context.getHandler(),
       context.getClass(),
     ]);
-    if (stepUpOperationId) {
+    const stepUpProperty = this.reflector.getAllAndOverride<string>(
+      STEP_UP_REQUEST_PROPERTY,
+      [context.getHandler(), context.getClass()],
+    );
+    const stepUpApplies = stepUpOperationId
+      && stepUpRequiredForBody(request.body, stepUpProperty);
+    if (stepUpOperationId && stepUpApplies) {
       const idempotencyKey = request.header('Idempotency-Key');
       if (!idempotencyKey || idempotencyKey.length < 8 || idempotencyKey.length > 128) {
         throw new TreasuryProblem('TRS-GEN-001', 422, 'Idempotency-Key must contain 8 through 128 characters.');
@@ -127,6 +134,14 @@ export class AuthGuard implements CanActivate {
       throw new TreasuryProblem('TRS-AUT-009', 403);
     }
   }
+}
+
+export function stepUpRequiredForBody(body: unknown, requestProperty?: string): boolean {
+  return !requestProperty || Boolean(
+    body
+    && typeof body === 'object'
+    && requestProperty in (body as Record<string, unknown>)
+  );
 }
 
 export function operationPermissionGranted(

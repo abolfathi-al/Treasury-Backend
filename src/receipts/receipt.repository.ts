@@ -1191,6 +1191,18 @@ export class ReceiptRepository {
              jsonb_build_object('id', u.id, 'label', u.display_name) AS creator,
              jsonb_build_object('amount', rd.total_base_amount::text, 'currency', rd.base_currency)
                AS "totalBaseAmount",
+             to_char(rd.executed_at AT TIME ZONE 'UTC',
+               'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS "executedAt",
+             rd.executed_by_user_id AS "executedByUserId",
+             CASE WHEN executor.id IS NULL THEN NULL
+               ELSE jsonb_build_object('id', executor.id, 'label', executor.display_name)
+             END AS "executedBy",
+             CASE WHEN reversal.id IS NULL THEN NULL
+               ELSE jsonb_build_object('id', reversal.id, 'label', reversal.business_number)
+             END AS "reversalReceipt",
+             CASE WHEN original.id IS NULL THEN NULL
+               ELSE jsonb_build_object('id', original.id, 'label', original.business_number)
+             END AS "reversesReceipt",
              rd.state, rd.workflow_state AS "workflowState",
              rd.execution_state AS "executionState",
              rd.accounting_state AS "accountingState", rd.version::int,
@@ -1206,6 +1218,15 @@ export class ReceiptRepository {
         ON c.organization_id = rd.organization_id AND c.code = rd.base_currency
       JOIN user_refs u
         ON u.organization_id = rd.organization_id AND u.id = rd.creator_user_id
+      LEFT JOIN user_refs executor
+        ON executor.organization_id = rd.organization_id
+          AND executor.id = rd.executed_by_user_id
+      LEFT JOIN receipt_documents reversal
+        ON reversal.organization_id = rd.organization_id
+          AND reversal.id = rd.reversal_receipt_id
+      LEFT JOIN receipt_documents original
+        ON original.organization_id = rd.organization_id
+          AND original.id = rd.reverses_receipt_id
       WHERE rd.organization_id = $1 AND rd.id = ANY($2::uuid[])
     `, [organizationId, ids]);
     const lineRows = await client.query<ReceiptLineRow>(`
@@ -1253,6 +1274,14 @@ export class ReceiptRepository {
              rl.due_date::text AS "dueDate", rl.payer_name AS "payerName",
              rl.remainder_treatment AS "remainderTreatment", rl.description,
              rl.accounting_dimensions AS "accountingDimensions",
+             to_char(rl.executed_at AT TIME ZONE 'UTC',
+               'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS "executedAt",
+             rl.executed_by_user_id AS "executedByUserId",
+             CASE WHEN line_executor.id IS NULL THEN NULL
+               ELSE jsonb_build_object(
+                 'id', line_executor.id, 'label', line_executor.display_name
+               )
+             END AS "executedBy",
              rl.state, rl.version::int
       FROM receipt_lines rl
       LEFT JOIN exchange_rates er ON er.id = rl.rate_record_id
@@ -1264,6 +1293,9 @@ export class ReceiptRepository {
         ON pos.organization_id = rl.organization_id AND pos.id = rl.pos_terminal_id
       LEFT JOIN payment_gateways gw
         ON gw.organization_id = rl.organization_id AND gw.id = rl.payment_gateway_id
+      LEFT JOIN user_refs line_executor
+        ON line_executor.organization_id = rl.organization_id
+          AND line_executor.id = rl.executed_by_user_id
       WHERE rl.organization_id = $1 AND rl.receipt_document_id = ANY($2::uuid[])
       ORDER BY rl.receipt_document_id, rl.line_number
     `, [organizationId, ids]);
@@ -1295,6 +1327,41 @@ export class ReceiptRepository {
       WHERE l.organization_id = $1 AND l.receipt_line_id = ANY($2::uuid[])
       ORDER BY l.receipt_line_id, a.file_name, a.id
     `, [organizationId, lineIds])).rows;
+    const executionEffects = lineIds.length === 0 ? [] : (await client.query<{
+      lineId: string;
+      value: NonNullable<ReceiptLineView['executionEffects']>[number];
+    }>(`
+      SELECT e.receipt_line_id AS "lineId", jsonb_strip_nulls(jsonb_build_object(
+        'receiptEffectId', e.id,
+        'effectKey', e.effect_key,
+        'effectType', e.effect_type,
+        'effect', CASE
+          WHEN COALESCE(e.movement_fact_id, e.received_cheque_id, e.collection_item_id) IS NULL
+            THEN NULL
+          ELSE jsonb_build_object(
+            'id', COALESCE(e.movement_fact_id, e.received_cheque_id, e.collection_item_id),
+            'label', CASE e.effect_type
+              WHEN 'CASHBOX_MOVEMENT' THEN 'Cashbox movement'
+              WHEN 'BANK_MOVEMENT' THEN 'Bank account movement'
+              WHEN 'RECEIVED_CHEQUE' THEN 'Received cheque'
+              WHEN 'COLLECTION_ITEM' THEN 'Collection item'
+            END
+          )
+        END,
+        'chequeEventId', e.cheque_event_id,
+        'collectionItemId', e.collection_item_id,
+        'collectionItemVersion', e.collection_item_version,
+        'collectionItemState', e.collection_item_state,
+        'direction', e.direction,
+        'money', jsonb_build_object('amount', e.amount::text, 'currency', e.currency),
+        'businessDate', e.business_date::text,
+        'sourceVersion', e.source_version::int,
+        'reversalOfEffectId', e.reversal_of_effect_id
+      )) AS value
+      FROM receipt_execution_effects e
+      WHERE e.organization_id = $1 AND e.receipt_line_id = ANY($2::uuid[])
+      ORDER BY e.receipt_line_id, e.created_at, e.id
+    `, [organizationId, lineIds])).rows;
     const chequeSemantics = await this.chequeViews(client, organizationId, lineRows.rows);
     const linesByReceipt = new Map<string, ReceiptLineView[]>();
     for (const row of lineRows.rows) {
@@ -1311,6 +1378,8 @@ export class ReceiptRepository {
         allocations: allocations.filter(({ lineId }) => lineId === row.id)
           .map(({ value }) => value),
         attachments: evidence.filter(({ lineId }) => lineId === row.id)
+          .map(({ value }) => value),
+        executionEffects: executionEffects.filter(({ lineId }) => lineId === row.id)
           .map(({ value }) => value),
         cheque: chequeInput ? chequeSemantics.get(row.id) : undefined,
       }) as ReceiptLineView;
@@ -1469,7 +1538,7 @@ export class ReceiptRepository {
           }) as ReceiptApprovalSnapshotView['steps'][number];
         }),
         actions: snapshotActions,
-        state: snapshot.receiptState === 'APPROVED'
+        state: ['APPROVED', 'EXECUTED', 'REVERSED'].includes(snapshot.receiptState)
           ? 'APPROVED'
           : snapshot.receiptState === 'REJECTED'
             ? 'REJECTED'

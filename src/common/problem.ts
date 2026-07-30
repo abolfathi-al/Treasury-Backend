@@ -16,6 +16,7 @@ const titles = {
   'TRS-GEN-005': 'State conflict',
   'TRS-GEN-006': 'Stale version',
   'TRS-GEN-007': 'Idempotency key conflict',
+  'TRS-GEN-009': 'Business date closed',
   'TRS-AUT-001': 'Authentication failed',
   'TRS-AUT-002': 'TOTP required or invalid',
   'TRS-AUT-003': 'Session invalid',
@@ -35,11 +36,15 @@ const titles = {
   'TRS-CHQ-001': 'Cheque leaf unavailable',
   'TRS-CHQ-002': 'Cheque-book range overlap',
   'TRS-CHQ-003': 'Illegal cheque transition',
+  'TRS-CHQ-005': 'Possible duplicate received cheque',
   'TRS-CSH-002': 'Cashbox custody conflict',
   'TRS-RCP-001': 'Receipt total mismatch',
   'TRS-RCP-002': 'Receipt line incomplete',
   'TRS-RCP-003': 'Receipt allocation exceeds line',
+  'TRS-RCP-004': 'Receipt effect mapping unavailable',
   'TRS-RCP-005': 'Receipt approval policy unavailable',
+  'TRS-RCP-006': 'Receipt reversal blocked',
+  'TRS-ACT-005': 'Accounting posting lock active',
 } as const;
 
 export type ProblemCode = keyof typeof titles;

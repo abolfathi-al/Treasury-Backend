@@ -3,6 +3,7 @@ import {
   Controller,
   Get,
   Headers,
+  HttpCode,
   Inject,
   Param,
   Post,
@@ -13,10 +14,20 @@ import {
 } from '@nestjs/common';
 import type { Response } from 'express';
 
-import { RequirePermission } from '../access-control/auth.decorators';
+import {
+  RequirePermission,
+  RequireStepUp,
+  RequireStepUpWhenPresent,
+} from '../access-control/auth.decorators';
 import { TreasuryRequest } from '../access-control/auth.guard';
-import { ReceiptApprovalActionDto, ReceiptCreateDto } from './receipt.dto';
+import {
+  ReceiptApprovalActionDto,
+  ReceiptCreateDto,
+  ReceiptExecuteDto,
+  ReceiptReverseDto,
+} from './receipt.dto';
 import { ReceiptApprovalService } from './receipt-approval.service';
+import { ReceiptExecutionService } from './receipt-execution.service';
 import { ReceiptService } from './receipt.service';
 
 @Controller('v1')
@@ -24,6 +35,7 @@ export class ReceiptController {
   constructor(
     @Inject(ReceiptService) private readonly service: ReceiptService,
     @Inject(ReceiptApprovalService) private readonly approvalService: ReceiptApprovalService,
+    @Inject(ReceiptExecutionService) private readonly executionService: ReceiptExecutionService,
   ) {}
 
   @Get('receipts')
@@ -148,5 +160,58 @@ export class ReceiptController {
     );
     response.setHeader('ETag', `"${receipt.version}"`);
     return receipt;
+  }
+
+  @Post('receipts/:resourceId/execute')
+  @HttpCode(200)
+  @RequirePermission('receipt.execute', 'executeReceipt', 'ONE_GRANT_RESOURCE')
+  @RequireStepUpWhenPresent('executeReceipt', 'separationOverride')
+  async execute(
+    @Req() request: TreasuryRequest,
+    @Param('resourceId') resourceId: string,
+    @Headers('Idempotency-Key') key: string,
+    @Headers('If-Match') ifMatch: string,
+    @Headers('X-Request-Id') requestId: string,
+    @Body() body: ReceiptExecuteDto | undefined,
+    @Res({ passthrough: true }) response: Response,
+  ) {
+    const receipt = await this.executionService.execute({
+      organizationId: request.auth!.organizationId,
+      actorUserId: request.auth!.session.userId,
+      physicalSessionId: request.auth!.physicalSessionId,
+      receiptId: resourceId,
+      key,
+      ifMatch,
+      requestId,
+      stepUp: request.stepUp,
+    }, body);
+    response.setHeader('ETag', `"${receipt.version}"`);
+    return receipt;
+  }
+
+  @Post('receipts/:resourceId/reverse')
+  @RequirePermission('receipt.reverse', 'reverseReceipt', 'ONE_GRANT_RESOURCE')
+  @RequireStepUp('reverseReceipt')
+  async reverse(
+    @Req() request: TreasuryRequest,
+    @Param('resourceId') resourceId: string,
+    @Headers('Idempotency-Key') key: string,
+    @Headers('If-Match') ifMatch: string,
+    @Headers('X-Request-Id') requestId: string,
+    @Body() body: ReceiptReverseDto,
+    @Res({ passthrough: true }) response: Response,
+  ) {
+    const result = await this.executionService.reverse({
+      organizationId: request.auth!.organizationId,
+      actorUserId: request.auth!.session.userId,
+      physicalSessionId: request.auth!.physicalSessionId,
+      receiptId: resourceId,
+      key,
+      ifMatch,
+      requestId,
+      stepUp: request.stepUp,
+    }, body);
+    response.setHeader('ETag', `"${result.originalReceipt.version}"`);
+    return result;
   }
 }

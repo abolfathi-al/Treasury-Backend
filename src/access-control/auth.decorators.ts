@@ -5,6 +5,7 @@ export const REQUIRED_PERMISSION = 'treasury.permission';
 export const AUTHORIZATION_OPERATION = 'treasury.authorization-operation';
 export const PERMISSION_SCOPE_MODE = 'treasury.permission-scope-mode';
 export const STEP_UP_REQUIRED = 'treasury.step-up';
+export const STEP_UP_REQUEST_PROPERTY = 'treasury.step-up-request-property';
 
 export type PermissionScopeMode = 'ORGANIZATION_WIDE' | 'ONE_GRANT_RESOURCE';
 
@@ -20,3 +21,10 @@ export const RequirePermission = (
 };
 export const RequireStepUp = (operationId: string): MethodDecorator =>
   SetMetadata(STEP_UP_REQUIRED, operationId);
+export const RequireStepUpWhenPresent = (
+  operationId: string,
+  requestProperty: string,
+): MethodDecorator => (target, propertyKey, descriptor) => {
+  SetMetadata(STEP_UP_REQUIRED, operationId)(target, propertyKey, descriptor);
+  SetMetadata(STEP_UP_REQUEST_PROPERTY, requestProperty)(target, propertyKey, descriptor);
+};

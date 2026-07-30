@@ -155,6 +155,21 @@ export class ReceiptApprovalActionDto {
   @IsOptional() @IsString() @MinLength(1) @MaxLength(500) reason?: string;
 }
 
+export class ReceiptSeparationOverrideDto {
+  @IsString() @MinLength(1) @MaxLength(500) reason!: string;
+  @IsUUID() independentApprovalActionId!: string;
+}
+
+export class ReceiptExecuteDto {
+  @ValidateNested() @Type(() => ReceiptSeparationOverrideDto)
+  separationOverride!: ReceiptSeparationOverrideDto;
+}
+
+export class ReceiptReverseDto {
+  @IsString() @MinLength(1) @MaxLength(500) reason!: string;
+  @IsDateString({ strict: true }) @Matches(DATE) businessDate!: string;
+}
+
 export interface ReceiptSemanticRef {
   id: string;
   label: string;
@@ -223,8 +238,34 @@ export interface ReceiptLineView {
   description?: string;
   accountingDimensions?: ReceiptAccountingDimensionsDto;
   attachments?: ReceiptEvidenceRef[];
+  executedAt?: string;
+  executedByUserId?: string;
+  executedBy?: ReceiptSemanticRef;
+  executionEffects?: ReceiptExecutionEffectView[];
   state: 'DRAFT' | 'EXECUTED' | 'REVERSED';
   version: number;
+}
+
+export type ReceiptExecutionEffectType =
+  | 'CASHBOX_MOVEMENT'
+  | 'BANK_MOVEMENT'
+  | 'RECEIVED_CHEQUE'
+  | 'COLLECTION_ITEM';
+
+export interface ReceiptExecutionEffectView {
+  receiptEffectId: string;
+  effectKey: string;
+  effectType: ReceiptExecutionEffectType;
+  effect?: ReceiptSemanticRef;
+  chequeEventId?: string;
+  collectionItemId?: string;
+  collectionItemVersion?: number;
+  collectionItemState?: 'RETURNED' | 'REOPENED_AFTER_REVERSAL';
+  direction: 'INCOMING' | 'REVERSAL';
+  money: ReceiptPositiveMoneyDto;
+  businessDate: string;
+  sourceVersion: number;
+  reversalOfEffectId?: string;
 }
 
 export interface ReceiptApprovalPolicyContextView {
@@ -302,14 +343,50 @@ export interface ReceiptView {
   creator: ReceiptSemanticRef;
   totalBaseAmount: ReceiptPositiveMoneyDto;
   approvalSnapshot?: ReceiptApprovalSnapshotView;
+  executedAt?: string;
+  executedByUserId?: string;
+  executedBy?: ReceiptSemanticRef;
+  reversalReceipt?: ReceiptSemanticRef;
+  reversesReceipt?: ReceiptSemanticRef;
   lines: ReceiptLineView[];
-  state: 'DRAFT' | 'SUBMITTED' | 'APPROVAL_PENDING' | 'APPROVED' | 'REJECTED';
-  workflowState: 'DRAFT' | 'SUBMITTED' | 'APPROVAL_PENDING' | 'APPROVED' | 'REJECTED';
-  executionState: 'NOT_EXECUTED';
-  accountingState: 'NOT_READY';
+  state:
+    | 'DRAFT'
+    | 'SUBMITTED'
+    | 'APPROVAL_PENDING'
+    | 'APPROVED'
+    | 'REJECTED'
+    | 'EXECUTED'
+    | 'ACCOUNTING_READY'
+    | 'ACCOUNTING_POSTED'
+    | 'CANCELLED'
+    | 'REVERSED';
+  workflowState:
+    | 'DRAFT'
+    | 'SUBMITTED'
+    | 'APPROVAL_PENDING'
+    | 'APPROVED'
+    | 'REJECTED'
+    | 'CANCELLED';
+  executionState: 'NOT_EXECUTED' | 'EXECUTED' | 'REVERSED';
+  accountingState:
+    | 'NOT_READY'
+    | 'MAPPING_REQUIRED'
+    | 'READY'
+    | 'QUEUED'
+    | 'SENDING'
+    | 'SENDING_UNKNOWN'
+    | 'ACCEPTED'
+    | 'FAILED'
+    | 'RETURNED'
+    | 'CORRECTED';
   version: number;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface ReceiptReversalResult {
+  originalReceipt: ReceiptView;
+  reversalReceipt: ReceiptView;
 }
 
 export interface ReceiptPage {

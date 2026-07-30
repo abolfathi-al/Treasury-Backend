@@ -259,8 +259,8 @@ export class ReceiptApprovalService {
         || dto.action === ReceiptApprovalAction.RETURN)
       && !dto.reason?.trim()
     ) this.validation('REJECT and RETURN require a non-empty reason.');
-    if (dto.action === ReceiptApprovalAction.APPROVE && dto.reason !== undefined) {
-      this.validation('APPROVE does not accept a reason.');
+    if (dto.reason !== undefined && !dto.reason.trim()) {
+      this.validation('Approval reasons must be non-empty when supplied.');
     }
   }
 
