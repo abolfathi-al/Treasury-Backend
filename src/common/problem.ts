@@ -45,6 +45,8 @@ const titles = {
   'TRS-RCP-005': 'Receipt approval policy unavailable',
   'TRS-RCP-006': 'Receipt reversal blocked',
   'TRS-ACT-005': 'Accounting posting lock active',
+  'TRS-RPT-001': 'Unsupported report request',
+  'TRS-RPT-002': 'Projection stale',
 } as const;
 
 export type ProblemCode = keyof typeof titles;
@@ -54,6 +56,7 @@ const retryable = new Set<ProblemCode>([
   'TRS-AUT-008',
   'TRS-AUT-010',
   'TRS-CSH-002',
+  'TRS-RPT-002',
 ]);
 
 export class TreasuryProblem extends HttpException {

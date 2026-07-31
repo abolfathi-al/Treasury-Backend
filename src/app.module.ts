@@ -10,6 +10,7 @@ import { ChequeModule } from './cheques/cheque.module';
 import { DatabaseModule } from './database/database.module';
 import { MasterDataModule } from './master-data/master-data.module';
 import { ReceiptModule } from './receipts/receipt.module';
+import { ReportingModule } from './reporting/reporting.module';
 
 @Module({
   imports: [
@@ -20,6 +21,7 @@ import { ReceiptModule } from './receipts/receipt.module';
     BankingModule,
     ChequeModule,
     ReceiptModule,
+    ReportingModule,
   ],
   providers: [
     { provide: APP_FILTER, useClass: ProblemFilter },

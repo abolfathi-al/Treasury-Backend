@@ -22,6 +22,7 @@ import { CollectionItemsController } from '../src/collection-and-settlement/coll
 import { MasterDataController } from '../src/master-data/master-data.controller';
 import { PrintTemplateController } from '../src/master-data/print-template.controller';
 import { ReceiptController } from '../src/receipts/receipt.controller';
+import { ReportingController } from '../src/reporting/reporting.controller';
 
 const expectedOperations = [
   ['POST', 'v1/auth/sessions'],
@@ -79,6 +80,7 @@ const expectedOperations = [
   ['POST', 'v1/receipts/:resourceId/submit'],
   ['POST', 'v1/receipts/:resourceId/execute'],
   ['POST', 'v1/receipts/:resourceId/reverse'],
+  ['GET', 'v1/reports/:reportKey'],
 ] as const;
 
 test('all authorized operations through INC-1H are present in owner-local controllers', async () => {
@@ -94,6 +96,7 @@ test('all authorized operations through INC-1H are present in owner-local contro
     ChequeController,
     CollectionItemsController,
     ReceiptController,
+    ReportingController,
   ]) {
     const prefix = Reflect.getMetadata(PATH_METADATA, controller) as string;
     for (const name of Object.getOwnPropertyNames(controller.prototype)) {
@@ -107,6 +110,20 @@ test('all authorized operations through INC-1H are present in owner-local contro
   for (const [method, path] of expectedOperations) {
     assert.ok(operations.has(`${method} ${path}`), `${method} ${path}`);
   }
+});
+
+test('Operational reporting uses the exact one-grant permission contract', () => {
+  const handler = ReportingController.prototype.run;
+  assert.equal(Reflect.getMetadata(REQUIRED_PERMISSION, handler), 'report.view');
+  assert.equal(
+    Reflect.getMetadata(AUTHORIZATION_OPERATION, handler),
+    'runOperationalReport',
+  );
+  assert.equal(
+    Reflect.getMetadata(PERMISSION_SCOPE_MODE, handler),
+    'ONE_GRANT_RESOURCE',
+  );
+  assert.equal(Reflect.getMetadata(STEP_UP_REQUIRED, handler), undefined);
 });
 
 test('Collection Item queue uses the exact one-grant permission contract', () => {
