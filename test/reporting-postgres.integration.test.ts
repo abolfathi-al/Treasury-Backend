@@ -176,8 +176,21 @@ async function seedReportFixture(database: DatabaseService): Promise<{
       ORDER BY created_at, id
       LIMIT 1
     `);
-    const owner = organization.rows[0];
-    if (!owner) throw new Error('Singleton organization fixture is required.');
+    const owner = organization.rows[0] ?? {
+      id: randomUUID(),
+      base_currency: 'IRR',
+    };
+    if (organization.rows.length === 0) {
+      await client.query(`
+        INSERT INTO organizations (id, code, legal_name, timezone, base_currency)
+        VALUES ($1, $2, 'INC-2E QA Treasury', 'Asia/Tehran', $3)
+      `, [owner.id, `RPT-${fixtureKey}`, owner.base_currency]);
+      await client.query(`
+        INSERT INTO currencies (
+          organization_id, code, name, decimal_places, base_currency
+        ) VALUES ($1, $2, 'Iranian rial', 0, true)
+      `, [owner.id, owner.base_currency]);
+    }
     const organizationId = owner.id;
     const baseCurrency = owner.base_currency;
     await client.query(`
