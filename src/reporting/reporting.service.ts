@@ -71,8 +71,6 @@ const REPORT_STATES: Record<ReportKey, ReadonlySet<string>> = {
     'CANCELLED',
   ]),
   'issued-cheques': new Set([
-    'AVAILABLE',
-    'RESERVED',
     'ISSUED',
     'DELIVERED',
     'CLEARED',
@@ -80,6 +78,9 @@ const REPORT_STATES: Record<ReportKey, ReadonlySet<string>> = {
     'VOID',
     'LOST',
     'STOPPED',
+    'REPLACED',
+    'CLEARANCE_REVERSED',
+    'PAID_EXCEPTION',
   ]),
   'funds-in-transit': new Set(COLLECTION_ITEM_STATES),
 };
@@ -231,10 +232,6 @@ export class ReportingService {
     }
 
     const asOf = cursor?.asOf ?? new Date().toISOString();
-    const context = await this.repository.context(organizationId, filters);
-    if (!context) throw new TreasuryProblem('TRS-GEN-003', 403);
-    this.contextMatches(filters, context);
-    const businessDate = this.businessDate(asOf, context.timezone);
     const sourceWatermark = await this.repository.sourceWatermark(
       reportKey,
       organizationId,
@@ -246,6 +243,15 @@ export class ReportingService {
         'Owner facts changed after the report snapshot was selected.',
       );
     }
+    const context = await this.repository.context(
+      organizationId,
+      actorUserId,
+      scope.map(({ grantId }) => grantId),
+      filters,
+    );
+    if (!context) throw new TreasuryProblem('TRS-GEN-003', 403);
+    this.contextMatches(filters, context);
+    const businessDate = this.businessDate(asOf, context.timezone);
     const result = await this.repository.list(reportKey, {
       organizationId,
       actorUserId,
@@ -422,10 +428,20 @@ export class ReportingService {
       ...(context.currency ? { currency: context.currency } : {}),
       ...(filters.states.length > 0 ? { state: filters.states } : {}),
       ...(filters.projectRef
-        ? { project: { id: filters.projectRef, label: filters.projectRef } }
+        ? {
+          project: {
+            id: filters.projectRef,
+            label: this.referenceLabel(filters.projectRef, 'Project'),
+          },
+        }
         : {}),
       ...(filters.costCenterRef
-        ? { costCenter: { id: filters.costCenterRef, label: filters.costCenterRef } }
+        ? {
+          costCenter: {
+            id: filters.costCenterRef,
+            label: this.referenceLabel(filters.costCenterRef, 'Cost center'),
+          },
+        }
         : {}),
       ...(filters.accountingStates.length > 0
         ? { accountingState: filters.accountingStates }
@@ -503,6 +519,10 @@ export class ReportingService {
     const value = this.scalar(raw, field);
     if (value && value.length > 128) this.validation(`${field} is too long.`);
     return value;
+  }
+
+  private referenceLabel(value: string, fallback: string): string {
+    return UUID.test(value) ? fallback : value;
   }
 
   private optionalDate(raw: unknown, field: string): string | undefined {

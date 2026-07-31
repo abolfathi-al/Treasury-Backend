@@ -209,6 +209,8 @@ export class ReportingRepository {
 
   async context(
     organizationId: string,
+    actorUserId: string,
+    authorizedGrantIds: string[],
     filters: NormalizedReportFilters,
   ): Promise<ReportContext | undefined> {
     const rows = await this.database.db
@@ -260,7 +262,15 @@ export class ReportingRepository {
         ),
       })
       .from(organizations)
-      .where(eq(organizations.id, organizationId))
+      .where(and(
+        eq(organizations.id, organizationId),
+        this.filterGrantAuthorization(
+          organizationId,
+          actorUserId,
+          authorizedGrantIds,
+          filters,
+        ),
+      ))
       .limit(1);
     return rows[0];
   }
@@ -268,6 +278,7 @@ export class ReportingRepository {
   async list(reportKey: ReportKey, input: ReportListInput): Promise<ReportListResult> {
     if (reportKey === 'receipts') return this.receipts(input);
     if (reportKey === 'received-cheques') return this.receivedCheques(input);
+    if (reportKey === 'issued-cheques') return this.issuedCheques(input);
     if (reportKey === 'funds-in-transit') return this.fundsInTransit(input);
     return { items: [], keys: [], hasMore: false };
   }
@@ -277,44 +288,67 @@ export class ReportingRepository {
     organizationId: string,
   ): Promise<string> {
     const source = reportKey === 'receipts'
-      ? sql<string>`COALESCE((
-          SELECT max(concat(
-            greatest(document.updated_at, line.updated_at)::text,
-            ':',
-            document.version::text,
-            ':',
-            line.version::text
-          ))
-          FROM receipt_documents AS document
-          JOIN receipt_lines AS line
-            ON line.organization_id = document.organization_id
-           AND line.receipt_document_id = document.id
-          WHERE document.organization_id = ${organizationId}
-        ), 'none')`
+      ? this.ownerDigest(organizationId, [
+        'organizations',
+        'receipt_documents',
+        'receipt_lines',
+        'receipt_allocations',
+        'receipt_execution_effects',
+        'collection_items',
+        'branches',
+        'treasury_units',
+        'cashboxes',
+        'bank_accounts',
+        'user_refs',
+        'parties',
+        'method_definitions',
+        'currencies',
+        'pos_terminals',
+        'payment_gateways',
+      ])
       : reportKey === 'received-cheques'
-        ? sql<string>`COALESCE((
-            SELECT max(concat(
-              effect.created_at::text,
-              ':',
-              cheque.version::text
-            ))
-            FROM received_cheques AS cheque
-            JOIN receipt_execution_effects AS effect
-              ON effect.organization_id = cheque.organization_id
-             AND effect.received_cheque_id = cheque.id
-            WHERE cheque.organization_id = ${organizationId}
-          ), 'none')`
+        ? this.ownerDigest(organizationId, [
+          'organizations',
+          'received_cheques',
+          'receipt_execution_effects',
+          'receipt_documents',
+          'receipt_lines',
+          'branches',
+          'treasury_units',
+          'cashboxes',
+          'bank_accounts',
+          'banks',
+          'parties',
+          'currencies',
+          'pos_terminals',
+          'payment_gateways',
+        ])
         : reportKey === 'issued-cheques'
-          ? sql<string>`COALESCE((
-              SELECT max(concat(leaf.updated_at::text, ':', leaf.version::text))
-              FROM cheque_leaves AS leaf
-              WHERE leaf.organization_id = ${organizationId}
-            ), 'none')`
-          : sql<string>`COALESCE((
-              SELECT max(concat(item.updated_at::text, ':', item.version::text))
-              FROM collection_items AS item
-              WHERE item.organization_id = ${organizationId}
-            ), 'none')`;
+          ? this.ownerDigest(organizationId, [
+            'organizations',
+            'cheque_books',
+            'cheque_leaves',
+            'bank_accounts',
+            'banks',
+            'user_refs',
+            'currencies',
+          ])
+          : this.ownerDigest(organizationId, [
+            'organizations',
+            'collection_items',
+            'received_cheques',
+            'cheque_leaves',
+            'receipt_execution_effects',
+            'receipt_documents',
+            'receipt_lines',
+            'branches',
+            'treasury_units',
+            'bank_accounts',
+            'parties',
+            'currencies',
+            'pos_terminals',
+            'payment_gateways',
+          ]);
     const rows = await this.database.db
       .select({ source })
       .from(organizations)
@@ -345,7 +379,7 @@ export class ReportingRepository {
        AND item.id = effect.collection_item_id
       WHERE effect.organization_id = ${receiptLines.organizationId}
         AND effect.receipt_line_id = ${receiptLines.id}
-        AND effect.direction = 'CREDIT'
+        AND effect.direction = 'INCOMING'
         AND effect.created_at <= ${new Date(input.asOf)}
       ORDER BY effect.created_at DESC, effect.id DESC
       LIMIT 1
@@ -360,9 +394,9 @@ export class ReportingRepository {
         cashboxId: receiptLines.cashboxId,
         bankAccountId: effectiveBankAccountId,
         currency: receiptLines.currency,
-        baseCurrency: receiptLines.baseCurrency,
-        baseAmount: receiptLines.baseAmount,
-        methodCategory: receiptLines.methodCategory,
+        partyId: receiptDocuments.partyId,
+        projectRef: receiptDocuments.projectRef,
+        costCenterRef: receiptDocuments.costCenterRef,
       }),
     ];
     this.receiptFilters(conditions, input.filters, effectiveBankAccountId);
@@ -533,10 +567,15 @@ export class ReportingRepository {
           method: this.ref(row.methodId, row.methodLabel),
           currency: this.ref(row.currencyCode, row.currencyLabel),
           ...(row.projectRef
-            ? { project: this.ref(row.projectRef, row.projectRef) }
+            ? { project: this.ref(row.projectRef, this.referenceLabel(row.projectRef, 'Project')) }
             : {}),
           ...(row.costCenterRef
-            ? { costCenter: this.ref(row.costCenterRef, row.costCenterRef) }
+            ? {
+              costCenter: this.ref(
+                row.costCenterRef,
+                this.referenceLabel(row.costCenterRef, 'Cost center'),
+              ),
+            }
             : {}),
           documentCount: 1,
           lineCount: 1,
@@ -580,9 +619,9 @@ export class ReportingRepository {
         cashboxId: effectiveCashboxId,
         bankAccountId: effectiveBankAccountId,
         currency: receivedCheques.currency,
-        baseCurrency: receiptLines.baseCurrency,
-        baseAmount: receiptLines.baseAmount,
-        methodCategory: receiptLines.methodCategory,
+        partyId,
+        projectRef: sql<null>`NULL`,
+        costCenterRef: sql<null>`NULL`,
       }),
     ];
     this.chequeFilters(
@@ -657,7 +696,7 @@ export class ReportingRepository {
         and(
           eq(receiptExecutionEffects.organizationId, receivedCheques.organizationId),
           eq(receiptExecutionEffects.receivedChequeId, receivedCheques.id),
-          eq(receiptExecutionEffects.direction, 'CREDIT'),
+          eq(receiptExecutionEffects.direction, 'INCOMING'),
         ),
       )
       .innerJoin(
@@ -732,7 +771,12 @@ export class ReportingRepository {
         custody: this.ref(row.custodianId, row.custodyLabel),
         state: row.state,
         dueDate: row.dueDate,
-        dueStatus: this.dueStatus(row.state, row.dueDate, input.businessDate),
+        dueStatus: this.dueStatus(
+          'RECEIVED_CHEQUE',
+          row.state,
+          row.dueDate,
+          input.businessDate,
+        ),
         amount: this.money(row.amount, row.currency),
       })),
       keys: visible.map(({ businessDate, id }) => ({ businessDate, id })),
@@ -740,46 +784,64 @@ export class ReportingRepository {
     };
   }
 
+  private async issuedCheques(_input: ReportListInput): Promise<ReportListResult> {
+    // INC-2E cannot manufacture an IssuedCheque from Foundation ChequeLeaf facts.
+    // The current owner runtime has no issued-cheque/payment aggregate carrying
+    // the Canon-required party, custody, due-date, and Money facts.
+    return { items: [], keys: [], hasMore: false };
+  }
+
   private async fundsInTransit(input: ReportListInput): Promise<ReportListResult> {
+    const businessDate = sql<string>`CASE
+      WHEN ${collectionItems.sourceFactType} = 'RECEIPT_LINE'
+        THEN ${receiptDocuments.businessDate}
+      ELSE (${collectionItems.collectedAt} AT TIME ZONE ${organizations.timezone})::date
+    END`;
     const conditions = [
       eq(collectionItems.organizationId, input.organizationId),
       lte(collectionItems.createdAt, new Date(input.asOf)),
-      lte(receiptExecutionEffects.createdAt, new Date(input.asOf)),
       this.oneGrantScope(input, {
         branchId: collectionItems.branchId,
         treasuryUnitId: collectionItems.treasuryUnitId,
         cashboxId: receiptLines.cashboxId,
         bankAccountId: collectionItems.destinationBankAccountId,
         currency: collectionItems.currency,
-        baseCurrency: receiptLines.baseCurrency,
-        baseAmount: receiptLines.baseAmount,
-        methodCategory: receiptLines.methodCategory,
+        partyId: collectionItems.collectedPartyId,
+        projectRef: sql<null>`NULL`,
+        costCenterRef: sql<null>`NULL`,
       }),
     ];
-    this.fundsFilters(conditions, input.filters);
+    this.fundsFilters(conditions, input.filters, businessDate);
     if (input.after) {
       conditions.push(or(
-        lt(receiptExecutionEffects.businessDate, input.after.businessDate),
+        lt(businessDate, input.after.businessDate),
         and(
-          eq(receiptExecutionEffects.businessDate, input.after.businessDate),
+          eq(businessDate, input.after.businessDate),
           lt(collectionItems.id, input.after.id),
         ),
       )!);
     }
     const amount = input.currencyMode === 'BASE_SOURCE_SNAPSHOT'
-      ? sql<string>`round(
-          ${collectionItems.grossAmount}::numeric * ${receiptLines.exchangeRate}::numeric,
-          8
-        )::text`
+      ? sql<string>`CASE
+          WHEN ${collectionItems.sourceFactType} = 'RECEIPT_LINE' THEN round(
+            ${collectionItems.grossAmount}::numeric * ${receiptLines.exchangeRate}::numeric,
+            8
+          )::text
+          ELSE ${collectionItems.grossAmount}::text
+        END`
       : collectionItems.grossAmount;
     const currency = input.currencyMode === 'BASE_SOURCE_SNAPSHOT'
-      ? receiptLines.baseCurrency
+      ? sql<string>`CASE
+          WHEN ${collectionItems.sourceFactType} = 'RECEIPT_LINE'
+            THEN ${receiptLines.baseCurrency}
+          ELSE ${collectionItems.currency}
+        END`
       : collectionItems.currency;
 
     const rows = await this.database.db
       .select({
         id: collectionItems.id,
-        businessDate: receiptExecutionEffects.businessDate,
+        businessDate,
         organizationId: organizations.id,
         organizationLabel: organizations.legalName,
         branchId: collectionItems.branchId,
@@ -813,7 +875,30 @@ export class ReportingRepository {
           WHEN ${collectionItems.sourceFactType} = 'RECEIPT_LINE' THEN concat(
             'Receipt ', ${receiptDocuments.businessNumber}, ' · line ', ${receiptLines.lineNumber}
           )
-          ELSE concat('Cheque collection · ', ${collectionItems.id})
+          ELSE COALESCE((
+            SELECT CASE
+              WHEN event.cheque_type = 'RECEIVED' THEN COALESCE((
+                SELECT concat(
+                  'Received cheque ',
+                  CASE WHEN cheque.series IS NULL THEN '' ELSE cheque.series || ' · ' END,
+                  cheque.cheque_number
+                )
+                FROM received_cheques AS cheque
+                WHERE cheque.organization_id = ${collectionItems.organizationId}
+                  AND cheque.id = event.cheque_id
+              ), 'Received cheque')
+              WHEN event.cheque_type = 'LEAF' THEN COALESCE((
+                SELECT concat('Cheque leaf ', leaf.series, ' · ', leaf.leaf_number)
+                FROM cheque_leaves AS leaf
+                WHERE leaf.organization_id = ${collectionItems.organizationId}
+                  AND leaf.id = event.cheque_id
+              ), 'Cheque leaf')
+              WHEN event.cheque_type = 'ISSUED' THEN 'Issued cheque'
+              ELSE 'Cheque event'
+            END
+            FROM cheque_events AS event
+            WHERE event.id = ${collectionItems.sourceFactId}
+          ), 'Cheque event')
         END`,
         amount,
         currency,
@@ -821,29 +906,22 @@ export class ReportingRepository {
         state: collectionItems.state,
       })
       .from(collectionItems)
-      .innerJoin(
-        receiptExecutionEffects,
-        and(
-          eq(receiptExecutionEffects.organizationId, collectionItems.organizationId),
-          eq(receiptExecutionEffects.collectionItemId, collectionItems.id),
-          eq(receiptExecutionEffects.direction, 'CREDIT'),
-        ),
-      )
-      .innerJoin(
+      .innerJoin(organizations, eq(organizations.id, collectionItems.organizationId))
+      .leftJoin(
         receiptLines,
         and(
-          eq(receiptLines.organizationId, receiptExecutionEffects.organizationId),
-          eq(receiptLines.id, receiptExecutionEffects.receiptLineId),
+          eq(collectionItems.sourceFactType, 'RECEIPT_LINE'),
+          eq(receiptLines.organizationId, collectionItems.organizationId),
+          eq(receiptLines.id, collectionItems.sourceFactId),
         ),
       )
-      .innerJoin(
+      .leftJoin(
         receiptDocuments,
         and(
           eq(receiptDocuments.organizationId, receiptLines.organizationId),
           eq(receiptDocuments.id, receiptLines.receiptDocumentId),
         ),
       )
-      .innerJoin(organizations, eq(organizations.id, collectionItems.organizationId))
       .leftJoin(
         branches,
         and(
@@ -866,7 +944,7 @@ export class ReportingRepository {
         ),
       )
       .where(and(...conditions))
-      .orderBy(desc(receiptExecutionEffects.businessDate), desc(collectionItems.id))
+      .orderBy(desc(businessDate), desc(collectionItems.id))
       .limit(input.limit + 1);
 
     const visible = rows.slice(0, input.limit);
@@ -952,8 +1030,9 @@ export class ReportingRepository {
   private fundsFilters(
     conditions: SQLWrapper[],
     filters: NormalizedReportFilters,
+    businessDate: SQLWrapper,
   ): void {
-    this.dateFilters(conditions, filters, receiptExecutionEffects.businessDate);
+    this.dateFilters(conditions, filters, businessDate);
     if (filters.branchId) conditions.push(eq(collectionItems.branchId, filters.branchId));
     if (filters.treasuryUnitId) {
       conditions.push(eq(collectionItems.treasuryUnitId, filters.treasuryUnitId));
@@ -1016,9 +1095,9 @@ export class ReportingRepository {
       cashboxId: SQLWrapper;
       bankAccountId: SQLWrapper;
       currency: SQLWrapper;
-      baseCurrency: SQLWrapper;
-      baseAmount: SQLWrapper;
-      methodCategory: SQLWrapper;
+      partyId: SQLWrapper;
+      projectRef: SQLWrapper;
+      costCenterRef: SQLWrapper;
     },
   ) {
     const grantIds = sql.join(
@@ -1077,46 +1156,204 @@ export class ReportingRepository {
                 AND scope.bank_account_id = ${anchor.bankAccountId}
             ))
             AND (NOT EXISTS (
-              SELECT 1 FROM access_grant_document_type_scopes AS scope
-              WHERE scope.access_grant_id = access_grant.id
-            ) OR EXISTS (
-              SELECT 1 FROM access_grant_document_type_scopes AS scope
-              WHERE scope.access_grant_id = access_grant.id
-                AND scope.document_type = 'RECEIPT'
-            ))
-            AND (NOT EXISTS (
-              SELECT 1 FROM access_grant_method_category_scopes AS scope
-              WHERE scope.access_grant_id = access_grant.id
-            ) OR EXISTS (
-              SELECT 1 FROM access_grant_method_category_scopes AS scope
-              WHERE scope.access_grant_id = access_grant.id
-                AND scope.method_category = ${anchor.methodCategory}
-            ))
-            AND (NOT EXISTS (
               SELECT 1 FROM access_grant_currency_scopes AS scope
               WHERE scope.access_grant_id = access_grant.id
-            ) OR (
-              EXISTS (
-                SELECT 1 FROM access_grant_currency_scopes AS scope
-                WHERE scope.access_grant_id = access_grant.id
-                  AND scope.currency = ${anchor.currency}
-              )
-              AND EXISTS (
-                SELECT 1 FROM access_grant_currency_scopes AS scope
-                WHERE scope.access_grant_id = access_grant.id
-                  AND scope.currency = ${anchor.baseCurrency}
-              )
+            ) OR EXISTS (
+              SELECT 1 FROM access_grant_currency_scopes AS scope
+              WHERE scope.access_grant_id = access_grant.id
+                AND scope.currency = ${anchor.currency}
             ))
-            AND (
-              access_grant.amount_ceiling IS NULL
-              OR (
-                access_grant.amount_ceiling_currency = ${anchor.baseCurrency}
-                AND access_grant.amount_ceiling >= ${anchor.baseAmount}
-              )
-            )
           )
         )
     )`;
+  }
+
+  private filterGrantAuthorization(
+    organizationId: string,
+    actorUserId: string,
+    authorizedGrantIds: string[],
+    filters: NormalizedReportFilters,
+  ) {
+    const grantIds = sql.join(
+      authorizedGrantIds.map((grantId) => sql`${grantId}::uuid`),
+      sql`, `,
+    );
+    const checks: SQLWrapper[] = [];
+    if (filters.branchId) {
+      checks.push(this.grantScopeValue(
+        'access_grant_branch_scopes',
+        'branch_id',
+        filters.branchId,
+      ));
+    }
+    if (filters.treasuryUnitId) {
+      checks.push(
+        this.grantScopeValue(
+          'access_grant_treasury_unit_scopes',
+          'treasury_unit_id',
+          filters.treasuryUnitId,
+        ),
+        sql<boolean>`(
+          NOT EXISTS (
+            SELECT 1 FROM access_grant_branch_scopes AS scope
+            WHERE scope.access_grant_id = access_grant.id
+          )
+          OR EXISTS (
+            SELECT 1
+            FROM treasury_units AS owner
+            JOIN access_grant_branch_scopes AS scope
+              ON scope.branch_id = owner.branch_id
+             AND scope.access_grant_id = access_grant.id
+            WHERE owner.organization_id = ${organizationId}
+              AND owner.id = ${filters.treasuryUnitId}
+          )
+        )`,
+      );
+    }
+    if (filters.cashboxId) {
+      checks.push(
+        this.grantScopeValue(
+          'access_grant_cashbox_scopes',
+          'cashbox_id',
+          filters.cashboxId,
+        ),
+        sql<boolean>`(
+          NOT EXISTS (
+            SELECT 1 FROM access_grant_branch_scopes AS scope
+            WHERE scope.access_grant_id = access_grant.id
+          )
+          OR EXISTS (
+            SELECT 1
+            FROM cashboxes AS owner
+            JOIN access_grant_branch_scopes AS scope
+              ON scope.branch_id = owner.branch_id
+             AND scope.access_grant_id = access_grant.id
+            WHERE owner.organization_id = ${organizationId}
+              AND owner.id = ${filters.cashboxId}
+          )
+        )`,
+        sql<boolean>`(
+          NOT EXISTS (
+            SELECT 1 FROM access_grant_treasury_unit_scopes AS scope
+            WHERE scope.access_grant_id = access_grant.id
+          )
+          OR EXISTS (
+            SELECT 1
+            FROM cashboxes AS owner
+            JOIN access_grant_treasury_unit_scopes AS scope
+              ON scope.treasury_unit_id = owner.treasury_unit_id
+             AND scope.access_grant_id = access_grant.id
+            WHERE owner.organization_id = ${organizationId}
+              AND owner.id = ${filters.cashboxId}
+          )
+        )`,
+      );
+    }
+    if (filters.bankAccountId) {
+      checks.push(
+        this.grantScopeValue(
+          'access_grant_bank_account_scopes',
+          'bank_account_id',
+          filters.bankAccountId,
+        ),
+        sql<boolean>`(
+          NOT EXISTS (
+            SELECT 1 FROM access_grant_branch_scopes AS scope
+            WHERE scope.access_grant_id = access_grant.id
+          )
+          OR EXISTS (
+            SELECT 1
+            FROM bank_accounts AS owner
+            LEFT JOIN treasury_units AS unit
+              ON unit.organization_id = owner.organization_id
+             AND unit.id = owner.treasury_unit_id
+            JOIN access_grant_branch_scopes AS scope
+              ON scope.branch_id = COALESCE(owner.organization_branch_id, unit.branch_id)
+             AND scope.access_grant_id = access_grant.id
+            WHERE owner.organization_id = ${organizationId}
+              AND owner.id = ${filters.bankAccountId}
+          )
+        )`,
+        sql<boolean>`(
+          NOT EXISTS (
+            SELECT 1 FROM access_grant_treasury_unit_scopes AS scope
+            WHERE scope.access_grant_id = access_grant.id
+          )
+          OR EXISTS (
+            SELECT 1
+            FROM bank_accounts AS owner
+            JOIN access_grant_treasury_unit_scopes AS scope
+              ON scope.treasury_unit_id = owner.treasury_unit_id
+             AND scope.access_grant_id = access_grant.id
+            WHERE owner.organization_id = ${organizationId}
+              AND owner.id = ${filters.bankAccountId}
+          )
+        )`,
+      );
+    }
+    if (filters.currency) {
+      checks.push(this.grantScopeValue(
+        'access_grant_currency_scopes',
+        'currency',
+        filters.currency,
+      ));
+    }
+    const scopedChecks = checks.length > 0
+      ? sql.join(checks.map((check) => sql`(${check})`), sql` AND `)
+      : sql`TRUE`;
+    return sql<boolean>`EXISTS (
+      SELECT 1
+      FROM access_grants AS access_grant
+      JOIN roles AS role
+        ON role.id = access_grant.role_id
+       AND role.organization_id = access_grant.organization_id
+       AND role.state = 'ACTIVE'
+      JOIN role_permissions AS permission
+        ON permission.role_id = role.id
+       AND permission.permission = 'report.view'
+      WHERE access_grant.organization_id = ${organizationId}
+        AND access_grant.user_ref_id = ${actorUserId}
+        AND access_grant.id IN (${grantIds})
+        AND access_grant.state = 'ACTIVE'
+        AND access_grant.valid_from <= now()
+        AND (access_grant.valid_to IS NULL OR access_grant.valid_to > now())
+        AND (access_grant.organization_wide OR (${scopedChecks}))
+    )`;
+  }
+
+  private grantScopeValue(
+    scopeTable: string,
+    scopeColumn: string,
+    value: string,
+  ) {
+    return sql<boolean>`(
+      NOT EXISTS (
+        SELECT 1
+        FROM ${sql.raw(scopeTable)} AS scope
+        WHERE scope.access_grant_id = access_grant.id
+      )
+      OR EXISTS (
+        SELECT 1
+        FROM ${sql.raw(scopeTable)} AS scope
+        WHERE scope.access_grant_id = access_grant.id
+          AND scope.${sql.raw(scopeColumn)} = ${value}
+      )
+    )`;
+  }
+
+  private ownerDigest(organizationId: string, tableNames: string[]) {
+    const sources = tableNames.map((tableName) => {
+      const organizationColumn = tableName === 'organizations' ? 'id' : 'organization_id';
+      return sql`COALESCE((
+        SELECT string_agg(
+          to_jsonb(owner)::text,
+          '|' ORDER BY to_jsonb(owner)::text
+        )
+        FROM ${sql.raw(tableName)} AS owner
+        WHERE owner.${sql.raw(organizationColumn)} = ${organizationId}
+      ), '')`;
+    });
+    return sql<string>`md5(concat_ws('|', ${sql.join(sources, sql`, `)}))`;
   }
 
   private scopeRefs(
@@ -1151,6 +1388,13 @@ export class ReportingRepository {
     return { id, label };
   }
 
+  private referenceLabel(value: string, fallback: string): string {
+    return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu
+      .test(value)
+      ? fallback
+      : value;
+  }
+
   private money(amount: string, currency: string) {
     return { amount, currency };
   }
@@ -1169,19 +1413,15 @@ export class ReportingRepository {
   }
 
   private dueStatus(
+    kind: ChequeReportRow['kind'],
     state: string,
     dueDate: string,
     businessDate: string,
   ): ChequeReportRow['dueStatus'] {
-    if ([
-      'CLEARED',
-      'RETURNED',
-      'RETURNED_AFTER_CLEARANCE',
-      'RETURNED_TO_PARTY',
-      'ASSIGNED',
-      'LOST',
-      'CANCELLED',
-    ].includes(state)) return 'TERMINAL';
+    const terminalStates = kind === 'RECEIVED_CHEQUE'
+      ? ['RETURNED_TO_PARTY', 'ASSIGNED', 'CANCELLED']
+      : ['CLEARANCE_REVERSED', 'PAID_EXCEPTION'];
+    if (terminalStates.includes(state)) return 'TERMINAL';
     if (dueDate === businessDate) return 'DUE_TODAY';
     return dueDate < businessDate ? 'OVERDUE' : 'UPCOMING';
   }
