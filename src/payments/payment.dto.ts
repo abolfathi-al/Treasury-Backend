@@ -106,6 +106,21 @@ export class PaymentApprovalActionDto {
   @IsOptional() @IsString() @MaxLength(500) reason?: string;
 }
 
+export class PaymentSeparationOverrideDto {
+  @IsString() @MinLength(1) @MaxLength(500) reason!: string;
+  @IsUUID() independentApprovalActionId!: string;
+}
+
+export class PaymentExecuteDto {
+  @ValidateNested() @Type(() => PaymentSeparationOverrideDto)
+  separationOverride!: PaymentSeparationOverrideDto;
+}
+
+export class PaymentReverseDto {
+  @IsString() @MinLength(1) @MaxLength(500) reason!: string;
+  @IsDateString({ strict: true }) @Matches(DATE) businessDate!: string;
+}
+
 export interface PaymentSemanticRef {
   id: string;
   label: string;
@@ -240,8 +255,30 @@ export interface PaymentLineView {
   description?: string;
   accountingDimensions?: PaymentAccountingDimensionsDto;
   attachments?: PaymentEvidenceRef[];
-  state: 'DRAFT';
+  executedAt?: string;
+  executedByUserId?: string;
+  executedBy?: PaymentSemanticRef;
+  executionEffects?: PaymentExecutionEffectView[];
+  state: 'DRAFT' | 'RESERVED' | 'EXECUTED' | 'REVERSED';
   version: number;
+}
+
+export type PaymentExecutionEffectType =
+  | 'CASHBOX_MOVEMENT'
+  | 'BANK_MOVEMENT'
+  | 'BANK_INSTRUCTION'
+  | 'ISSUED_CHEQUE';
+
+export interface PaymentExecutionEffectView {
+  paymentEffectId: string;
+  effectKey: string;
+  effectType: PaymentExecutionEffectType;
+  effect: PaymentSemanticRef;
+  direction: 'OUTGOING' | 'REVERSAL';
+  money: PaymentPositiveMoneyDto;
+  businessDate: string;
+  sourceVersion: number;
+  reversalOfEffectId?: string;
 }
 
 export interface PaymentView {
@@ -267,10 +304,15 @@ export interface PaymentView {
   totalBaseAmount: PaymentPositiveMoneyDto;
   lines: PaymentLineView[];
   approvalSnapshot?: PaymentApprovalSnapshotView;
-  state: 'DRAFT' | 'SUBMITTED' | 'APPROVAL_PENDING' | 'APPROVED' | 'REJECTED';
-  workflowState: 'DRAFT' | 'SUBMITTED' | 'APPROVAL_PENDING' | 'APPROVED' | 'REJECTED';
-  executionState: 'NOT_EXECUTED';
-  accountingState: 'NOT_READY';
+  reversedPaymentId?: string;
+  reversedPayment?: PaymentSemanticRef;
+  state: 'DRAFT' | 'SUBMITTED' | 'APPROVAL_PENDING' | 'APPROVED' | 'REJECTED'
+    | 'SCHEDULED' | 'EXECUTED' | 'ACCOUNTING_READY' | 'ACCOUNTING_POSTED'
+    | 'CANCELLED' | 'REVERSED';
+  workflowState: 'DRAFT' | 'SUBMITTED' | 'APPROVAL_PENDING' | 'APPROVED' | 'REJECTED' | 'CANCELLED';
+  executionState: 'NOT_EXECUTED' | 'SCHEDULED' | 'EXECUTED' | 'REVERSED';
+  accountingState: 'NOT_READY' | 'MAPPING_REQUIRED' | 'READY' | 'QUEUED' | 'SENDING'
+    | 'SENDING_UNKNOWN' | 'ACCEPTED' | 'FAILED' | 'RETURNED' | 'CORRECTED';
   version: number;
   createdAt: string;
   updatedAt: string;
@@ -279,4 +321,9 @@ export interface PaymentView {
 export interface PaymentPage {
   items: PaymentView[];
   page: { limit: number; hasMore: boolean; nextCursor?: string; asOf: string };
+}
+
+export interface PaymentReversalResult {
+  original: PaymentView;
+  reversal: PaymentView;
 }

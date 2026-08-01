@@ -52,6 +52,8 @@ const titles = {
   'TRS-PAY-006': 'External obligation allocation conflict',
   'TRS-PAY-007': 'Approval aggregate stale',
   'TRS-PAY-008': 'Payment approval policy unresolved',
+  'TRS-PAY-009': 'Payment reversal blocked',
+  'TRS-BNK-005': 'Bank instruction outcome conflict',
   'TRS-ACT-005': 'Accounting posting lock active',
   'TRS-RPT-001': 'Unsupported report request',
   'TRS-RPT-002': 'Projection stale',

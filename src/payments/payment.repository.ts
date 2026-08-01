@@ -14,6 +14,7 @@ import { type DatabaseTransaction } from '../database/database.service';
 import {
   attachments,
   bankAccounts,
+  bankInstructions,
   branches,
   cashboxCurrencyControls,
   cashboxes,
@@ -28,6 +29,7 @@ import {
   organizations,
   parties,
   paymentDocuments,
+  paymentExecutionEffects,
   paymentLineAttachmentLinks,
   paymentLines,
   paymentRequestAttachmentLinks,
@@ -722,6 +724,37 @@ export class PaymentRepository {
         inArray(paymentLines.paymentDocumentId, ids),
       )).orderBy(asc(paymentLines.lineNumber));
     const evidence = await this.lineEvidence(transaction, organizationId, lineRows.map(({ line }) => line.id));
+    const executorIds = [...new Set(lineRows.flatMap(({ line }) =>
+      line.executedByUserId ? [line.executedByUserId] : []))];
+    const executors = executorIds.length
+      ? await transaction.select({ id: userRefs.id, label: userRefs.displayName })
+        .from(userRefs).where(and(
+          eq(userRefs.organizationId, organizationId),
+          inArray(userRefs.id, executorIds),
+        ))
+      : [];
+    const lineIds = lineRows.map(({ line }) => line.id);
+    const effectRows = lineIds.length
+      ? await transaction.select({
+        effect: paymentExecutionEffects,
+        instructionReference: bankInstructions.localReference,
+      }).from(paymentExecutionEffects).leftJoin(bankInstructions, and(
+        eq(bankInstructions.organizationId, paymentExecutionEffects.organizationId),
+        eq(bankInstructions.id, paymentExecutionEffects.bankInstructionId),
+      )).where(and(
+        eq(paymentExecutionEffects.organizationId, organizationId),
+        inArray(paymentExecutionEffects.paymentLineId, lineIds),
+      ))
+      : [];
+    const reversalIds = [...new Set(headers.flatMap(({ payment }) =>
+      payment.reversedPaymentId ? [payment.reversedPaymentId] : []))];
+    const reversalRows = reversalIds.length
+      ? await transaction.select({ id: paymentDocuments.id, label: paymentDocuments.businessNumber })
+        .from(paymentDocuments).where(and(
+          eq(paymentDocuments.organizationId, organizationId),
+          inArray(paymentDocuments.id, reversalIds),
+        ))
+      : [];
 
     const byId = new Map(headers.map((row) => [row.payment.id, row]));
     return ids.flatMap((id) => {
@@ -730,7 +763,16 @@ export class PaymentRepository {
       const lines = lineRows
         .filter(({ line }) => line.paymentDocumentId === id)
         .map(({ line, beneficiaryLabel, cashboxLabel, accountLabel, rateLabel }) =>
-          this.lineView(line, beneficiaryLabel, cashboxLabel, accountLabel, rateLabel, evidence));
+          this.lineView(
+            line,
+            beneficiaryLabel,
+            cashboxLabel,
+            accountLabel,
+            rateLabel,
+            evidence,
+            executors.find(({ id: executorId }) => executorId === line.executedByUserId)?.label,
+            effectRows.filter(({ effect }) => effect.paymentLineId === line.id),
+          ));
       return [compact({
         id: row.payment.id,
         organizationId: row.payment.organizationId,
@@ -757,6 +799,10 @@ export class PaymentRepository {
         creator: { id: row.payment.creatorUserId, label: row.creatorLabel },
         totalBaseAmount: { amount: row.payment.totalBaseAmount, currency: row.payment.baseCurrency },
         lines,
+        reversedPaymentId: row.payment.reversedPaymentId ?? undefined,
+        reversedPayment: row.payment.reversedPaymentId
+          ? reversalRows.find(({ id: reversalId }) => reversalId === row.payment.reversedPaymentId)
+          : undefined,
         state: row.payment.state,
         workflowState: row.payment.workflowState,
         executionState: row.payment.executionState,
@@ -850,6 +896,11 @@ export class PaymentRepository {
     accountLabel: string | null,
     rateLabel: string | null,
     evidence: Array<PaymentEvidenceRef & { paymentLineId: string }>,
+    executorLabel: string | undefined,
+    effects: Array<{
+      effect: InferSelectModel<typeof paymentExecutionEffects>;
+      instructionReference: string | null;
+    }>,
   ): PaymentLineView {
     const attachmentsForLine = evidence
       .filter(({ paymentLineId }) => paymentLineId === line.id)
@@ -888,10 +939,42 @@ export class PaymentRepository {
       description: line.description ?? undefined,
       accountingDimensions: line.accountingDimensions ?? undefined,
       attachments: attachmentsForLine.length ? attachmentsForLine : undefined,
-      state: 'DRAFT',
+      executedAt: line.executedAt?.toISOString(),
+      executedByUserId: line.executedByUserId ?? undefined,
+      executedBy: line.executedByUserId
+        ? { id: line.executedByUserId, label: executorLabel! }
+        : undefined,
+      executionEffects: effects.length ? effects.map(({ effect, instructionReference }) => ({
+        paymentEffectId: effect.id,
+        effectKey: effect.effectKey,
+        effectType: effect.effectType,
+        effect: {
+          id: effect.movementFactId ?? effect.bankInstructionId ?? effect.issuedChequeId!,
+          label: instructionReference ?? effectLabel(effect.effectType, effect.direction),
+        },
+        direction: effect.direction,
+        money: { amount: effect.amount, currency: effect.currency },
+        businessDate: effect.businessDate,
+        sourceVersion: effect.sourceVersion,
+        ...(effect.reversalOfEffectId
+          ? { reversalOfEffectId: effect.reversalOfEffectId }
+          : {}),
+      })) : undefined,
+      state: line.state,
       version: line.version,
     }) as PaymentLineView;
   }
+}
+
+function effectLabel(type: string, direction: string): string {
+  const label = type === 'CASHBOX_MOVEMENT'
+    ? 'Cashbox movement'
+    : type === 'BANK_MOVEMENT'
+      ? 'Bank account movement'
+      : type === 'ISSUED_CHEQUE'
+        ? 'Issued cheque'
+        : 'Bank instruction';
+  return direction === 'REVERSAL' ? `${label} reversal` : label;
 }
 
 function compact<T extends Record<string, unknown>>(value: T): T {

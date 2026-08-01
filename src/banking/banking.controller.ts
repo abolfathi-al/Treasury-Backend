@@ -3,27 +3,66 @@ import {
   Controller,
   Get,
   Headers,
+  HttpCode,
   Inject,
+  Param,
   Post,
   Query,
   Req,
+  Res,
 } from '@nestjs/common';
+import type { Response } from 'express';
 
 import { RequirePermission } from '../access-control/auth.decorators';
 import { TreasuryRequest } from '../access-control/auth.guard';
 import {
   BankAccountCreateDto,
+  BankInstructionOutcomeDto,
   BankBranchCreateDto,
   BankCreateDto,
   BankTypeCreateDto,
   PaymentGatewayCreateDto,
   PosTerminalCreateDto,
 } from './banking.dto';
+import { BankInstructionOutcomeService } from './bank-instruction-outcome.service';
 import { BankingService } from './banking.service';
 
 @Controller('v1')
 export class BankingController {
-  constructor(@Inject(BankingService) private readonly service: BankingService) {}
+  constructor(
+    @Inject(BankingService) private readonly service: BankingService,
+    @Inject(BankInstructionOutcomeService)
+    private readonly instructionOutcomes: BankInstructionOutcomeService,
+  ) {}
+
+  @Post('bank-instructions/:resourceId/outcomes')
+  @HttpCode(200)
+  @RequirePermission(
+    'bank-instruction.record-outcome',
+    'recordBankInstructionOutcome',
+    'ONE_GRANT_RESOURCE',
+  )
+  async recordInstructionOutcome(
+    @Req() request: TreasuryRequest,
+    @Param('resourceId') resourceId: string,
+    @Headers('Idempotency-Key') key: string,
+    @Headers('If-Match') ifMatch: string,
+    @Headers('X-Request-Id') requestId: string,
+    @Body() body: BankInstructionOutcomeDto,
+    @Res({ passthrough: true }) response: Response,
+  ) {
+    const instruction = await this.instructionOutcomes.record(
+      request.auth!.organizationId,
+      request.auth!.session.userId,
+      resourceId,
+      key,
+      ifMatch,
+      requestId,
+      body,
+    );
+    response.setHeader('ETag', `"${instruction.version}"`);
+    return instruction;
+  }
 
   @Get('bank-types')
   @RequirePermission('bank-type.view', 'listBankTypes', 'ORGANIZATION_WIDE')

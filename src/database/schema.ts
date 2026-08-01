@@ -2252,6 +2252,9 @@ export const paymentDocuments = pgTable('payment_documents', {
   purpose: varchar('purpose', { length: 1000 }).notNull(),
   creatorUserId: uuid('creator_user_id').notNull(),
   currentApprovalSnapshotId: uuid('current_approval_snapshot_id'),
+  reversedPaymentId: uuid('reversed_payment_id'),
+  executedAt: timestamp('executed_at', { withTimezone: true }),
+  executedByUserId: uuid('executed_by_user_id'),
   state: varchar('state', { length: 32 }).notNull().default('DRAFT'),
   workflowState: varchar('workflow_state', { length: 24 }).notNull().default('DRAFT'),
   executionState: varchar('execution_state', { length: 24 }).notNull().default('NOT_EXECUTED'),
@@ -2293,23 +2296,43 @@ export const paymentDocuments = pgTable('payment_documents', {
     foreignColumns: [userRefs.organizationId, userRefs.id],
     name: 'payment_documents_creator_fk',
   }),
+  foreignKey({
+    columns: [table.organizationId, table.reversedPaymentId],
+    foreignColumns: [table.organizationId, table.id],
+    name: 'payment_documents_reversal_fk',
+  }),
+  foreignKey({
+    columns: [table.organizationId, table.executedByUserId],
+    foreignColumns: [userRefs.organizationId, userRefs.id],
+    name: 'payment_documents_executor_fk',
+  }),
   check('payment_documents_total_positive', sql`${table.totalBaseAmount} > 0`),
   check(
     'payment_documents_state_check',
-    sql`${table.state} IN ('DRAFT', 'SUBMITTED', 'APPROVAL_PENDING', 'APPROVED', 'REJECTED')`,
+    sql`${table.state} IN ('DRAFT', 'SUBMITTED', 'APPROVAL_PENDING', 'APPROVED', 'REJECTED', 'SCHEDULED', 'EXECUTED', 'ACCOUNTING_READY', 'ACCOUNTING_POSTED', 'CANCELLED', 'REVERSED')`,
   ),
   check(
     'payment_documents_workflow_state_check',
-    sql`${table.workflowState} IN ('DRAFT', 'SUBMITTED', 'APPROVAL_PENDING', 'APPROVED', 'REJECTED')`,
+    sql`${table.workflowState} IN ('DRAFT', 'SUBMITTED', 'APPROVAL_PENDING', 'APPROVED', 'REJECTED', 'CANCELLED')`,
   ),
-  check('payment_documents_workflow_matches_state', sql`${table.workflowState} = ${table.state}`),
+  check(
+    'payment_documents_workflow_matches_state',
+    sql`(${table.state} IN ('DRAFT', 'SUBMITTED', 'APPROVAL_PENDING', 'APPROVED', 'REJECTED') AND ${table.workflowState} = ${table.state})
+      OR (${table.state} NOT IN ('DRAFT', 'SUBMITTED', 'APPROVAL_PENDING', 'APPROVED', 'REJECTED') AND ${table.workflowState} = 'APPROVED')`,
+  ),
   check(
     'payment_documents_snapshot_state_check',
     sql`(${table.state} = 'DRAFT' AND ${table.currentApprovalSnapshotId} IS NULL)
-      OR (${table.state} <> 'DRAFT' AND ${table.currentApprovalSnapshotId} IS NOT NULL)`,
+      OR (${table.state} IN ('SUBMITTED', 'APPROVAL_PENDING', 'APPROVED', 'REJECTED', 'SCHEDULED') AND ${table.currentApprovalSnapshotId} IS NOT NULL)
+      OR (${table.state} IN ('EXECUTED', 'ACCOUNTING_READY', 'ACCOUNTING_POSTED', 'CANCELLED', 'REVERSED'))`,
   ),
-  check('payment_documents_execution_state_check', sql`${table.executionState} = 'NOT_EXECUTED'`),
-  check('payment_documents_accounting_state_check', sql`${table.accountingState} = 'NOT_READY'`),
+  check('payment_documents_execution_state_check', sql`${table.executionState} IN ('NOT_EXECUTED', 'SCHEDULED', 'EXECUTED', 'REVERSED')`),
+  check('payment_documents_accounting_state_check', sql`${table.accountingState} IN ('NOT_READY', 'MAPPING_REQUIRED', 'READY', 'QUEUED', 'SENDING', 'SENDING_UNKNOWN', 'ACCEPTED', 'FAILED', 'RETURNED', 'CORRECTED')`),
+  check(
+    'payment_documents_execution_evidence_check',
+    sql`(${table.executionState} IN ('EXECUTED', 'REVERSED') AND ${table.executedAt} IS NOT NULL AND ${table.executedByUserId} IS NOT NULL)
+      OR (${table.executionState} NOT IN ('EXECUTED', 'REVERSED') AND ${table.executedAt} IS NULL AND ${table.executedByUserId} IS NULL)`,
+  ),
   check('payment_documents_version_nonnegative', sql`${table.version} >= 0`),
   index('payment_documents_list_idx').on(
     table.organizationId,
@@ -2572,6 +2595,8 @@ export const paymentLines = pgTable('payment_lines', {
   dueDate: date('due_date'),
   description: varchar('description', { length: 1000 }),
   accountingDimensions: jsonb('accounting_dimensions').$type<Record<string, string>>(),
+  executedAt: timestamp('executed_at', { withTimezone: true }),
+  executedByUserId: uuid('executed_by_user_id'),
   state: varchar('state', { length: 16 }).notNull().default('DRAFT'),
   version: bigint('version', { mode: 'number' }).notNull().default(0),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
@@ -2609,12 +2634,22 @@ export const paymentLines = pgTable('payment_lines', {
     foreignColumns: [currencies.organizationId, currencies.code],
     name: 'payment_lines_currency_fk',
   }),
+  foreignKey({
+    columns: [table.organizationId, table.executedByUserId],
+    foreignColumns: [userRefs.organizationId, userRefs.id],
+    name: 'payment_lines_executor_fk',
+  }),
   check('payment_lines_line_number_positive', sql`${table.lineNumber} > 0`),
   check('payment_lines_required_references_array', sql`jsonb_typeof(${table.methodRequiredReferences}) = 'array'`),
   check('payment_lines_amount_positive', sql`${table.amount} > 0`),
   check('payment_lines_exchange_rate_positive', sql`${table.exchangeRate} > 0`),
   check('payment_lines_base_amount_positive', sql`${table.baseAmount} > 0`),
-  check('payment_lines_state_check', sql`${table.state} = 'DRAFT'`),
+  check('payment_lines_state_check', sql`${table.state} IN ('DRAFT', 'RESERVED', 'EXECUTED', 'REVERSED')`),
+  check(
+    'payment_lines_execution_evidence_check',
+    sql`(${table.state} IN ('EXECUTED', 'REVERSED') AND ${table.executedAt} IS NOT NULL AND ${table.executedByUserId} IS NOT NULL)
+      OR (${table.state} IN ('DRAFT', 'RESERVED') AND ${table.executedAt} IS NULL AND ${table.executedByUserId} IS NULL)`,
+  ),
   check('payment_lines_version_nonnegative', sql`${table.version} >= 0`),
   check('payment_lines_rate_shape', sql`(
     ${table.rateSource} = 'IDENTITY'
@@ -2627,6 +2662,283 @@ export const paymentLines = pgTable('payment_lines', {
     AND ${table.currency} <> ${table.baseCurrency}
     AND ${table.rateRecordId} IS NOT NULL
   )`),
+]);
+
+export const paymentAllocations = pgTable('payment_allocations', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  organizationId: uuid('organization_id').notNull().references(() => organizations.id),
+  paymentDocumentId: uuid('payment_document_id').notNull(),
+  sourceNamespace: varchar('source_namespace', { length: 128 }).notNull(),
+  externalObjectType: varchar('external_object_type', { length: 32 }).notNull(),
+  externalObjectId: varchar('external_object_id', { length: 128 }).notNull(),
+  allocatedAmount: numeric('allocated_amount', { precision: 38, scale: 8 }).notNull(),
+  currency: varchar('currency', { length: 8 }).notNull(),
+  knownObligationTotal: numeric('known_obligation_total', { precision: 38, scale: 8 }),
+  duplicateOverrideReason: varchar('duplicate_override_reason', { length: 500 }),
+  overrideApprovalActionId: uuid('override_approval_action_id'),
+  state: varchar('state', { length: 16 }).notNull(),
+  version: bigint('version', { mode: 'number' }).notNull().default(0),
+}, (table) => [
+  unique().on(table.organizationId, table.id),
+  unique().on(
+    table.organizationId,
+    table.paymentDocumentId,
+    table.sourceNamespace,
+    table.externalObjectType,
+    table.externalObjectId,
+  ),
+  foreignKey({
+    columns: [table.organizationId, table.paymentDocumentId],
+    foreignColumns: [paymentDocuments.organizationId, paymentDocuments.id],
+    name: 'payment_allocations_document_fk',
+  }),
+  foreignKey({
+    columns: [table.organizationId, table.overrideApprovalActionId],
+    foreignColumns: [paymentApprovalActions.organizationId, paymentApprovalActions.id],
+    name: 'payment_allocations_override_action_fk',
+  }),
+  check('payment_allocations_external_type_check', sql`${table.externalObjectType} IN ('INVOICE', 'DEBT', 'CONTRACT_ITEM', 'OTHER_PAYABLE')`),
+  check('payment_allocations_amount_positive', sql`${table.allocatedAmount} > 0`),
+  check('payment_allocations_known_total_positive', sql`${table.knownObligationTotal} IS NULL OR ${table.knownObligationTotal} > 0`),
+  check('payment_allocations_not_over_known_total', sql`${table.knownObligationTotal} IS NULL OR ${table.allocatedAmount} <= ${table.knownObligationTotal}`),
+  check('payment_allocations_override_pair', sql`(${table.duplicateOverrideReason} IS NULL) = (${table.overrideApprovalActionId} IS NULL)`),
+  check('payment_allocations_state_check', sql`${table.state} IN ('ACTIVE', 'REVERSED')`),
+  check('payment_allocations_version_nonnegative', sql`${table.version} >= 0`),
+  index('payment_allocations_obligation_idx').on(
+    table.organizationId,
+    table.sourceNamespace,
+    table.externalObjectType,
+    table.externalObjectId,
+    table.currency,
+    table.state,
+  ),
+]);
+
+export const paymentReservations = pgTable('payment_reservations', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  organizationId: uuid('organization_id').notNull().references(() => organizations.id),
+  paymentDocumentId: uuid('payment_document_id').notNull(),
+  sourceType: varchar('source_type', { length: 16 }).notNull(),
+  sourceId: uuid('source_id').notNull(),
+  amount: numeric('amount', { precision: 38, scale: 8 }).notNull(),
+  currency: varchar('currency', { length: 8 }).notNull(),
+  reviewDueAt: timestamp('review_due_at', { withTimezone: true }).notNull(),
+  reviewedAt: timestamp('reviewed_at', { withTimezone: true }),
+  releaseReason: varchar('release_reason', { length: 500 }),
+  state: varchar('state', { length: 24 }).notNull(),
+  version: bigint('version', { mode: 'number' }).notNull().default(0),
+}, (table) => [
+  unique().on(table.organizationId, table.id),
+  unique().on(
+    table.organizationId,
+    table.paymentDocumentId,
+    table.sourceType,
+    table.sourceId,
+    table.currency,
+  ),
+  foreignKey({
+    columns: [table.organizationId, table.paymentDocumentId],
+    foreignColumns: [paymentDocuments.organizationId, paymentDocuments.id],
+    name: 'payment_reservations_document_fk',
+  }),
+  check('payment_reservations_source_type_check', sql`${table.sourceType} IN ('CASHBOX', 'BANK_ACCOUNT')`),
+  check('payment_reservations_amount_positive', sql`${table.amount} > 0`),
+  check('payment_reservations_state_check', sql`${table.state} IN ('ACTIVE', 'REVIEW_REQUIRED', 'CONSUMED', 'RELEASED')`),
+  check('payment_reservations_version_nonnegative', sql`${table.version} >= 0`),
+  index('payment_reservations_source_idx').on(
+    table.organizationId,
+    table.sourceType,
+    table.sourceId,
+    table.currency,
+    table.state,
+    table.reviewDueAt,
+  ),
+]);
+
+export const bankInstructions = pgTable('bank_instructions', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  organizationId: uuid('organization_id').notNull().references(() => organizations.id),
+  paymentLineId: uuid('payment_line_id').notNull(),
+  bankAccountId: uuid('bank_account_id').notNull(),
+  amount: numeric('amount', { precision: 38, scale: 8 }).notNull(),
+  currency: varchar('currency', { length: 8 }).notNull(),
+  beneficiaryAccountReference: varchar('beneficiary_account_reference', { length: 128 }).notNull(),
+  localReference: varchar('local_reference', { length: 128 }).notNull(),
+  statementLineId: uuid('statement_line_id'),
+  correctionPaymentId: uuid('correction_payment_id'),
+  outcomeReason: varchar('outcome_reason', { length: 500 }),
+  outcomeEvidence: jsonb('outcome_evidence').$type<Record<string, unknown>>(),
+  state: varchar('state', { length: 24 }).notNull().default('PENDING_CONFIRMATION'),
+  version: bigint('version', { mode: 'number' }).notNull().default(0),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  unique().on(table.organizationId, table.id),
+  unique().on(table.organizationId, table.paymentLineId),
+  unique().on(table.organizationId, table.bankAccountId, table.localReference),
+  foreignKey({
+    columns: [table.organizationId, table.paymentLineId],
+    foreignColumns: [paymentLines.organizationId, paymentLines.id],
+    name: 'bank_instructions_payment_line_fk',
+  }),
+  foreignKey({
+    columns: [table.organizationId, table.bankAccountId],
+    foreignColumns: [bankAccounts.organizationId, bankAccounts.id],
+    name: 'bank_instructions_bank_account_fk',
+  }),
+  foreignKey({
+    columns: [table.organizationId, table.correctionPaymentId],
+    foreignColumns: [paymentDocuments.organizationId, paymentDocuments.id],
+    name: 'bank_instructions_correction_payment_fk',
+  }),
+  check('bank_instructions_amount_positive', sql`${table.amount} > 0`),
+  check('bank_instructions_state_check', sql`${table.state} IN ('PENDING_CONFIRMATION', 'CONFIRMED', 'REJECTED', 'CANCELLED', 'RETURNED')`),
+  check('bank_instructions_version_nonnegative', sql`${table.version} >= 0`),
+  check(
+    'bank_instructions_outcome_shape',
+    sql`(${table.state} = 'PENDING_CONFIRMATION'
+      AND ${table.statementLineId} IS NULL
+      AND ${table.correctionPaymentId} IS NULL
+      AND ${table.outcomeReason} IS NULL
+      AND ${table.outcomeEvidence} IS NULL)
+      OR (${table.state} <> 'PENDING_CONFIRMATION'
+        AND ${table.outcomeEvidence} IS NOT NULL
+        AND jsonb_typeof(${table.outcomeEvidence}) = 'object')`,
+  ),
+  index('bank_instructions_account_idx').on(
+    table.organizationId,
+    table.bankAccountId,
+    table.state,
+    table.createdAt,
+  ),
+]);
+
+export const bankInstructionOutcomeEvents = pgTable('bank_instruction_outcome_events', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  organizationId: uuid('organization_id').notNull().references(() => organizations.id),
+  bankInstructionId: uuid('bank_instruction_id').notNull(),
+  sequenceNo: bigint('sequence_no', { mode: 'number' }).notNull(),
+  outcome: varchar('outcome', { length: 24 }).notNull(),
+  effectiveAt: timestamp('effective_at', { withTimezone: true }).notNull(),
+  actorUserId: uuid('actor_user_id').notNull(),
+  statementLineId: uuid('statement_line_id'),
+  correctionPaymentId: uuid('correction_payment_id'),
+  reason: varchar('reason', { length: 500 }),
+  evidence: jsonb('evidence').$type<Record<string, unknown>>().notNull(),
+  sourceVersion: bigint('source_version', { mode: 'number' }).notNull(),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  unique().on(table.organizationId, table.id),
+  unique().on(table.organizationId, table.bankInstructionId, table.sequenceNo),
+  foreignKey({
+    columns: [table.organizationId, table.bankInstructionId],
+    foreignColumns: [bankInstructions.organizationId, bankInstructions.id],
+    name: 'bank_instruction_outcomes_instruction_fk',
+  }),
+  foreignKey({
+    columns: [table.organizationId, table.correctionPaymentId],
+    foreignColumns: [paymentDocuments.organizationId, paymentDocuments.id],
+    name: 'bank_instruction_outcomes_correction_payment_fk',
+  }),
+  foreignKey({
+    columns: [table.organizationId, table.actorUserId],
+    foreignColumns: [userRefs.organizationId, userRefs.id],
+    name: 'bank_instruction_outcomes_actor_fk',
+  }),
+  check('bank_instruction_outcomes_sequence_positive', sql`${table.sequenceNo} > 0`),
+  check('bank_instruction_outcomes_outcome_check', sql`${table.outcome} IN ('CONFIRMED', 'REJECTED', 'CANCELLED', 'RETURNED')`),
+  check('bank_instruction_outcomes_source_version', sql`${table.sourceVersion} > 0 AND ${table.sourceVersion} = ${table.sequenceNo}`),
+  check('bank_instruction_outcomes_evidence', sql`jsonb_typeof(${table.evidence}) = 'object' AND ${table.evidence} <> '{}'::jsonb`),
+  check(
+    'bank_instruction_outcomes_shape',
+    sql`(${table.outcome} = 'CONFIRMED' AND ${table.correctionPaymentId} IS NULL AND ${table.reason} IS NULL)
+      OR (${table.outcome} IN ('REJECTED', 'CANCELLED', 'RETURNED')
+        AND ${table.correctionPaymentId} IS NOT NULL
+        AND NULLIF(BTRIM(${table.reason}), '') IS NOT NULL)`,
+  ),
+  index('bank_instruction_outcomes_instruction_idx').on(
+    table.organizationId,
+    table.bankInstructionId,
+    table.sequenceNo,
+  ),
+]);
+
+export const paymentExecutionEffects = pgTable('payment_execution_effects', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  organizationId: uuid('organization_id').notNull().references(() => organizations.id),
+  paymentLineId: uuid('payment_line_id').notNull(),
+  effectKey: varchar('effect_key', { length: 128 }).notNull(),
+  effectType: varchar('effect_type', { length: 24 }).notNull(),
+  direction: varchar('direction', { length: 8 }).notNull(),
+  amount: numeric('amount', { precision: 38, scale: 8 }).notNull(),
+  currency: varchar('currency', { length: 8 }).notNull(),
+  businessDate: date('business_date').notNull(),
+  sourceVersion: bigint('source_version', { mode: 'number' }).notNull(),
+  movementFactId: uuid('movement_fact_id'),
+  bankInstructionId: uuid('bank_instruction_id'),
+  issuedChequeId: uuid('issued_cheque_id'),
+  reversalOfEffectId: uuid('reversal_of_effect_id'),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  unique().on(table.organizationId, table.id),
+  unique().on(table.organizationId, table.id, table.currency, table.amount),
+  unique().on(table.organizationId, table.paymentLineId, table.effectKey, table.direction),
+  unique().on(table.organizationId, table.reversalOfEffectId),
+  unique().on(table.organizationId, table.movementFactId),
+  unique().on(table.organizationId, table.bankInstructionId),
+  unique().on(table.organizationId, table.issuedChequeId),
+  foreignKey({
+    columns: [table.organizationId, table.paymentLineId],
+    foreignColumns: [paymentLines.organizationId, paymentLines.id],
+    name: 'payment_execution_effects_payment_line_fk',
+  }),
+  foreignKey({
+    columns: [table.organizationId, table.movementFactId],
+    foreignColumns: [movementFacts.organizationId, movementFacts.id],
+    name: 'payment_execution_effects_movement_fk',
+  }),
+  foreignKey({
+    columns: [table.organizationId, table.bankInstructionId],
+    foreignColumns: [bankInstructions.organizationId, bankInstructions.id],
+    name: 'payment_execution_effects_bank_instruction_fk',
+  }),
+  foreignKey({
+    columns: [table.organizationId, table.reversalOfEffectId, table.currency, table.amount],
+    foreignColumns: [table.organizationId, table.id, table.currency, table.amount],
+    name: 'payment_execution_effects_reversal_fk',
+  }),
+  check('payment_execution_effects_type_check', sql`${table.effectType} IN ('CASHBOX_MOVEMENT', 'BANK_MOVEMENT', 'BANK_INSTRUCTION', 'ISSUED_CHEQUE')`),
+  check('payment_execution_effects_direction_check', sql`${table.direction} IN ('OUTGOING', 'REVERSAL')`),
+  check('payment_execution_effects_amount_positive', sql`${table.amount} > 0`),
+  check('payment_execution_effects_source_version_positive', sql`${table.sourceVersion} > 0`),
+  check(
+    'payment_execution_effects_shape',
+    sql`(${table.direction} = 'OUTGOING'
+      AND ${table.reversalOfEffectId} IS NULL
+      AND ((${table.effectType} IN ('CASHBOX_MOVEMENT', 'BANK_MOVEMENT')
+          AND ${table.movementFactId} IS NOT NULL
+          AND ${table.bankInstructionId} IS NULL
+          AND ${table.issuedChequeId} IS NULL)
+        OR (${table.effectType} = 'BANK_INSTRUCTION'
+          AND ${table.movementFactId} IS NULL
+          AND ${table.bankInstructionId} IS NOT NULL
+          AND ${table.issuedChequeId} IS NULL)
+        OR (${table.effectType} = 'ISSUED_CHEQUE'
+          AND ${table.movementFactId} IS NULL
+          AND ${table.bankInstructionId} IS NULL
+          AND ${table.issuedChequeId} IS NOT NULL)))
+      OR (${table.direction} = 'REVERSAL'
+        AND ${table.effectType} IN ('CASHBOX_MOVEMENT', 'BANK_MOVEMENT')
+        AND ${table.reversalOfEffectId} IS NOT NULL
+        AND ${table.movementFactId} IS NOT NULL
+        AND ${table.bankInstructionId} IS NULL
+        AND ${table.issuedChequeId} IS NULL)`,
+  ),
+  index('payment_execution_effects_line_idx').on(
+    table.organizationId,
+    table.paymentLineId,
+    table.direction,
+  ),
 ]);
 
 export const paymentRequestAttachmentLinks = pgTable('payment_request_attachment_links', {

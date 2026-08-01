@@ -10,6 +10,8 @@ import {
 
 export interface MovementFactCommand {
   organizationId: string;
+  owner?: 'domain.receipts' | 'domain.payments';
+  sourceType?: 'RECEIPT' | 'Payment';
   sourceId: string;
   sourceLineId: string;
   effectKey: string;
@@ -19,6 +21,8 @@ export interface MovementFactCommand {
   currency: string;
   businessDate: string;
   reversalOfFactId?: string;
+  direction?: 'DEBIT' | 'CREDIT';
+  state?: 'POSTED' | 'REVERSED';
 }
 
 @Injectable()
@@ -31,19 +35,19 @@ export class FoundationEffectsRepository {
     await transaction.insert(movementFacts).values({
       id,
       organizationId: command.organizationId,
-      owner: 'domain.receipts',
-      sourceType: 'RECEIPT',
+      owner: command.owner ?? 'domain.receipts',
+      sourceType: command.sourceType ?? 'RECEIPT',
       sourceId: command.sourceId,
       sourceLineId: command.sourceLineId,
       effectKey: command.effectKey,
       endpointType: command.endpointType,
       endpointId: command.endpointId,
-      direction: command.reversalOfFactId ? 'DEBIT' : 'CREDIT',
+      direction: command.direction ?? (command.reversalOfFactId ? 'DEBIT' : 'CREDIT'),
       amount: command.amount,
       currency: command.currency,
       businessDate: command.businessDate,
       reversalOfFactId: command.reversalOfFactId,
-      state: command.reversalOfFactId ? 'REVERSED' : 'POSTED',
+      state: command.state ?? (command.reversalOfFactId ? 'REVERSED' : 'POSTED'),
     });
     return id;
   }
@@ -54,6 +58,7 @@ export class FoundationEffectsRepository {
       organizationId: string;
       requestId: string;
       actorUserId: string;
+      entityType?: 'Receipt' | 'Payment' | 'BankInstruction';
       entityId: string;
       action: string;
       reason?: string;
@@ -64,7 +69,7 @@ export class FoundationEffectsRepository {
       requestId: input.requestId,
       sequenceNo: 1,
       actorUserId: input.actorUserId,
-      entityType: 'Receipt',
+      entityType: input.entityType ?? 'Receipt',
       entityId: input.entityId,
       action: input.action,
       reason: input.reason,
@@ -76,6 +81,7 @@ export class FoundationEffectsRepository {
     transaction: DatabaseTransaction,
     input: {
       organizationId: string;
+      aggregateType?: 'Receipt' | 'Payment' | 'BankInstruction';
       aggregateId: string;
       aggregateVersion: number;
       eventType: string;
@@ -84,7 +90,7 @@ export class FoundationEffectsRepository {
   ): Promise<void> {
     await transaction.insert(outboxEvents).values({
       organizationId: input.organizationId,
-      aggregateType: 'Receipt',
+      aggregateType: input.aggregateType ?? 'Receipt',
       aggregateId: input.aggregateId,
       aggregateVersion: input.aggregateVersion,
       eventType: input.eventType,
