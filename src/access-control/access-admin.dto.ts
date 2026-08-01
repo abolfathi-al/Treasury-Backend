@@ -61,6 +61,7 @@ export const CANON_PERMISSIONS = [
   'payment.approve',
   'payment.create',
   'payment.execute',
+  'payment.reject',
   'payment.reverse',
   'payment.submit',
   'payment.view',

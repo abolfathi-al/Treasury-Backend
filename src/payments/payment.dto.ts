@@ -4,6 +4,7 @@ import {
   ArrayUnique,
   IsArray,
   IsDateString,
+  IsEnum,
   IsInt,
   IsOptional,
   IsString,
@@ -94,6 +95,17 @@ export class PaymentCreateDto {
   lines!: PaymentLineInputDto[];
 }
 
+export enum PaymentApprovalAction {
+  APPROVE = 'APPROVE',
+  REJECT = 'REJECT',
+  RETURN = 'RETURN',
+}
+
+export class PaymentApprovalActionDto {
+  @IsEnum(PaymentApprovalAction) action!: PaymentApprovalAction;
+  @IsOptional() @IsString() @MaxLength(500) reason?: string;
+}
+
 export interface PaymentSemanticRef {
   id: string;
   label: string;
@@ -114,6 +126,67 @@ export interface PaymentRateSnapshot {
   rateRecordId?: string;
   targetAmount: string;
   roundingDifference: string;
+}
+
+export interface PaymentApprovalPolicyContextView {
+  order: number;
+  firstLineNumber: number;
+  currency: string;
+  methodCategory: MethodBehaviorCategory;
+  policyId: string;
+  policy: PaymentSemanticRef;
+  policyVersion: number;
+}
+
+export interface PaymentApprovalActionView {
+  id: string;
+  approvalSnapshotId: string;
+  approvalSnapshotStepId?: string;
+  stepOrder?: number;
+  actorUserId: string;
+  actor: PaymentSemanticRef;
+  delegatedFromUserId?: string;
+  delegatedFrom?: PaymentSemanticRef;
+  action: 'APPROVED' | 'REJECTED' | 'RETURNED';
+  reason?: string;
+  actedAt: string;
+}
+
+export interface PaymentApprovalSnapshotStepView {
+  order: number;
+  roleId?: string;
+  role?: PaymentSemanticRef;
+  approverUserId?: string;
+  approver?: PaymentSemanticRef;
+  approvalsRequired: number;
+  approvalsRecorded: number;
+  separationRules: string[];
+  sourceContextOrders: number[];
+  state: 'WAITING' | 'CURRENT' | 'APPROVED' | 'REJECTED' | 'RETURNED';
+}
+
+export interface PaymentApprovalAggregationParticipantView {
+  paymentId: string;
+  payment: PaymentSemanticRef;
+  versionBasis: 'SUBMITTED_CONTENT' | 'LIVE_AGGREGATE';
+  paymentVersion: number;
+  baseAmount: PaymentPositiveMoneyDto;
+}
+
+export interface PaymentApprovalSnapshotView {
+  id: string;
+  documentVersion: number;
+  amountBasis: PaymentPositiveMoneyDto;
+  evaluatedAt: string;
+  policyContexts: PaymentApprovalPolicyContextView[];
+  steps: PaymentApprovalSnapshotStepView[];
+  actions: PaymentApprovalActionView[];
+  paymentAggregation?: {
+    businessDate: string;
+    keys: Array<'BENEFICIARY' | 'EXTERNAL_OBLIGATION'>;
+    participants: PaymentApprovalAggregationParticipantView[];
+  };
+  state: 'PENDING' | 'APPROVED' | 'REJECTED' | 'RETURNED';
 }
 
 export interface PaymentRequestView {
@@ -193,8 +266,9 @@ export interface PaymentView {
   creator: PaymentSemanticRef;
   totalBaseAmount: PaymentPositiveMoneyDto;
   lines: PaymentLineView[];
-  state: 'DRAFT';
-  workflowState: 'DRAFT';
+  approvalSnapshot?: PaymentApprovalSnapshotView;
+  state: 'DRAFT' | 'SUBMITTED' | 'APPROVAL_PENDING' | 'APPROVED' | 'REJECTED';
+  workflowState: 'DRAFT' | 'SUBMITTED' | 'APPROVAL_PENDING' | 'APPROVED' | 'REJECTED';
   executionState: 'NOT_EXECUTED';
   accountingState: 'NOT_READY';
   version: number;

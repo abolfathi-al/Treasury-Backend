@@ -7,6 +7,7 @@ import { commandDigest } from '../common/http';
 import { TreasuryProblem } from '../common/problem';
 import { DatabaseService, type DatabaseTransaction } from '../database/database.service';
 import { MethodBehaviorCategory } from '../master-data/master-data.dto';
+import { PaymentApprovalRepository } from './payment-approval.repository';
 import {
   PaymentCreateDto,
   PaymentLineInputDto,
@@ -34,6 +35,8 @@ export class PaymentService {
     @Inject(DatabaseService) private readonly database: DatabaseService,
     @Inject(AccessAuthorizationService)
     private readonly authorization: AccessAuthorizationService,
+    @Inject(PaymentApprovalRepository)
+    private readonly approvals?: PaymentApprovalRepository,
   ) {}
 
   async createRequest(
@@ -190,9 +193,16 @@ export class PaymentService {
       );
       const visibleIds = ids.slice(0, limit);
       const items = await this.repository.paymentViews(transaction, organizationId, visibleIds);
-      const last = items.at(-1);
+      const snapshots = this.approvals
+        ? await this.approvals.snapshotViewsForPayments(transaction, organizationId, visibleIds)
+        : new Map();
+      const visibleItems = items.map((item) => ({
+        ...item,
+        ...(snapshots.get(item.id) ? { approvalSnapshot: snapshots.get(item.id) } : {}),
+      }));
+      const last = visibleItems.at(-1);
       return {
-        items,
+        items: visibleItems,
         page: {
           limit,
           hasMore: ids.length > limit,
@@ -203,6 +213,68 @@ export class PaymentService {
         },
       };
     }));
+  }
+
+  async revalidateSubmission(
+    transaction: DatabaseTransaction,
+    organizationId: string,
+    view: PaymentView,
+  ): Promise<void> {
+    const dto = this.paymentDto(view);
+    const facts = await this.repository.paymentFacts(
+      transaction,
+      organizationId,
+      view.creatorUserId,
+      dto,
+    );
+    this.derive(dto, facts, new Date());
+    const base = facts.currencies.find(({ code }) => code === view.baseCurrency);
+    if (!base) throw new Error('RESOURCE_HIDDEN');
+    const total = view.lines.reduce(
+      (sum, line) => sum + scaled(line.baseAmount.amount, base.decimalPlaces),
+      0n,
+    );
+    if (compareDecimal(formatScaled(total, base.decimalPlaces), view.totalBaseAmount.amount) !== 0) {
+      throw new Error('TOTAL_MISMATCH');
+    }
+    for (const line of view.lines) {
+      const rate = line.rateSnapshot;
+      if (compareDecimal(rate.targetAmount, line.baseAmount.amount) !== 0) {
+        throw new Error('RATE_INVALID');
+      }
+      if (rate.rateSource === 'IDENTITY') {
+        if (
+          rate.sourceCurrency !== view.baseCurrency
+          || rate.targetCurrency !== view.baseCurrency
+          || compareDecimal(rate.rate, '1') !== 0
+          || rate.rateRecordId !== undefined
+          || compareDecimal(rate.roundingDifference, '0') !== 0
+          || compareDecimal(line.money.amount, line.baseAmount.amount) !== 0
+        ) throw new Error('RATE_INVALID');
+        continue;
+      }
+      const ratedAt = new Date(rate.ratedAt);
+      const candidates = facts.rates.filter((candidate) =>
+        candidate.sourceCurrency === rate.sourceCurrency
+        && candidate.targetCurrency === rate.targetCurrency
+        && candidate.validAt <= ratedAt);
+      const latestAt = candidates.reduce<Date | undefined>((latest, candidate) =>
+        !latest || candidate.validAt > latest ? candidate.validAt : latest, undefined);
+      const selected = latestAt
+        ? candidates.filter(({ validAt }) => validAt.getTime() === latestAt.getTime())
+        : [];
+      const stored = selected.length === 1 ? selected[0] : undefined;
+      const derived = deriveTarget(line.money.amount, rate.rate, base.decimalPlaces);
+      if (
+        !stored
+        || stored.id !== rate.rateRecordId
+        || stored.rate !== rate.rate
+        || stored.rateType !== rate.rateType
+        || stored.validAt.getTime() !== ratedAt.getTime()
+        || compareDecimal(derived.targetAmount, line.baseAmount.amount) !== 0
+        || compareDecimal(derived.roundingDifference, rate.roundingDifference) !== 0
+      ) throw new Error('RATE_INVALID');
+    }
   }
 
   private validateRequest(dto: PaymentRequestCreateDto): void {

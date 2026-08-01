@@ -4,6 +4,10 @@ import type { DatabaseTransaction } from '../database/database.service';
 import { AccessAuthorizationRepository } from './access-authorization.repository';
 import type { PaymentAuthorizationContext, PaymentGrant } from './access-authorization.repository';
 
+export interface PaymentAuthority {
+  delegatedFromUserId?: string;
+}
+
 @Injectable()
 export class AccessAuthorizationService {
   constructor(
@@ -100,6 +104,48 @@ export class AccessAuthorizationService {
     );
   }
 
+  async canOperatePayment(
+    transaction: DatabaseTransaction,
+    organizationId: string,
+    actorUserId: string,
+    context: PaymentAuthorizationContext,
+    permission: 'payment.submit' | 'payment.approve' | 'payment.reject',
+    roleId?: string,
+  ): Promise<boolean> {
+    return !!this.paymentAuthority(
+      await this.repository.paymentGrants(
+        transaction,
+        organizationId,
+        actorUserId,
+        permission,
+        roleId,
+      ),
+      context,
+    );
+  }
+
+  async resolvePaymentAuthority(
+    transaction: DatabaseTransaction,
+    organizationId: string,
+    actorUserId: string,
+    context: PaymentAuthorizationContext,
+    permission: 'payment.submit' | 'payment.approve' | 'payment.reject',
+    roleId?: string,
+    requiredAuthorityUserId?: string | null,
+  ): Promise<PaymentAuthority | null> {
+    return this.paymentAuthority(
+      await this.repository.paymentGrants(
+        transaction,
+        organizationId,
+        actorUserId,
+        permission,
+        roleId,
+      ),
+      context,
+      requiredAuthorityUserId,
+    );
+  }
+
   listVisiblePaymentIds(
     transaction: DatabaseTransaction,
     organizationId: string,
@@ -121,7 +167,15 @@ export class AccessAuthorizationService {
   }
 
   private paymentAllowed(grants: PaymentGrant[], context: PaymentAuthorizationContext): boolean {
-    return grants.some((grant) => (
+    return !!this.paymentAuthority(grants, context);
+  }
+
+  private paymentAuthority(
+    grants: PaymentGrant[],
+    context: PaymentAuthorizationContext,
+    requiredAuthorityUserId?: string | null,
+  ): PaymentAuthority | null {
+    let eligible = grants.filter((grant) => (
       covers(grant.branchIds, context.branchId ? [context.branchId] : [])
       && covers(grant.treasuryUnitIds, context.treasuryUnitId ? [context.treasuryUnitId] : [])
       && covers(grant.documentTypes, [context.documentType])
@@ -142,6 +196,13 @@ export class AccessAuthorizationService {
         )
       )
     ));
+    if (requiredAuthorityUserId) {
+      eligible = eligible.filter(({ grantUserId }) => grantUserId === requiredAuthorityUserId);
+    }
+    if (eligible.some(({ delegatedFromUserId }) => delegatedFromUserId === null)) return {};
+    const grantors = [...new Set(eligible.flatMap(({ delegatedFromUserId }) =>
+      delegatedFromUserId ? [delegatedFromUserId] : []))];
+    return grantors.length === 1 ? { delegatedFromUserId: grantors[0] } : null;
   }
 }
 
