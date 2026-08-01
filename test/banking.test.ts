@@ -8,6 +8,8 @@ import {
   BankAccountCreateDto,
   BankAccountType,
   BankCreateDto,
+  BankInstructionOutcome,
+  BankInstructionOutcomeDto,
   BankTypeCreateDto,
   PaymentGatewayCreateDto,
 } from '../src/banking/banking.dto';
@@ -92,6 +94,19 @@ test('Banking DTO transformations and masks enforce the typed HTTP boundary', as
   });
   assert.equal(gateway.providerCode, 'PROVIDER.ONE');
   assert.deepEqual(await validate(gateway), []);
+
+  const outcome = plainToInstance(BankInstructionOutcomeDto, {
+    outcome: BankInstructionOutcome.CONFIRMED,
+    effectiveAt: '2026-08-02T00:00:00.000Z',
+    attachments: [{
+      id: id(8),
+      contentDigest: 'a'.repeat(64),
+      purpose: 'Bank acknowledgement',
+    }],
+  });
+  assert.deepEqual(await validate(outcome), []);
+  outcome.attachments![0]!.contentDigest = 'not-a-digest';
+  assert.ok((await validate(outcome)).some(({ property }) => property === 'attachments'));
 });
 
 test('Bank Account activation guard fails before SQL', () => {

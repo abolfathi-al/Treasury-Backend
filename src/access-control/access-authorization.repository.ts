@@ -267,7 +267,8 @@ export class AccessAuthorizationRepository {
     organizationId: string,
     actorUserId: string,
     permission: 'payment-request.create' | 'payment.create' | 'payment.submit'
-      | 'payment.approve' | 'payment.reject',
+      | 'payment.approve' | 'payment.reject' | 'payment.execute' | 'payment.reverse'
+      | 'bank-instruction.record-outcome',
     roleId?: string,
   ): Promise<PaymentGrant[]> {
     const result = await transaction.execute<PaymentGrant>(sql`

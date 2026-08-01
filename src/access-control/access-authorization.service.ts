@@ -109,7 +109,8 @@ export class AccessAuthorizationService {
     organizationId: string,
     actorUserId: string,
     context: PaymentAuthorizationContext,
-    permission: 'payment.submit' | 'payment.approve' | 'payment.reject',
+    permission: 'payment.submit' | 'payment.approve' | 'payment.reject'
+      | 'payment.execute' | 'payment.reverse' | 'bank-instruction.record-outcome',
     roleId?: string,
   ): Promise<boolean> {
     return !!this.paymentAuthority(
@@ -129,7 +130,8 @@ export class AccessAuthorizationService {
     organizationId: string,
     actorUserId: string,
     context: PaymentAuthorizationContext,
-    permission: 'payment.submit' | 'payment.approve' | 'payment.reject',
+    permission: 'payment.submit' | 'payment.approve' | 'payment.reject'
+      | 'payment.execute' | 'payment.reverse' | 'bank-instruction.record-outcome',
     roleId?: string,
     requiredAuthorityUserId?: string | null,
   ): Promise<PaymentAuthority | null> {

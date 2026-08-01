@@ -9,6 +9,10 @@ import {
   ReceiptCashboxEffectsRepository,
   ReceiptCashboxEffectsService,
 } from './receipt-cashbox-effects.service';
+import {
+  PaymentCashboxEffectsRepository,
+  PaymentCashboxEffectsService,
+} from './payment-cashbox-effects.service';
 
 @Module({
   imports: [AccessControlModule, MasterDataModule],
@@ -18,7 +22,9 @@ import {
     CashboxRepository,
     ReceiptCashboxEffectsRepository,
     ReceiptCashboxEffectsService,
+    PaymentCashboxEffectsRepository,
+    PaymentCashboxEffectsService,
   ],
-  exports: [ReceiptCashboxEffectsService],
+  exports: [ReceiptCashboxEffectsService, PaymentCashboxEffectsService],
 })
 export class CashboxModule {}

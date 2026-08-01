@@ -131,20 +131,35 @@ test('Operational reporting uses the exact one-grant permission contract', () =>
   assert.equal(Reflect.getMetadata(STEP_UP_REQUIRED, handler), undefined);
 });
 
-test('INC-3A Payment operations expose only the authorized one-grant surface', () => {
+test('Payment operations through INC-3C expose only the authorized one-grant surface', () => {
   for (const [handler, permission, operationId] of [
     [PaymentController.prototype.createRequest, 'payment-request.create', 'createPaymentRequest'],
     [PaymentController.prototype.list, 'payment.view', 'listPayments'],
     [PaymentController.prototype.create, 'payment.create', 'createPayment'],
+    [PaymentController.prototype.execute, 'payment.execute', 'executePayment'],
+    [PaymentController.prototype.reverse, 'payment.reverse', 'reversePayment'],
   ] as const) {
     assert.equal(Reflect.getMetadata(REQUIRED_PERMISSION, handler), permission);
     assert.equal(Reflect.getMetadata(AUTHORIZATION_OPERATION, handler), operationId);
     assert.equal(Reflect.getMetadata(PERMISSION_SCOPE_MODE, handler), 'ONE_GRANT_RESOURCE');
-    assert.equal(Reflect.getMetadata(STEP_UP_REQUIRED, handler), undefined);
   }
-  for (const deferred of ['execute', 'reverse']) {
-    assert.equal(Object.prototype.hasOwnProperty.call(PaymentController.prototype, deferred), false);
-  }
+  for (const handler of [
+    PaymentController.prototype.createRequest,
+    PaymentController.prototype.list,
+    PaymentController.prototype.create,
+  ]) assert.equal(Reflect.getMetadata(STEP_UP_REQUIRED, handler), undefined);
+  assert.equal(Reflect.getMetadata(STEP_UP_REQUIRED, PaymentController.prototype.execute), 'executePayment');
+  assert.equal(
+    Reflect.getMetadata(STEP_UP_REQUEST_PROPERTY, PaymentController.prototype.execute),
+    'separationOverride',
+  );
+  assert.equal(Reflect.getMetadata(STEP_UP_REQUIRED, PaymentController.prototype.reverse), 'reversePayment');
+  assert.equal(Reflect.getMetadata(STEP_UP_REQUEST_PROPERTY, PaymentController.prototype.reverse), undefined);
+  const outcome = BankingController.prototype.recordInstructionOutcome;
+  assert.equal(Reflect.getMetadata(REQUIRED_PERMISSION, outcome), 'bank-instruction.record-outcome');
+  assert.equal(Reflect.getMetadata(AUTHORIZATION_OPERATION, outcome), 'recordBankInstructionOutcome');
+  assert.equal(Reflect.getMetadata(PERMISSION_SCOPE_MODE, outcome), 'ONE_GRANT_RESOURCE');
+  assert.equal(Reflect.getMetadata(STEP_UP_REQUIRED, outcome), undefined);
 });
 
 test('INC-3B Payment submission and action routes preserve action-specific authorization', () => {

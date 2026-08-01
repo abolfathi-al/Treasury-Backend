@@ -1,5 +1,8 @@
 import { Transform, Type } from 'class-transformer';
 import {
+  ArrayMinSize,
+  ArrayUnique,
+  IsArray,
   IsBoolean,
   IsDateString,
   IsEnum,
@@ -11,6 +14,8 @@ import {
   MinLength,
   ValidateNested,
 } from 'class-validator';
+
+const DIGEST = /^[a-f0-9]{64}$/u;
 
 const CODE = /^[A-Z0-9][A-Z0-9_-]{1,31}$/u;
 const BRANCH_CODE = /^[A-Z0-9][A-Z0-9_-]{0,31}$/u;
@@ -34,6 +39,31 @@ export enum BankAccountType {
   FUNDS_IN_TRANSIT = 'FUNDS_IN_TRANSIT',
   FACILITY_REFERENCE = 'FACILITY_REFERENCE',
   GUARANTEE_REFERENCE = 'GUARANTEE_REFERENCE',
+}
+
+export enum BankInstructionOutcome {
+  CONFIRMED = 'CONFIRMED',
+  REJECTED = 'REJECTED',
+  CANCELLED = 'CANCELLED',
+  RETURNED = 'RETURNED',
+}
+
+export class BankInstructionAttachmentDto {
+  @IsUUID() id!: string;
+  @IsString() @Matches(DIGEST) contentDigest!: string;
+  @IsOptional() @IsString() @MaxLength(64) purpose?: string;
+}
+
+export class BankInstructionOutcomeDto {
+  @IsEnum(BankInstructionOutcome) outcome!: BankInstructionOutcome;
+  @IsDateString() effectiveAt!: string;
+  @IsOptional() @IsUUID() statementLineId?: string;
+  @IsOptional() @IsString() @MinLength(1) @MaxLength(500) reason?: string;
+  @IsOptional() @IsUUID() correctionPaymentId?: string;
+  @IsOptional() @IsArray() @ArrayMinSize(1)
+  @ArrayUnique((item: BankInstructionAttachmentDto) => `${item.id}:${item.contentDigest}:${item.purpose ?? ''}`)
+  @ValidateNested({ each: true }) @Type(() => BankInstructionAttachmentDto)
+  attachments?: BankInstructionAttachmentDto[];
 }
 
 export class BankCapabilitiesDto {
@@ -216,6 +246,45 @@ export interface BankAccountView extends VersionedView {
   openingDate: string;
   closingDate?: string;
   accountingDimensions?: BankingAccountingDimensionsDto;
+}
+
+export interface BankInstructionOutcomeView {
+  id: string;
+  sequenceNo: number;
+  outcome: BankInstructionOutcome;
+  effectiveAt: string;
+  recordedByUserId: string;
+  recordedBy: string;
+  statementLineId?: string;
+  statementLineLabel?: string;
+  correctionPaymentId?: string;
+  correctionPaymentLabel?: string;
+  reason?: string;
+  attachments?: Array<{ id: string; label: string; contentDigest: string; purpose?: string }>;
+  sourceVersion: number;
+}
+
+export interface BankInstructionView {
+  id: string;
+  paymentLineId: string;
+  paymentLineLabel: string;
+  bankAccountId: string;
+  bankAccount: BankAccountSummary;
+  money: { amount: string; currency: string };
+  beneficiaryAccountReference: string;
+  localReference: string;
+  state: 'PENDING_CONFIRMATION' | BankInstructionOutcome;
+  outcomeEffectiveAt?: string;
+  statementLineId?: string;
+  statementLineLabel?: string;
+  correctionPaymentId?: string;
+  correctionPaymentLabel?: string;
+  outcomeReason?: string;
+  attachments?: Array<{ id: string; label: string; contentDigest: string; purpose?: string }>;
+  outcomes: BankInstructionOutcomeView[];
+  version: number;
+  createdAt: string;
+  updatedAt: string;
 }
 
 export interface PosTerminalView extends VersionedView {

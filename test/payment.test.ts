@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
 import { AccessAuthorizationService } from '../src/access-control/access-authorization.service';
@@ -179,4 +180,25 @@ test('Payment maps PostgreSQL numeric overflow to validation', async () => {
     (error: unknown) => error instanceof TreasuryProblem
       && (error.getResponse() as { code?: string }).code === 'TRS-GEN-001',
   );
+});
+
+test('INC-3C migration owns payment effects, reversals, and bank outcome evidence', async () => {
+  const migration = await readFile('migrations/0019_payment_execution_outcomes.sql', 'utf8');
+  for (const table of [
+    'payment_allocations',
+    'payment_reservations',
+    'bank_instructions',
+    'bank_instruction_outcome_events',
+    'payment_execution_effects',
+  ]) assert.match(migration, new RegExp(`CREATE TABLE ${table}`, 'u'));
+  assert.match(migration, /payment_execution_effects_append_only/u);
+  assert.match(migration, /bank_instruction_outcome_events_append_only/u);
+  assert.match(migration, /payment_execution_effect_reversal_target_consistency/u);
+  assert.match(migration, /payment_execution_effect_movement_consistency/u);
+  assert.match(migration, /bank_instruction_outcome_attachment_consistency/u);
+  assert.match(migration, /bank_instruction_outcome_correction_consistency/u);
+  assert.match(migration, /CREATE OR REPLACE FUNCTION prevent_payment_child_reparenting/u);
+  assert.match(migration, /to_jsonb\(NEW\)->>'payment_document_id'/u);
+  assert.match(migration, /Statement evidence is unavailable until reconciliation is authorized/u);
+  assert.match(migration, /Cheque execution is unavailable until selector authorization/u);
 });

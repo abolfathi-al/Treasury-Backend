@@ -1,10 +1,17 @@
-import { Body, Controller, Get, Headers, Inject, Param, Post, Query, Req, Res } from '@nestjs/common';
+import { Body, Controller, Get, Headers, HttpCode, Inject, Param, Post, Query, Req, Res } from '@nestjs/common';
 import type { Response } from 'express';
 
-import { RequirePermission } from '../access-control/auth.decorators';
+import { RequirePermission, RequireStepUp, RequireStepUpWhenPresent } from '../access-control/auth.decorators';
 import type { TreasuryRequest } from '../access-control/auth.guard';
 import { PaymentApprovalService } from './payment-approval.service';
-import { PaymentApprovalActionDto, PaymentCreateDto, PaymentRequestCreateDto } from './payment.dto';
+import {
+  PaymentApprovalActionDto,
+  PaymentCreateDto,
+  PaymentExecuteDto,
+  PaymentRequestCreateDto,
+  PaymentReverseDto,
+} from './payment.dto';
+import { PaymentExecutionService } from './payment-execution.service';
 import { PaymentService } from './payment.service';
 
 @Controller('v1')
@@ -12,6 +19,7 @@ export class PaymentController {
   constructor(
     @Inject(PaymentService) private readonly service: PaymentService,
     @Inject(PaymentApprovalService) private readonly approvals: PaymentApprovalService,
+    @Inject(PaymentExecutionService) private readonly execution: PaymentExecutionService,
   ) {}
 
   @Post('payment-requests')
@@ -116,5 +124,58 @@ export class PaymentController {
     );
     response.setHeader('ETag', `"${updated.version}"`);
     return updated;
+  }
+
+  @Post('payments/:resourceId/execute')
+  @HttpCode(200)
+  @RequirePermission('payment.execute', 'executePayment', 'ONE_GRANT_RESOURCE')
+  @RequireStepUpWhenPresent('executePayment', 'separationOverride')
+  async execute(
+    @Req() request: TreasuryRequest,
+    @Param('resourceId') resourceId: string,
+    @Headers('Idempotency-Key') key: string,
+    @Headers('If-Match') ifMatch: string,
+    @Headers('X-Request-Id') requestId: string,
+    @Body() body: PaymentExecuteDto | undefined,
+    @Res({ passthrough: true }) response: Response,
+  ) {
+    const payment = await this.execution.execute({
+      organizationId: request.auth!.organizationId,
+      actorUserId: request.auth!.session.userId,
+      physicalSessionId: request.auth!.physicalSessionId,
+      paymentId: resourceId,
+      key,
+      ifMatch,
+      requestId,
+      stepUp: request.stepUp,
+    }, body);
+    response.setHeader('ETag', `"${payment.version}"`);
+    return payment;
+  }
+
+  @Post('payments/:resourceId/reverse')
+  @RequirePermission('payment.reverse', 'reversePayment', 'ONE_GRANT_RESOURCE')
+  @RequireStepUp('reversePayment')
+  async reverse(
+    @Req() request: TreasuryRequest,
+    @Param('resourceId') resourceId: string,
+    @Headers('Idempotency-Key') key: string,
+    @Headers('If-Match') ifMatch: string,
+    @Headers('X-Request-Id') requestId: string,
+    @Body() body: PaymentReverseDto,
+    @Res({ passthrough: true }) response: Response,
+  ) {
+    const result = await this.execution.reverse({
+      organizationId: request.auth!.organizationId,
+      actorUserId: request.auth!.session.userId,
+      physicalSessionId: request.auth!.physicalSessionId,
+      paymentId: resourceId,
+      key,
+      ifMatch,
+      requestId,
+      stepUp: request.stepUp,
+    }, body);
+    response.setHeader('ETag', `"${result.original.version}"`);
+    return result;
   }
 }
