@@ -274,6 +274,7 @@ export class ReportingService {
       );
     }
     const last = result.keys.at(-1);
+    const cursorIssuedAt = Date.now();
     const nextCursor = result.hasMore && last
       ? this.encode({
         version: 1,
@@ -288,8 +289,8 @@ export class ReportingService {
         asOf,
         sourceWatermark,
         after: last,
-        issuedAt: new Date().toISOString(),
-        expiresAt: new Date(Date.now() + CURSOR_TTL_MS).toISOString(),
+        issuedAt: new Date(cursorIssuedAt).toISOString(),
+        expiresAt: new Date(cursorIssuedAt + CURSOR_TTL_MS).toISOString(),
       })
       : undefined;
 
