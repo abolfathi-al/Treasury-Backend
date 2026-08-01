@@ -142,9 +142,47 @@ test('INC-3A Payment operations expose only the authorized one-grant surface', (
     assert.equal(Reflect.getMetadata(PERMISSION_SCOPE_MODE, handler), 'ONE_GRANT_RESOURCE');
     assert.equal(Reflect.getMetadata(STEP_UP_REQUIRED, handler), undefined);
   }
-  for (const deferred of ['submit', 'approve', 'execute', 'reverse']) {
+  for (const deferred of ['execute', 'reverse']) {
     assert.equal(Object.prototype.hasOwnProperty.call(PaymentController.prototype, deferred), false);
   }
+});
+
+test('INC-3B Payment submission and action routes preserve action-specific authorization', () => {
+  const submit = PaymentController.prototype.submit;
+  assert.equal(Reflect.getMetadata(REQUIRED_PERMISSION, submit), 'payment.submit');
+  assert.equal(Reflect.getMetadata(AUTHORIZATION_OPERATION, submit), 'submitPayment');
+  assert.equal(Reflect.getMetadata(PERMISSION_SCOPE_MODE, submit), 'ONE_GRANT_RESOURCE');
+  assert.equal(
+    Reflect.getMetadata(REQUIRED_PERMISSION, PaymentController.prototype.actOnApproval),
+    undefined,
+  );
+});
+
+test('INC-3B Payment migration persists immutable policy, snapshot, action, and aggregation facts', async () => {
+  const migration = await readFile('migrations/0018_payment_submit_approval.sql', 'utf8');
+  for (const table of [
+    'delegations',
+    'payment_approval_policies',
+    'payment_approval_policy_steps',
+    'payment_approval_snapshots',
+    'payment_approval_snapshot_contexts',
+    'payment_approval_snapshot_steps',
+    'payment_approval_actions',
+    'payment_approval_aggregations',
+    'payment_approval_aggregation_participants',
+  ]) assert.match(migration, new RegExp(`CREATE TABLE ${table}`, 'u'));
+  assert.match(migration, /VALUES \('payment.reject'\)/u);
+  assert.match(migration, /SUBMITTED_CONTENT/u);
+  assert.match(migration, /LIVE_AGGREGATE/u);
+  assert.match(migration, /payment_approval_one_submitted_content/u);
+  assert.match(migration, /payment_documents_snapshot_state_check/u);
+  assert.match(migration, /prevent_payment_approval_fact_updates/u);
+  assert.match(migration, /delegation_grantor_guard/u);
+  assert.match(migration, /delegation_rewrite_guard/u);
+  assert.match(
+    migration,
+    /BEFORE UPDATE OR DELETE ON payment_approval_aggregation_participants/u,
+  );
 });
 
 test('INC-3A Payment migration preserves tenant, reparent, and locked-total invariants', async () => {
@@ -569,6 +607,7 @@ test('CHG-017 admits the emergency separation override permission', async () => 
   ]);
   const persisted = [...migrations.join('\n').matchAll(/\('([^']+)'\)/gu)]
     .map((match) => match[1])
+    .concat('payment.reject')
     .sort();
   assert.deepEqual(persisted, [...CANON_PERMISSIONS].sort());
 });

@@ -44,7 +44,14 @@ const titles = {
   'TRS-RCP-004': 'Receipt effect mapping unavailable',
   'TRS-RCP-005': 'Receipt approval policy unavailable',
   'TRS-RCP-006': 'Receipt reversal blocked',
+  'TRS-PAY-001': 'Payment total mismatch',
   'TRS-PAY-002': 'Payment evidence incomplete',
+  'TRS-PAY-003': 'Payment approval incomplete',
+  'TRS-PAY-004': 'Payment source unavailable',
+  'TRS-PAY-005': 'Payment not executable',
+  'TRS-PAY-006': 'External obligation allocation conflict',
+  'TRS-PAY-007': 'Approval aggregate stale',
+  'TRS-PAY-008': 'Payment approval policy unresolved',
   'TRS-ACT-005': 'Accounting posting lock active',
   'TRS-RPT-001': 'Unsupported report request',
   'TRS-RPT-002': 'Projection stale',
@@ -57,6 +64,8 @@ const retryable = new Set<ProblemCode>([
   'TRS-AUT-008',
   'TRS-AUT-010',
   'TRS-CSH-002',
+  'TRS-PAY-006',
+  'TRS-PAY-007',
   'TRS-RPT-002',
 ]);
 

@@ -13,6 +13,8 @@ import { deriveTarget, PaymentService } from '../src/payments/payment.service';
 
 const grant = (overrides: Partial<PaymentGrant> = {}): PaymentGrant => ({
   id: 'grant',
+  grantUserId: 'actor',
+  delegatedFromUserId: null,
   amountCeiling: null,
   amountCeilingCurrency: null,
   branchIds: [],
@@ -23,6 +25,33 @@ const grant = (overrides: Partial<PaymentGrant> = {}): PaymentGrant => ({
   methodCategories: [],
   currencies: [],
   ...overrides,
+});
+
+test('Named payment authority ignores unrelated direct grants during execution and replay', async () => {
+  const namedApproverId = 'named-approver';
+  const service = new AccessAuthorizationService({
+    paymentGrants: async () => [
+      grant({ id: 'unrelated-direct', grantUserId: 'delegate' }),
+      grant({
+        id: 'named-delegation',
+        grantUserId: namedApproverId,
+        delegatedFromUserId: namedApproverId,
+      }),
+    ],
+  } as unknown as AccessAuthorizationRepository);
+  const transaction = {} as DatabaseTransaction;
+
+  const resolve = () => service.resolvePaymentAuthority(
+    transaction,
+    'org',
+    'delegate',
+    context,
+    'payment.approve',
+    undefined,
+    namedApproverId,
+  );
+  assert.deepEqual(await resolve(), { delegatedFromUserId: namedApproverId });
+  assert.deepEqual(await resolve(), { delegatedFromUserId: namedApproverId });
 });
 
 const context = {

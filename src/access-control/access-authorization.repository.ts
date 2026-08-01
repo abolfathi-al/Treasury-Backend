@@ -18,6 +18,8 @@ export interface PaymentAuthorizationContext {
 export interface PaymentGrant {
   [key: string]: unknown;
   id: string;
+  grantUserId: string;
+  delegatedFromUserId: string | null;
   amountCeiling: string | null;
   amountCeilingCurrency: string | null;
   branchIds: string[];
@@ -264,10 +266,15 @@ export class AccessAuthorizationRepository {
     transaction: DatabaseTransaction,
     organizationId: string,
     actorUserId: string,
-    permission: 'payment-request.create' | 'payment.create',
+    permission: 'payment-request.create' | 'payment.create' | 'payment.submit'
+      | 'payment.approve' | 'payment.reject',
+    roleId?: string,
   ): Promise<PaymentGrant[]> {
     const result = await transaction.execute<PaymentGrant>(sql`
       SELECT ag.id,
+             ag.user_ref_id AS "grantUserId",
+             CASE WHEN ag.user_ref_id = ${actorUserId}
+               THEN NULL ELSE ag.user_ref_id END AS "delegatedFromUserId",
              ag.amount_ceiling::text AS "amountCeiling",
              ag.amount_ceiling_currency AS "amountCeilingCurrency",
              ARRAY(SELECT s.branch_id::text FROM access_grant_branch_scopes s
@@ -288,7 +295,20 @@ export class AccessAuthorizationRepository {
       JOIN roles r ON r.id = ag.role_id AND r.state = 'ACTIVE'
       JOIN role_permissions rp ON rp.role_id = r.id AND rp.permission = ${permission}
       WHERE ag.organization_id = ${organizationId}
-        AND ag.user_ref_id = ${actorUserId}
+        AND (
+          ag.user_ref_id = ${actorUserId}
+          OR EXISTS (
+            SELECT 1 FROM delegations d
+            WHERE d.organization_id = ag.organization_id
+              AND d.access_grant_id = ag.id
+              AND d.grantor_user_id = ag.user_ref_id
+              AND d.delegate_user_id = ${actorUserId}
+              AND d.revoked_at IS NULL
+              AND d.valid_from <= now()
+              AND d.valid_to > now()
+          )
+        )
+        AND (${roleId ?? null}::uuid IS NULL OR ag.role_id = ${roleId ?? null}::uuid)
         AND ag.state = 'ACTIVE'
         AND ag.valid_from <= now()
         AND (ag.valid_to IS NULL OR ag.valid_to > now())

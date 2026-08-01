@@ -204,10 +204,11 @@ export class PaymentRepository {
     scope: string,
     idempotencyKey: string,
     response: PaymentRequestView | PaymentView,
+    responseStatus = 201,
   ): Promise<void> {
     await transaction
       .update(idempotencyRecords)
-      .set({ responseStatus: 201, responseBody: { ...response } })
+      .set({ responseStatus, responseBody: { ...response } })
       .where(and(
         eq(idempotencyRecords.organizationId, organizationId),
         eq(idempotencyRecords.scope, scope),
@@ -756,15 +757,23 @@ export class PaymentRepository {
         creator: { id: row.payment.creatorUserId, label: row.creatorLabel },
         totalBaseAmount: { amount: row.payment.totalBaseAmount, currency: row.payment.baseCurrency },
         lines,
-        state: 'DRAFT',
-        workflowState: 'DRAFT',
-        executionState: 'NOT_EXECUTED',
-        accountingState: 'NOT_READY',
+        state: row.payment.state,
+        workflowState: row.payment.workflowState,
+        executionState: row.payment.executionState,
+        accountingState: row.payment.accountingState,
         version: row.payment.version,
         createdAt: row.payment.createdAt.toISOString(),
         updatedAt: row.payment.updatedAt.toISOString(),
       }) as PaymentView];
     });
+  }
+
+  async paymentView(
+    transaction: DatabaseTransaction,
+    organizationId: string,
+    paymentId: string,
+  ): Promise<PaymentView | undefined> {
+    return (await this.paymentViews(transaction, organizationId, [paymentId]))[0];
   }
 
   private async evidenceFacts(

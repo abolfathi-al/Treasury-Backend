@@ -205,6 +205,54 @@ export const accessGrants = pgTable('access_grants', {
   check('access_grants_valid_interval', sql`${table.validTo} IS NULL OR ${table.validTo} > ${table.validFrom}`),
 ]);
 
+export const delegations = pgTable('delegations', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  organizationId: uuid('organization_id').notNull().references(() => organizations.id),
+  accessGrantId: uuid('access_grant_id').notNull(),
+  grantorUserId: uuid('grantor_user_id').notNull(),
+  delegateUserId: uuid('delegate_user_id').notNull(),
+  reason: varchar('reason', { length: 500 }).notNull(),
+  validFrom: timestamp('valid_from', { withTimezone: true }).notNull(),
+  validTo: timestamp('valid_to', { withTimezone: true }).notNull(),
+  revokedAt: timestamp('revoked_at', { withTimezone: true }),
+  revokedByUserId: uuid('revoked_by_user_id'),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  unique().on(table.organizationId, table.id),
+  foreignKey({
+    columns: [table.organizationId, table.accessGrantId],
+    foreignColumns: [accessGrants.organizationId, accessGrants.id],
+    name: 'delegations_access_grant_fk',
+  }),
+  foreignKey({
+    columns: [table.organizationId, table.grantorUserId],
+    foreignColumns: [userRefs.organizationId, userRefs.id],
+    name: 'delegations_grantor_fk',
+  }),
+  foreignKey({
+    columns: [table.organizationId, table.delegateUserId],
+    foreignColumns: [userRefs.organizationId, userRefs.id],
+    name: 'delegations_delegate_fk',
+  }),
+  foreignKey({
+    columns: [table.organizationId, table.revokedByUserId],
+    foreignColumns: [userRefs.organizationId, userRefs.id],
+    name: 'delegations_revoked_by_fk',
+  }),
+  check('delegations_distinct_users', sql`${table.grantorUserId} <> ${table.delegateUserId}`),
+  check('delegations_valid_interval', sql`${table.validTo} > ${table.validFrom}`),
+  check(
+    'delegations_revocation_pair',
+    sql`(${table.revokedAt} IS NULL) = (${table.revokedByUserId} IS NULL)`,
+  ),
+  index('delegations_delegate_active_idx').on(
+    table.organizationId,
+    table.delegateUserId,
+    table.validFrom,
+    table.validTo,
+  ),
+]);
+
 export const accessGrantBranchScopes = pgTable('access_grant_branch_scopes', {
   accessGrantId: uuid('access_grant_id').notNull().references(() => accessGrants.id),
   branchId: uuid('branch_id').notNull().references(() => branches.id),
@@ -2203,6 +2251,7 @@ export const paymentDocuments = pgTable('payment_documents', {
   dueDate: date('due_date'),
   purpose: varchar('purpose', { length: 1000 }).notNull(),
   creatorUserId: uuid('creator_user_id').notNull(),
+  currentApprovalSnapshotId: uuid('current_approval_snapshot_id'),
   state: varchar('state', { length: 32 }).notNull().default('DRAFT'),
   workflowState: varchar('workflow_state', { length: 24 }).notNull().default('DRAFT'),
   executionState: varchar('execution_state', { length: 24 }).notNull().default('NOT_EXECUTED'),
@@ -2245,8 +2294,20 @@ export const paymentDocuments = pgTable('payment_documents', {
     name: 'payment_documents_creator_fk',
   }),
   check('payment_documents_total_positive', sql`${table.totalBaseAmount} > 0`),
-  check('payment_documents_state_check', sql`${table.state} = 'DRAFT'`),
-  check('payment_documents_workflow_state_check', sql`${table.workflowState} = 'DRAFT'`),
+  check(
+    'payment_documents_state_check',
+    sql`${table.state} IN ('DRAFT', 'SUBMITTED', 'APPROVAL_PENDING', 'APPROVED', 'REJECTED')`,
+  ),
+  check(
+    'payment_documents_workflow_state_check',
+    sql`${table.workflowState} IN ('DRAFT', 'SUBMITTED', 'APPROVAL_PENDING', 'APPROVED', 'REJECTED')`,
+  ),
+  check('payment_documents_workflow_matches_state', sql`${table.workflowState} = ${table.state}`),
+  check(
+    'payment_documents_snapshot_state_check',
+    sql`(${table.state} = 'DRAFT' AND ${table.currentApprovalSnapshotId} IS NULL)
+      OR (${table.state} <> 'DRAFT' AND ${table.currentApprovalSnapshotId} IS NOT NULL)`,
+  ),
   check('payment_documents_execution_state_check', sql`${table.executionState} = 'NOT_EXECUTED'`),
   check('payment_documents_accounting_state_check', sql`${table.accountingState} = 'NOT_READY'`),
   check('payment_documents_version_nonnegative', sql`${table.version} >= 0`),
@@ -2256,6 +2317,232 @@ export const paymentDocuments = pgTable('payment_documents', {
     table.id.desc(),
   ),
 ]);
+
+export const paymentApprovalPolicies = pgTable('payment_approval_policies', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  organizationId: uuid('organization_id').notNull().references(() => organizations.id),
+  code: varchar('code', { length: 64 }).notNull(),
+  name: varchar('name', { length: 240 }).notNull(),
+  documentType: varchar('document_type', { length: 64 }).notNull(),
+  branchId: uuid('branch_id'),
+  treasuryUnitId: uuid('treasury_unit_id'),
+  currency: varchar('currency', { length: 8 }),
+  methodCategory: varchar('method_category', { length: 64 }),
+  amountMinimum: numeric('amount_minimum', { precision: 38, scale: 8 }),
+  amountMaximum: numeric('amount_maximum', { precision: 38, scale: 8 }),
+  aggregationWindowKind: varchar('aggregation_window_kind', { length: 16 }),
+  aggregationKeys: varchar('aggregation_keys', { length: 64 }).array().notNull().default([]),
+  version: integer('version').notNull(),
+  state: varchar('state', { length: 16 }).notNull(),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  unique().on(table.organizationId, table.id),
+  unique().on(table.organizationId, table.code, table.version),
+  foreignKey({
+    columns: [table.organizationId, table.branchId],
+    foreignColumns: [branches.organizationId, branches.id],
+    name: 'payment_approval_policies_branch_fk',
+  }),
+  foreignKey({
+    columns: [table.organizationId, table.treasuryUnitId],
+    foreignColumns: [treasuryUnits.organizationId, treasuryUnits.id],
+    name: 'payment_approval_policies_treasury_unit_fk',
+  }),
+  foreignKey({
+    columns: [table.organizationId, table.currency],
+    foreignColumns: [currencies.organizationId, currencies.code],
+    name: 'payment_approval_policies_currency_fk',
+  }),
+  index('payment_approval_policy_selection_idx').on(
+    table.organizationId,
+    table.documentType,
+    table.state,
+    table.branchId,
+    table.treasuryUnitId,
+    table.currency,
+    table.methodCategory,
+    table.amountMinimum,
+    table.amountMaximum,
+  ),
+]);
+
+export const paymentApprovalPolicySteps = pgTable('payment_approval_policy_steps', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  organizationId: uuid('organization_id').notNull(),
+  policyId: uuid('policy_id').notNull(),
+  stepOrder: integer('step_order').notNull(),
+  roleId: uuid('role_id'),
+  approverUserId: uuid('approver_user_id'),
+  approvalsRequired: integer('approvals_required').notNull(),
+  separationRules: varchar('separation_rules', { length: 64 }).array().notNull().default([]),
+}, (table) => [
+  unique().on(table.organizationId, table.policyId, table.stepOrder),
+  unique().on(table.organizationId, table.policyId, table.id),
+  foreignKey({
+    columns: [table.organizationId, table.policyId],
+    foreignColumns: [paymentApprovalPolicies.organizationId, paymentApprovalPolicies.id],
+    name: 'payment_approval_policy_steps_policy_fk',
+  }),
+  foreignKey({
+    columns: [table.organizationId, table.roleId],
+    foreignColumns: [roles.organizationId, roles.id],
+    name: 'payment_approval_policy_steps_role_fk',
+  }),
+  foreignKey({
+    columns: [table.organizationId, table.approverUserId],
+    foreignColumns: [userRefs.organizationId, userRefs.id],
+    name: 'payment_approval_policy_steps_approver_fk',
+  }),
+]);
+
+export const paymentApprovalSnapshots = pgTable('payment_approval_snapshots', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  organizationId: uuid('organization_id').notNull(),
+  paymentDocumentId: uuid('payment_document_id').notNull(),
+  documentVersion: bigint('document_version', { mode: 'number' }).notNull(),
+  amountBasis: numeric('amount_basis', { precision: 38, scale: 8 }).notNull(),
+  baseCurrency: varchar('base_currency', { length: 8 }).notNull(),
+  evaluatedAt: timestamp('evaluated_at', { withTimezone: true }).notNull(),
+}, (table) => [
+  unique().on(table.organizationId, table.id),
+  unique().on(table.organizationId, table.paymentDocumentId, table.id),
+  foreignKey({
+    columns: [table.organizationId, table.paymentDocumentId, table.baseCurrency],
+    foreignColumns: [paymentDocuments.organizationId, paymentDocuments.id, paymentDocuments.baseCurrency],
+    name: 'payment_approval_snapshots_document_fk',
+  }),
+]);
+
+export const paymentApprovalSnapshotContexts = pgTable('payment_approval_snapshot_contexts', {
+  organizationId: uuid('organization_id').notNull(),
+  approvalSnapshotId: uuid('approval_snapshot_id').notNull(),
+  contextOrder: integer('context_order').notNull(),
+  firstLineNumber: integer('first_line_number').notNull(),
+  currency: varchar('currency', { length: 8 }).notNull(),
+  methodCategory: varchar('method_category', { length: 64 }).notNull(),
+  policyId: uuid('policy_id').notNull(),
+  policyCode: varchar('policy_code', { length: 64 }).notNull(),
+  policyName: varchar('policy_name', { length: 240 }).notNull(),
+  policyVersion: integer('policy_version').notNull(),
+}, (table) => [
+  primaryKey({ columns: [table.organizationId, table.approvalSnapshotId, table.contextOrder] }),
+  foreignKey({
+    columns: [table.organizationId, table.approvalSnapshotId],
+    foreignColumns: [paymentApprovalSnapshots.organizationId, paymentApprovalSnapshots.id],
+    name: 'payment_approval_snapshot_contexts_snapshot_fk',
+  }),
+  foreignKey({
+    columns: [table.organizationId, table.policyId],
+    foreignColumns: [paymentApprovalPolicies.organizationId, paymentApprovalPolicies.id],
+    name: 'payment_approval_snapshot_contexts_policy_fk',
+  }),
+]);
+
+export const paymentApprovalSnapshotSteps = pgTable('payment_approval_snapshot_steps', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  organizationId: uuid('organization_id').notNull(),
+  approvalSnapshotId: uuid('approval_snapshot_id').notNull(),
+  stepOrder: integer('step_order').notNull(),
+  roleId: uuid('role_id'),
+  roleName: varchar('role_name', { length: 240 }),
+  approverUserId: uuid('approver_user_id'),
+  approverName: varchar('approver_name', { length: 240 }),
+  approvalsRequired: integer('approvals_required').notNull(),
+  separationRules: varchar('separation_rules', { length: 64 }).array().notNull(),
+  sourceContextOrders: integer('source_context_orders').array().notNull(),
+  obligationKey: text('obligation_key').notNull(),
+}, (table) => [
+  unique().on(table.organizationId, table.approvalSnapshotId, table.id),
+  unique().on(table.organizationId, table.approvalSnapshotId, table.stepOrder),
+  unique().on(table.organizationId, table.approvalSnapshotId, table.obligationKey),
+  foreignKey({
+    columns: [table.organizationId, table.approvalSnapshotId],
+    foreignColumns: [paymentApprovalSnapshots.organizationId, paymentApprovalSnapshots.id],
+    name: 'payment_approval_snapshot_steps_snapshot_fk',
+  }),
+]);
+
+export const paymentApprovalActions = pgTable('payment_approval_actions', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  organizationId: uuid('organization_id').notNull(),
+  approvalSnapshotId: uuid('approval_snapshot_id').notNull(),
+  approvalSnapshotStepId: uuid('approval_snapshot_step_id'),
+  stepOrder: integer('step_order'),
+  actorUserId: uuid('actor_user_id').notNull(),
+  delegatedFromUserId: uuid('delegated_from_user_id'),
+  action: varchar('action', { length: 16 }).notNull(),
+  reason: varchar('reason', { length: 500 }),
+  actedAt: timestamp('acted_at', { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  unique().on(table.organizationId, table.id),
+  foreignKey({
+    columns: [table.organizationId, table.approvalSnapshotId],
+    foreignColumns: [paymentApprovalSnapshots.organizationId, paymentApprovalSnapshots.id],
+    name: 'payment_approval_actions_snapshot_fk',
+  }),
+  foreignKey({
+    columns: [table.organizationId, table.approvalSnapshotId, table.approvalSnapshotStepId],
+    foreignColumns: [
+      paymentApprovalSnapshotSteps.organizationId,
+      paymentApprovalSnapshotSteps.approvalSnapshotId,
+      paymentApprovalSnapshotSteps.id,
+    ],
+    name: 'payment_approval_actions_step_fk',
+  }),
+  foreignKey({
+    columns: [table.organizationId, table.actorUserId],
+    foreignColumns: [userRefs.organizationId, userRefs.id],
+    name: 'payment_approval_actions_actor_fk',
+  }),
+]);
+
+export const paymentApprovalAggregations = pgTable('payment_approval_aggregations', {
+  organizationId: uuid('organization_id').notNull(),
+  approvalSnapshotId: uuid('approval_snapshot_id').notNull(),
+  businessDate: date('business_date').notNull(),
+  aggregationKeys: varchar('aggregation_keys', { length: 64 }).array().notNull(),
+  beneficiaryPartyId: uuid('beneficiary_party_id'),
+  externalObligationKey: text('external_obligation_key'),
+}, (table) => [
+  primaryKey({ columns: [table.organizationId, table.approvalSnapshotId] }),
+  foreignKey({
+    columns: [table.organizationId, table.approvalSnapshotId],
+    foreignColumns: [paymentApprovalSnapshots.organizationId, paymentApprovalSnapshots.id],
+    name: 'payment_approval_aggregations_snapshot_fk',
+  }),
+  foreignKey({
+    columns: [table.organizationId, table.beneficiaryPartyId],
+    foreignColumns: [parties.organizationId, parties.id],
+    name: 'payment_approval_aggregations_beneficiary_fk',
+  }),
+]);
+
+export const paymentApprovalAggregationParticipants = pgTable(
+  'payment_approval_aggregation_participants',
+  {
+    organizationId: uuid('organization_id').notNull(),
+    approvalSnapshotId: uuid('approval_snapshot_id').notNull(),
+    paymentDocumentId: uuid('payment_document_id').notNull(),
+    paymentNumber: varchar('payment_number', { length: 64 }).notNull(),
+    versionBasis: varchar('version_basis', { length: 24 }).notNull(),
+    paymentVersion: bigint('payment_version', { mode: 'number' }).notNull(),
+    baseAmount: numeric('base_amount', { precision: 38, scale: 8 }).notNull(),
+    baseCurrency: varchar('base_currency', { length: 8 }).notNull(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.organizationId, table.approvalSnapshotId, table.paymentDocumentId] }),
+    foreignKey({
+      columns: [table.organizationId, table.approvalSnapshotId],
+      foreignColumns: [paymentApprovalAggregations.organizationId, paymentApprovalAggregations.approvalSnapshotId],
+      name: 'payment_approval_aggregation_participants_aggregation_fk',
+    }),
+    foreignKey({
+      columns: [table.organizationId, table.paymentDocumentId, table.baseCurrency],
+      foreignColumns: [paymentDocuments.organizationId, paymentDocuments.id, paymentDocuments.baseCurrency],
+      name: 'payment_approval_aggregation_participants_payment_fk',
+    }),
+  ],
+);
 
 export const paymentLines = pgTable('payment_lines', {
   id: uuid('id').primaryKey().defaultRandom(),
