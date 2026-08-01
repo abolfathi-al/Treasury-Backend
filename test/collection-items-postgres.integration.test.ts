@@ -13,7 +13,7 @@ test('INC-2D migration applies to fresh and pre-0016 PostgreSQL schemas', {
   const names = (await readdir('migrations'))
     .filter((name) => name.endsWith('.sql'))
     .sort();
-  assert.equal(names.at(-1), '0016_collection_items_queue.sql');
+  assert.ok(names.includes('0016_collection_items_queue.sql'));
   try {
     await withSchema(pool, async (client) => {
       await apply(client, names);

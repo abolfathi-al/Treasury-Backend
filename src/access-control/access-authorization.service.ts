@@ -2,6 +2,7 @@ import { Inject, Injectable } from '@nestjs/common';
 
 import type { DatabaseTransaction } from '../database/database.service';
 import { AccessAuthorizationRepository } from './access-authorization.repository';
+import type { PaymentAuthorizationContext, PaymentGrant } from './access-authorization.repository';
 
 @Injectable()
 export class AccessAuthorizationService {
@@ -64,4 +65,91 @@ export class AccessAuthorizationService {
       context,
     );
   }
+
+  async canCreatePaymentRequest(
+    transaction: DatabaseTransaction,
+    organizationId: string,
+    actorUserId: string,
+    context: PaymentAuthorizationContext,
+  ): Promise<boolean> {
+    return this.paymentAllowed(
+      await this.repository.paymentGrants(
+        transaction,
+        organizationId,
+        actorUserId,
+        'payment-request.create',
+      ),
+      context,
+    );
+  }
+
+  async canCreatePayment(
+    transaction: DatabaseTransaction,
+    organizationId: string,
+    actorUserId: string,
+    context: PaymentAuthorizationContext,
+  ): Promise<boolean> {
+    return this.paymentAllowed(
+      await this.repository.paymentGrants(
+        transaction,
+        organizationId,
+        actorUserId,
+        'payment.create',
+      ),
+      context,
+    );
+  }
+
+  listVisiblePaymentIds(
+    transaction: DatabaseTransaction,
+    organizationId: string,
+    actorUserId: string,
+    limit: number,
+    cursor?: { businessDate: string; id: string },
+    from?: string,
+    to?: string,
+  ): Promise<string[]> {
+    return this.repository.visiblePaymentIds(
+      transaction,
+      organizationId,
+      actorUserId,
+      limit,
+      cursor,
+      from,
+      to,
+    );
+  }
+
+  private paymentAllowed(grants: PaymentGrant[], context: PaymentAuthorizationContext): boolean {
+    return grants.some((grant) => (
+      covers(grant.branchIds, context.branchId ? [context.branchId] : [])
+      && covers(grant.treasuryUnitIds, context.treasuryUnitId ? [context.treasuryUnitId] : [])
+      && covers(grant.documentTypes, [context.documentType])
+      && covers(grant.currencies, context.currencies)
+      && (
+        context.documentType === 'PAYMENT_REQUEST'
+        || (
+          covers(grant.cashboxIds, context.cashboxIds)
+          && covers(grant.bankAccountIds, context.bankAccountIds)
+          && covers(grant.methodCategories, context.methodCategories)
+        )
+      )
+      && (
+        grant.amountCeiling === null
+        || (
+          grant.amountCeilingCurrency === context.amountCurrency
+          && decimal(context.amount) <= decimal(grant.amountCeiling)
+        )
+      )
+    ));
+  }
+}
+
+function covers(scope: string[], values: string[]): boolean {
+  return scope.length === 0 || (values.length > 0 && values.every((value) => scope.includes(value)));
+}
+
+function decimal(value: string): bigint {
+  const [whole, fraction = ''] = value.split('.');
+  return BigInt(whole) * 1_000_000_000_000n + BigInt(fraction.padEnd(12, '0'));
 }
