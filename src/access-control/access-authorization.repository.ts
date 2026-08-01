@@ -3,6 +3,32 @@ import { sql } from 'drizzle-orm';
 
 import type { DatabaseTransaction } from '../database/database.service';
 
+export interface PaymentAuthorizationContext {
+  branchId: string | null;
+  treasuryUnitId: string | null;
+  cashboxIds: string[];
+  bankAccountIds: string[];
+  currencies: string[];
+  methodCategories: string[];
+  documentType: 'PAYMENT_REQUEST' | 'PAYMENT';
+  amount: string;
+  amountCurrency: string;
+}
+
+export interface PaymentGrant {
+  [key: string]: unknown;
+  id: string;
+  amountCeiling: string | null;
+  amountCeilingCurrency: string | null;
+  branchIds: string[];
+  treasuryUnitIds: string[];
+  cashboxIds: string[];
+  bankAccountIds: string[];
+  documentTypes: string[];
+  methodCategories: string[];
+  currencies: string[];
+}
+
 @Injectable()
 export class AccessAuthorizationRepository {
   async canOperateReceipt(
@@ -232,5 +258,158 @@ export class AccessAuthorizationRepository {
       ) AS allowed
     `);
     return result.rows[0]!.allowed;
+  }
+
+  async paymentGrants(
+    transaction: DatabaseTransaction,
+    organizationId: string,
+    actorUserId: string,
+    permission: 'payment-request.create' | 'payment.create',
+  ): Promise<PaymentGrant[]> {
+    const result = await transaction.execute<PaymentGrant>(sql`
+      SELECT ag.id,
+             ag.amount_ceiling::text AS "amountCeiling",
+             ag.amount_ceiling_currency AS "amountCeilingCurrency",
+             ARRAY(SELECT s.branch_id::text FROM access_grant_branch_scopes s
+                   WHERE s.access_grant_id = ag.id ORDER BY s.branch_id) AS "branchIds",
+             ARRAY(SELECT s.treasury_unit_id::text FROM access_grant_treasury_unit_scopes s
+                   WHERE s.access_grant_id = ag.id ORDER BY s.treasury_unit_id) AS "treasuryUnitIds",
+             ARRAY(SELECT s.cashbox_id::text FROM access_grant_cashbox_scopes s
+                   WHERE s.access_grant_id = ag.id ORDER BY s.cashbox_id) AS "cashboxIds",
+             ARRAY(SELECT s.bank_account_id::text FROM access_grant_bank_account_scopes s
+                   WHERE s.access_grant_id = ag.id ORDER BY s.bank_account_id) AS "bankAccountIds",
+             ARRAY(SELECT s.document_type FROM access_grant_document_type_scopes s
+                   WHERE s.access_grant_id = ag.id ORDER BY s.document_type) AS "documentTypes",
+             ARRAY(SELECT s.method_category FROM access_grant_method_category_scopes s
+                   WHERE s.access_grant_id = ag.id ORDER BY s.method_category) AS "methodCategories",
+             ARRAY(SELECT s.currency FROM access_grant_currency_scopes s
+                   WHERE s.access_grant_id = ag.id ORDER BY s.currency) AS currencies
+      FROM access_grants ag
+      JOIN roles r ON r.id = ag.role_id AND r.state = 'ACTIVE'
+      JOIN role_permissions rp ON rp.role_id = r.id AND rp.permission = ${permission}
+      WHERE ag.organization_id = ${organizationId}
+        AND ag.user_ref_id = ${actorUserId}
+        AND ag.state = 'ACTIVE'
+        AND ag.valid_from <= now()
+        AND (ag.valid_to IS NULL OR ag.valid_to > now())
+      ORDER BY ag.id
+    `);
+    return result.rows;
+  }
+
+  async visiblePaymentIds(
+    transaction: DatabaseTransaction,
+    organizationId: string,
+    actorUserId: string,
+    limit: number,
+    cursor?: { businessDate: string; id: string },
+    from?: string,
+    to?: string,
+  ): Promise<string[]> {
+    const result = await transaction.execute<{ id: string }>(sql`
+      SELECT pd.id
+      FROM payment_documents pd
+      JOIN treasury_units tu
+        ON tu.organization_id = pd.organization_id
+       AND tu.id = pd.treasury_unit_id
+      WHERE pd.organization_id = ${organizationId}
+        AND (${from ?? null}::date IS NULL OR pd.business_date >= ${from ?? null}::date)
+        AND (${to ?? null}::date IS NULL OR pd.business_date <= ${to ?? null}::date)
+        AND (
+          ${cursor?.businessDate ?? null}::date IS NULL
+          OR (pd.business_date, pd.id) < (
+            ${cursor?.businessDate ?? null}::date,
+            ${cursor?.id ?? null}::uuid
+          )
+        )
+        AND EXISTS (
+          SELECT 1
+          FROM access_grants ag
+          JOIN roles r ON r.id = ag.role_id AND r.state = 'ACTIVE'
+          JOIN role_permissions rp ON rp.role_id = r.id AND rp.permission = 'payment.view'
+          WHERE ag.organization_id = pd.organization_id
+            AND ag.user_ref_id = ${actorUserId}
+            AND ag.state = 'ACTIVE'
+            AND ag.valid_from <= now()
+            AND (ag.valid_to IS NULL OR ag.valid_to > now())
+            AND (
+              NOT EXISTS (SELECT 1 FROM access_grant_branch_scopes s WHERE s.access_grant_id = ag.id)
+              OR (COALESCE(pd.branch_id, tu.branch_id) IS NOT NULL AND EXISTS (
+                SELECT 1 FROM access_grant_branch_scopes s
+                WHERE s.access_grant_id = ag.id
+                  AND s.branch_id = COALESCE(pd.branch_id, tu.branch_id)
+              ))
+            )
+            AND (
+              NOT EXISTS (SELECT 1 FROM access_grant_treasury_unit_scopes s WHERE s.access_grant_id = ag.id)
+              OR EXISTS (
+                SELECT 1 FROM access_grant_treasury_unit_scopes s
+                WHERE s.access_grant_id = ag.id AND s.treasury_unit_id = pd.treasury_unit_id
+              )
+            )
+            AND (
+              NOT EXISTS (SELECT 1 FROM access_grant_document_type_scopes s WHERE s.access_grant_id = ag.id)
+              OR EXISTS (
+                SELECT 1 FROM access_grant_document_type_scopes s
+                WHERE s.access_grant_id = ag.id AND s.document_type = 'PAYMENT'
+              )
+            )
+            AND (
+              NOT EXISTS (SELECT 1 FROM access_grant_cashbox_scopes s WHERE s.access_grant_id = ag.id)
+              OR EXISTS (
+                SELECT 1 FROM payment_lines pl
+                JOIN access_grant_cashbox_scopes s
+                  ON s.access_grant_id = ag.id AND s.cashbox_id = pl.cashbox_id
+                WHERE pl.organization_id = pd.organization_id
+                  AND pl.payment_document_id = pd.id
+              )
+            )
+            AND (
+              NOT EXISTS (SELECT 1 FROM access_grant_bank_account_scopes s WHERE s.access_grant_id = ag.id)
+              OR EXISTS (
+                SELECT 1 FROM payment_lines pl
+                JOIN access_grant_bank_account_scopes s
+                  ON s.access_grant_id = ag.id AND s.bank_account_id = pl.bank_account_id
+                WHERE pl.organization_id = pd.organization_id
+                  AND pl.payment_document_id = pd.id
+              )
+            )
+            AND (
+              NOT EXISTS (SELECT 1 FROM access_grant_currency_scopes s WHERE s.access_grant_id = ag.id)
+              OR EXISTS (
+                SELECT 1 FROM access_grant_currency_scopes s
+                WHERE s.access_grant_id = ag.id AND s.currency = pd.base_currency
+              )
+            )
+            AND NOT EXISTS (
+              SELECT 1
+              FROM payment_lines pl
+              WHERE pl.organization_id = pd.organization_id
+                AND pl.payment_document_id = pd.id
+                AND (
+                  (pl.cashbox_id IS NOT NULL
+                    AND EXISTS (SELECT 1 FROM access_grant_cashbox_scopes s WHERE s.access_grant_id = ag.id)
+                    AND NOT EXISTS (SELECT 1 FROM access_grant_cashbox_scopes s
+                                    WHERE s.access_grant_id = ag.id AND s.cashbox_id = pl.cashbox_id))
+                  OR
+                  (pl.bank_account_id IS NOT NULL
+                    AND EXISTS (SELECT 1 FROM access_grant_bank_account_scopes s WHERE s.access_grant_id = ag.id)
+                    AND NOT EXISTS (SELECT 1 FROM access_grant_bank_account_scopes s
+                                    WHERE s.access_grant_id = ag.id AND s.bank_account_id = pl.bank_account_id))
+                  OR
+                  (EXISTS (SELECT 1 FROM access_grant_method_category_scopes s WHERE s.access_grant_id = ag.id)
+                    AND NOT EXISTS (SELECT 1 FROM access_grant_method_category_scopes s
+                                    WHERE s.access_grant_id = ag.id AND s.method_category = pl.method_category))
+                  OR
+                  (EXISTS (SELECT 1 FROM access_grant_currency_scopes s WHERE s.access_grant_id = ag.id)
+                    AND NOT EXISTS (SELECT 1 FROM access_grant_currency_scopes s
+                                    WHERE s.access_grant_id = ag.id AND s.currency = pl.currency))
+                )
+            )
+        )
+      ORDER BY pd.business_date DESC, pd.id DESC
+      LIMIT ${limit}
+    `);
+    return result.rows.map(({ id }) => id);
   }
 }

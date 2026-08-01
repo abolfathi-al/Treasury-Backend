@@ -2118,6 +2118,274 @@ export const receiptExecutionEffects = pgTable('receipt_execution_effects', {
   unique().on(table.organizationId, table.chequeEventId),
 ]);
 
+export const paymentRequestNumberCounters = pgTable('payment_request_number_counters', {
+  organizationId: uuid('organization_id').primaryKey().references(() => organizations.id),
+  nextValue: bigint('next_value', { mode: 'number' }).notNull().default(1),
+}, (table) => [check('payment_request_number_counters_positive', sql`${table.nextValue} > 0`)]);
+
+export const paymentNumberCounters = pgTable('payment_number_counters', {
+  organizationId: uuid('organization_id').notNull().references(() => organizations.id),
+  businessDate: date('business_date').notNull(),
+  nextValue: bigint('next_value', { mode: 'number' }).notNull().default(1),
+}, (table) => [
+  primaryKey({ columns: [table.organizationId, table.businessDate] }),
+  check('payment_number_counters_positive', sql`${table.nextValue} > 0`),
+]);
+
+export const paymentRequests = pgTable('payment_requests', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  organizationId: uuid('organization_id').notNull().references(() => organizations.id),
+  businessNumber: varchar('business_number', { length: 64 }).notNull(),
+  requesterUserId: uuid('requester_user_id').notNull(),
+  beneficiaryPartyId: uuid('beneficiary_party_id').notNull(),
+  requestedAmount: numeric('requested_amount', { precision: 38, scale: 8 }).notNull(),
+  currency: varchar('currency', { length: 8 }).notNull(),
+  branchId: uuid('branch_id'),
+  treasuryUnitId: uuid('treasury_unit_id'),
+  dueDate: date('due_date'),
+  purpose: varchar('purpose', { length: 1000 }).notNull(),
+  contractRef: varchar('contract_ref', { length: 128 }),
+  invoiceRef: varchar('invoice_ref', { length: 128 }),
+  accountingDimensions: jsonb('accounting_dimensions').$type<Record<string, string>>(),
+  approvalProgress: jsonb('approval_progress')
+    .$type<{ state: 'NOT_STARTED'; completedSteps: 0; requiredSteps: 0 }>()
+    .notNull()
+    .default({ state: 'NOT_STARTED', completedSteps: 0, requiredSteps: 0 }),
+  state: varchar('state', { length: 32 }).notNull().default('DRAFT'),
+  version: bigint('version', { mode: 'number' }).notNull().default(0),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  unique().on(table.organizationId, table.businessNumber),
+  unique().on(table.organizationId, table.id),
+  foreignKey({
+    columns: [table.organizationId, table.requesterUserId],
+    foreignColumns: [userRefs.organizationId, userRefs.id],
+    name: 'payment_requests_requester_fk',
+  }),
+  foreignKey({
+    columns: [table.organizationId, table.beneficiaryPartyId],
+    foreignColumns: [parties.organizationId, parties.id],
+    name: 'payment_requests_beneficiary_fk',
+  }),
+  foreignKey({
+    columns: [table.organizationId, table.branchId],
+    foreignColumns: [branches.organizationId, branches.id],
+    name: 'payment_requests_branch_fk',
+  }),
+  foreignKey({
+    columns: [table.organizationId, table.treasuryUnitId],
+    foreignColumns: [treasuryUnits.organizationId, treasuryUnits.id],
+    name: 'payment_requests_treasury_unit_fk',
+  }),
+  foreignKey({
+    columns: [table.organizationId, table.currency],
+    foreignColumns: [currencies.organizationId, currencies.code],
+    name: 'payment_requests_currency_fk',
+  }),
+  check('payment_requests_amount_positive', sql`${table.requestedAmount} > 0`),
+  check('payment_requests_approval_progress_initial', sql`${table.approvalProgress} = '{"state":"NOT_STARTED","completedSteps":0,"requiredSteps":0}'::jsonb`),
+  check('payment_requests_state_check', sql`${table.state} = 'DRAFT'`),
+  check('payment_requests_version_nonnegative', sql`${table.version} >= 0`),
+]);
+
+export const paymentDocuments = pgTable('payment_documents', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  organizationId: uuid('organization_id').notNull().references(() => organizations.id),
+  businessNumber: varchar('business_number', { length: 64 }).notNull(),
+  businessDate: date('business_date').notNull(),
+  beneficiaryPartyId: uuid('beneficiary_party_id').notNull(),
+  paymentRequestId: uuid('payment_request_id'),
+  branchId: uuid('branch_id'),
+  treasuryUnitId: uuid('treasury_unit_id').notNull(),
+  baseCurrency: varchar('base_currency', { length: 8 }).notNull(),
+  totalBaseAmount: numeric('total_base_amount', { precision: 38, scale: 8 }).notNull(),
+  dueDate: date('due_date'),
+  purpose: varchar('purpose', { length: 1000 }).notNull(),
+  creatorUserId: uuid('creator_user_id').notNull(),
+  state: varchar('state', { length: 32 }).notNull().default('DRAFT'),
+  workflowState: varchar('workflow_state', { length: 24 }).notNull().default('DRAFT'),
+  executionState: varchar('execution_state', { length: 24 }).notNull().default('NOT_EXECUTED'),
+  accountingState: varchar('accounting_state', { length: 24 }).notNull().default('NOT_READY'),
+  version: bigint('version', { mode: 'number' }).notNull().default(0),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  unique().on(table.organizationId, table.businessNumber),
+  unique().on(table.organizationId, table.id),
+  unique().on(table.organizationId, table.id, table.baseCurrency),
+  foreignKey({
+    columns: [table.organizationId, table.beneficiaryPartyId],
+    foreignColumns: [parties.organizationId, parties.id],
+    name: 'payment_documents_beneficiary_fk',
+  }),
+  foreignKey({
+    columns: [table.organizationId, table.paymentRequestId],
+    foreignColumns: [paymentRequests.organizationId, paymentRequests.id],
+    name: 'payment_documents_request_fk',
+  }),
+  foreignKey({
+    columns: [table.organizationId, table.branchId],
+    foreignColumns: [branches.organizationId, branches.id],
+    name: 'payment_documents_branch_fk',
+  }),
+  foreignKey({
+    columns: [table.organizationId, table.treasuryUnitId],
+    foreignColumns: [treasuryUnits.organizationId, treasuryUnits.id],
+    name: 'payment_documents_treasury_unit_fk',
+  }),
+  foreignKey({
+    columns: [table.organizationId, table.baseCurrency],
+    foreignColumns: [currencies.organizationId, currencies.code],
+    name: 'payment_documents_currency_fk',
+  }),
+  foreignKey({
+    columns: [table.organizationId, table.creatorUserId],
+    foreignColumns: [userRefs.organizationId, userRefs.id],
+    name: 'payment_documents_creator_fk',
+  }),
+  check('payment_documents_total_positive', sql`${table.totalBaseAmount} > 0`),
+  check('payment_documents_state_check', sql`${table.state} = 'DRAFT'`),
+  check('payment_documents_workflow_state_check', sql`${table.workflowState} = 'DRAFT'`),
+  check('payment_documents_execution_state_check', sql`${table.executionState} = 'NOT_EXECUTED'`),
+  check('payment_documents_accounting_state_check', sql`${table.accountingState} = 'NOT_READY'`),
+  check('payment_documents_version_nonnegative', sql`${table.version} >= 0`),
+  index('payment_documents_list_idx').on(
+    table.organizationId,
+    table.businessDate.desc(),
+    table.id.desc(),
+  ),
+]);
+
+export const paymentLines = pgTable('payment_lines', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  organizationId: uuid('organization_id').notNull().references(() => organizations.id),
+  paymentDocumentId: uuid('payment_document_id').notNull(),
+  lineNumber: integer('line_number').notNull(),
+  methodId: uuid('method_id').notNull(),
+  methodName: varchar('method_name', { length: 160 }).notNull(),
+  methodCategory: varchar('method_category', { length: 32 }).notNull(),
+  methodRequiredReferences: jsonb('method_required_references').$type<string[]>().notNull(),
+  requiresApproval: boolean('requires_approval').notNull(),
+  amount: numeric('amount', { precision: 38, scale: 8 }).notNull(),
+  currency: varchar('currency', { length: 8 }).notNull(),
+  baseCurrency: varchar('base_currency', { length: 8 }).notNull(),
+  exchangeRate: numeric('exchange_rate', { precision: 38, scale: 18 }).notNull(),
+  rateType: varchar('rate_type', { length: 64 }).notNull(),
+  rateSource: varchar('rate_source', { length: 24 }).notNull(),
+  rateRecordId: uuid('rate_record_id').references(() => exchangeRates.id),
+  rateAt: timestamp('rate_at', { withTimezone: true }).notNull(),
+  baseAmount: numeric('base_amount', { precision: 38, scale: 8 }).notNull(),
+  roundingDifference: numeric('rounding_difference', { precision: 38, scale: 8 }).notNull().default('0'),
+  cashboxId: uuid('cashbox_id'),
+  bankAccountId: uuid('bank_account_id'),
+  beneficiaryPartyId: uuid('beneficiary_party_id').notNull(),
+  beneficiaryAccountReference: varchar('beneficiary_account_reference', { length: 128 }),
+  trackingNumber: varchar('tracking_number', { length: 128 }),
+  dueDate: date('due_date'),
+  description: varchar('description', { length: 1000 }),
+  accountingDimensions: jsonb('accounting_dimensions').$type<Record<string, string>>(),
+  state: varchar('state', { length: 16 }).notNull().default('DRAFT'),
+  version: bigint('version', { mode: 'number' }).notNull().default(0),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  unique().on(table.organizationId, table.id),
+  unique().on(table.organizationId, table.paymentDocumentId, table.lineNumber),
+  foreignKey({
+    columns: [table.organizationId, table.paymentDocumentId, table.baseCurrency],
+    foreignColumns: [paymentDocuments.organizationId, paymentDocuments.id, paymentDocuments.baseCurrency],
+    name: 'payment_lines_document_fk',
+  }),
+  foreignKey({
+    columns: [table.organizationId, table.methodId],
+    foreignColumns: [methodDefinitions.organizationId, methodDefinitions.id],
+    name: 'payment_lines_method_fk',
+  }),
+  foreignKey({
+    columns: [table.organizationId, table.cashboxId],
+    foreignColumns: [cashboxes.organizationId, cashboxes.id],
+    name: 'payment_lines_cashbox_fk',
+  }),
+  foreignKey({
+    columns: [table.organizationId, table.bankAccountId],
+    foreignColumns: [bankAccounts.organizationId, bankAccounts.id],
+    name: 'payment_lines_bank_account_fk',
+  }),
+  foreignKey({
+    columns: [table.organizationId, table.beneficiaryPartyId],
+    foreignColumns: [parties.organizationId, parties.id],
+    name: 'payment_lines_beneficiary_fk',
+  }),
+  foreignKey({
+    columns: [table.organizationId, table.currency],
+    foreignColumns: [currencies.organizationId, currencies.code],
+    name: 'payment_lines_currency_fk',
+  }),
+  check('payment_lines_line_number_positive', sql`${table.lineNumber} > 0`),
+  check('payment_lines_required_references_array', sql`jsonb_typeof(${table.methodRequiredReferences}) = 'array'`),
+  check('payment_lines_amount_positive', sql`${table.amount} > 0`),
+  check('payment_lines_exchange_rate_positive', sql`${table.exchangeRate} > 0`),
+  check('payment_lines_base_amount_positive', sql`${table.baseAmount} > 0`),
+  check('payment_lines_state_check', sql`${table.state} = 'DRAFT'`),
+  check('payment_lines_version_nonnegative', sql`${table.version} >= 0`),
+  check('payment_lines_rate_shape', sql`(
+    ${table.rateSource} = 'IDENTITY'
+    AND ${table.currency} = ${table.baseCurrency}
+    AND ${table.exchangeRate} = 1
+    AND ${table.rateRecordId} IS NULL
+    AND ${table.roundingDifference} = 0
+  ) OR (
+    ${table.rateSource} = 'TABLE'
+    AND ${table.currency} <> ${table.baseCurrency}
+    AND ${table.rateRecordId} IS NOT NULL
+  )`),
+]);
+
+export const paymentRequestAttachmentLinks = pgTable('payment_request_attachment_links', {
+  organizationId: uuid('organization_id').notNull().references(() => organizations.id),
+  paymentRequestId: uuid('payment_request_id').notNull(),
+  attachmentId: uuid('attachment_id').notNull(),
+  contentDigest: char('content_digest', { length: 64 }).notNull(),
+  purpose: varchar('purpose', { length: 64 }).notNull().default(''),
+  linkedAt: timestamp('linked_at', { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  primaryKey({ columns: [table.organizationId, table.paymentRequestId, table.attachmentId, table.purpose] }),
+  foreignKey({
+    columns: [table.organizationId, table.paymentRequestId],
+    foreignColumns: [paymentRequests.organizationId, paymentRequests.id],
+    name: 'payment_request_attachment_links_request_fk',
+  }),
+  foreignKey({
+    columns: [table.organizationId, table.attachmentId, table.contentDigest],
+    foreignColumns: [attachments.organizationId, attachments.id, attachments.contentDigest],
+    name: 'payment_request_attachment_links_attachment_fk',
+  }),
+  check('payment_request_attachment_links_digest_format', sql`${table.contentDigest} ~ '^[a-f0-9]{64}$'`),
+]);
+
+export const paymentLineAttachmentLinks = pgTable('payment_line_attachment_links', {
+  organizationId: uuid('organization_id').notNull().references(() => organizations.id),
+  paymentLineId: uuid('payment_line_id').notNull(),
+  attachmentId: uuid('attachment_id').notNull(),
+  contentDigest: char('content_digest', { length: 64 }).notNull(),
+  purpose: varchar('purpose', { length: 64 }).notNull().default(''),
+  linkedAt: timestamp('linked_at', { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  primaryKey({ columns: [table.organizationId, table.paymentLineId, table.attachmentId, table.purpose] }),
+  foreignKey({
+    columns: [table.organizationId, table.paymentLineId],
+    foreignColumns: [paymentLines.organizationId, paymentLines.id],
+    name: 'payment_line_attachment_links_line_fk',
+  }),
+  foreignKey({
+    columns: [table.organizationId, table.attachmentId, table.contentDigest],
+    foreignColumns: [attachments.organizationId, attachments.id, attachments.contentDigest],
+    name: 'payment_line_attachment_links_attachment_fk',
+  }),
+  check('payment_line_attachment_links_digest_format', sql`${table.contentDigest} ~ '^[a-f0-9]{64}$'`),
+]);
+
 export const auditEvents = pgTable('audit_events', {
   id: uuid('id').primaryKey().defaultRandom(),
   organizationId: uuid('organization_id').notNull().references(() => organizations.id),

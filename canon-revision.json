@@ -1,20 +1,23 @@
 {
   "repository": "Treasury-Canon",
-  "revision": "0f47f37a91e2be110b75ac89c26a017c545a59dc",
+  "revision": "1eda11d6e497b9f2d8209429124a28d43f2b667c",
   "canon_root": "canon-v4",
-  "authorized_delivery_slice": "SLICE-2-RECEIPT",
-  "authorized_increment": "INC-2E-RECEIPT-REPORTING",
+  "authorized_delivery_slice": "SLICE-3-PAYMENT",
+  "authorized_increment": "INC-3A-PAYMENT-REQUEST-DRAFT",
   "requirements": [
-    "REQ-RPT-001",
-    "REQ-RPT-005",
-    "REQ-RPT-007"
+    "REQ-PAY-001",
+    "REQ-PAY-002",
+    "REQ-PAY-003",
+    "REQ-PAY-004",
+    "REQ-PAY-005"
   ],
   "acceptance_scenarios": [
-    "SCN-RPT-004",
-    "SCN-RPT-010",
-    "SCN-RPT-011"
+    "SCN-PAY-001",
+    "SCN-PAY-011"
   ],
   "authorized_operations": [
-    "runOperationalReport"
+    "createPaymentRequest",
+    "listPayments",
+    "createPayment"
   ]
 }

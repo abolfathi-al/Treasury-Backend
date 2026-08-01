@@ -44,6 +44,7 @@ const titles = {
   'TRS-RCP-004': 'Receipt effect mapping unavailable',
   'TRS-RCP-005': 'Receipt approval policy unavailable',
   'TRS-RCP-006': 'Receipt reversal blocked',
+  'TRS-PAY-002': 'Payment evidence incomplete',
   'TRS-ACT-005': 'Accounting posting lock active',
   'TRS-RPT-001': 'Unsupported report request',
   'TRS-RPT-002': 'Projection stale',

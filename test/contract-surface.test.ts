@@ -21,6 +21,7 @@ import { ChequeController } from '../src/cheques/cheque.controller';
 import { CollectionItemsController } from '../src/collection-and-settlement/collection-items.controller';
 import { MasterDataController } from '../src/master-data/master-data.controller';
 import { PrintTemplateController } from '../src/master-data/print-template.controller';
+import { PaymentController } from '../src/payments/payment.controller';
 import { ReceiptController } from '../src/receipts/receipt.controller';
 import { ReportingController } from '../src/reporting/reporting.controller';
 
@@ -80,6 +81,9 @@ const expectedOperations = [
   ['POST', 'v1/receipts/:resourceId/submit'],
   ['POST', 'v1/receipts/:resourceId/execute'],
   ['POST', 'v1/receipts/:resourceId/reverse'],
+  ['POST', 'v1/payment-requests'],
+  ['GET', 'v1/payments'],
+  ['POST', 'v1/payments'],
   ['GET', 'v1/reports/:reportKey'],
 ] as const;
 
@@ -95,6 +99,7 @@ test('all authorized operations through INC-1H are present in owner-local contro
     BankingController,
     ChequeController,
     CollectionItemsController,
+    PaymentController,
     ReceiptController,
     ReportingController,
   ]) {
@@ -124,6 +129,38 @@ test('Operational reporting uses the exact one-grant permission contract', () =>
     'ONE_GRANT_RESOURCE',
   );
   assert.equal(Reflect.getMetadata(STEP_UP_REQUIRED, handler), undefined);
+});
+
+test('INC-3A Payment operations expose only the authorized one-grant surface', () => {
+  for (const [handler, permission, operationId] of [
+    [PaymentController.prototype.createRequest, 'payment-request.create', 'createPaymentRequest'],
+    [PaymentController.prototype.list, 'payment.view', 'listPayments'],
+    [PaymentController.prototype.create, 'payment.create', 'createPayment'],
+  ] as const) {
+    assert.equal(Reflect.getMetadata(REQUIRED_PERMISSION, handler), permission);
+    assert.equal(Reflect.getMetadata(AUTHORIZATION_OPERATION, handler), operationId);
+    assert.equal(Reflect.getMetadata(PERMISSION_SCOPE_MODE, handler), 'ONE_GRANT_RESOURCE');
+    assert.equal(Reflect.getMetadata(STEP_UP_REQUIRED, handler), undefined);
+  }
+  for (const deferred of ['submit', 'approve', 'execute', 'reverse']) {
+    assert.equal(Object.prototype.hasOwnProperty.call(PaymentController.prototype, deferred), false);
+  }
+});
+
+test('INC-3A Payment migration preserves tenant, reparent, and locked-total invariants', async () => {
+  const migration = await readFile('migrations/0017_payment_request_drafts.sql', 'utf8');
+  for (const table of [
+    'payment_requests',
+    'payment_documents',
+    'payment_lines',
+    'payment_request_attachment_links',
+    'payment_line_attachment_links',
+  ]) assert.match(migration, new RegExp(`CREATE TABLE ${table}`, 'u'));
+  assert.match(migration, /prevent_payment_child_reparenting/u);
+  assert.match(migration, /SELECT total_base_amount\s+INTO expected_total[\s\S]*FOR UPDATE/u);
+  assert.match(migration, /DEFERRABLE INITIALLY DEFERRED/u);
+  assert.match(migration, /FOREIGN KEY \(organization_id, attachment_id, content_digest\)/u);
+  assert.match(migration, /approval_progress = '\{"state":"NOT_STARTED","completedSteps":0,"requiredSteps":0\}'::jsonb/u);
 });
 
 test('Collection Item queue uses the exact one-grant permission contract', () => {
