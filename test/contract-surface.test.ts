@@ -20,6 +20,7 @@ import { BankingController } from '../src/banking/banking.controller';
 import { CashboxController } from '../src/cashbox-and-custody/cashbox.controller';
 import { ChequeController } from '../src/cheques/cheque.controller';
 import { CollectionItemsController } from '../src/collection-and-settlement/collection-items.controller';
+import { SettlementController } from '../src/collection-and-settlement/settlement.controller';
 import { MasterDataController } from '../src/master-data/master-data.controller';
 import { PrintTemplateController } from '../src/master-data/print-template.controller';
 import { PaymentController } from '../src/payments/payment.controller';
@@ -74,6 +75,9 @@ const expectedOperations = [
   ['GET', 'v1/payment-gateways'],
   ['POST', 'v1/payment-gateways'],
   ['GET', 'v1/collection-items'],
+  ['POST', 'v1/settlement-batches'],
+  ['POST', 'v1/settlement-batches/:resourceId/confirm'],
+  ['POST', 'v1/settlement-batches/:resourceId/reverse'],
   ['POST', 'v1/cheque-books'],
   ['POST', 'v1/cheque-books/:chequeBookId/leaves/:leafNumber/transitions'],
   ['GET', 'v1/receipts'],
@@ -111,6 +115,7 @@ test('all authorized operations through INC-1H are present in owner-local contro
     BankingController,
     ChequeController,
     CollectionItemsController,
+    SettlementController,
     PaymentController,
     ReceiptController,
     ReportingController,
@@ -128,6 +133,38 @@ test('all authorized operations through INC-1H are present in owner-local contro
   for (const [method, path] of expectedOperations) {
     assert.ok(operations.has(`${method} ${path}`), `${method} ${path}`);
   }
+});
+
+test('INC-4C Settlement routes expose only the authorized one-grant surface', () => {
+  for (const [handler, permission, operationId] of [
+    [SettlementController.prototype.create, 'settlement.create', 'createSettlementBatch'],
+    [SettlementController.prototype.confirm, 'settlement.confirm', 'confirmSettlementBatch'],
+    [SettlementController.prototype.reverse, 'settlement.reverse', 'reverseSettlementBatch'],
+  ] as const) {
+    assert.equal(Reflect.getMetadata(REQUIRED_PERMISSION, handler), permission);
+    assert.equal(Reflect.getMetadata(AUTHORIZATION_OPERATION, handler), operationId);
+    assert.equal(Reflect.getMetadata(PERMISSION_SCOPE_MODE, handler), 'ONE_GRANT_RESOURCE');
+  }
+  assert.equal(Reflect.getMetadata(STEP_UP_REQUIRED, SettlementController.prototype.create), undefined);
+  assert.equal(Reflect.getMetadata(STEP_UP_REQUIRED, SettlementController.prototype.confirm), undefined);
+  assert.equal(
+    Reflect.getMetadata(STEP_UP_REQUIRED, SettlementController.prototype.reverse),
+    'reverseSettlementBatch',
+  );
+});
+
+test('INC-4C Settlement migration preserves immutable evidence and lifecycle constraints', async () => {
+  const migration = await readFile('migrations/0022_settlement_lifecycle.sql', 'utf8');
+  for (const table of [
+    'settlement_batches',
+    'settlement_allocations',
+    'settlement_attachment_links',
+    'settlement_effects',
+  ]) assert.match(migration, new RegExp(`CREATE TABLE ${table}`, 'u'));
+  assert.match(migration, /settlement_batch_history_immutable/u);
+  assert.match(migration, /settlement_allocation_consistency/u);
+  assert.match(migration, /settlement_effects_append_only/u);
+  assert.match(migration, /purpose = 'BANK_CREDIT_EVIDENCE'/u);
 });
 
 test('Operational reporting uses the exact one-grant permission contract', () => {

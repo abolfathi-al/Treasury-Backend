@@ -1,27 +1,28 @@
 {
   "repository": "Treasury-Canon",
-  "revision": "19e8423a6855a684d0a29b01f1f91a2a5f6cc4b5",
+  "revision": "eda157ec6ff8c6a7d1d212903a42807196b9e73d",
   "canon_root": "canon-v4",
   "authorized_delivery_slice": "SLICE-4-TRANSFER-SETTLEMENT",
-  "authorized_increment": "INC-4A-TRANSFER-DRAFT-APPROVAL",
+  "authorized_increment": "INC-4C-SETTLEMENT-LIFECYCLE",
   "requirements": [
-    "REQ-TRF-001",
-    "REQ-TRF-002",
-    "REQ-TRF-003",
-    "REQ-TRF-004"
+    "REQ-COL-004",
+    "REQ-COL-005",
+    "REQ-COL-006",
+    "REQ-COL-007",
+    "REQ-COL-008",
+    "REQ-COL-009",
+    "REQ-ACC-005"
   ],
   "acceptance_scenarios": [
-    "SCN-TRF-009",
-    "SCN-TRF-010",
-    "SCN-TRF-011",
-    "SCN-TRF-012",
-    "SCN-TRF-013",
-    "SCN-TRF-014"
+    "SCN-COL-002",
+    "SCN-COL-003",
+    "SCN-COL-004",
+    "SCN-COL-005",
+    "SCN-COL-006"
   ],
   "authorized_operations": [
-    "listTransfers",
-    "createTransfer",
-    "submitTransfer",
-    "actOnTransferApproval"
+    "createSettlementBatch",
+    "confirmSettlementBatch",
+    "reverseSettlementBatch"
   ]
 }

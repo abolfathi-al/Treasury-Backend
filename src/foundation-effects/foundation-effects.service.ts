@@ -10,8 +10,8 @@ import {
 
 export interface MovementFactCommand {
   organizationId: string;
-  owner?: 'domain.receipts' | 'domain.payments';
-  sourceType?: 'RECEIPT' | 'Payment';
+  owner?: 'domain.receipts' | 'domain.payments' | 'domain.collection-and-settlement';
+  sourceType?: 'RECEIPT' | 'Payment' | 'SettlementBatch';
   sourceId: string;
   sourceLineId: string;
   effectKey: string;
@@ -58,7 +58,7 @@ export class FoundationEffectsRepository {
       organizationId: string;
       requestId: string;
       actorUserId: string;
-      entityType?: 'Receipt' | 'Payment' | 'BankInstruction' | 'AccountingExport';
+      entityType?: 'Receipt' | 'Payment' | 'BankInstruction' | 'AccountingExport' | 'SettlementBatch';
       entityId: string;
       action: string;
       reason?: string;
@@ -81,7 +81,7 @@ export class FoundationEffectsRepository {
     transaction: DatabaseTransaction,
     input: {
       organizationId: string;
-      aggregateType?: 'Receipt' | 'Payment' | 'BankInstruction' | 'AccountingExport';
+      aggregateType?: 'Receipt' | 'Payment' | 'BankInstruction' | 'AccountingExport' | 'SettlementBatch';
       aggregateId: string;
       aggregateVersion: number;
       eventType: string;
