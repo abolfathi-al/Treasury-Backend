@@ -268,7 +268,7 @@ export class AccessAuthorizationRepository {
     actorUserId: string,
     permission: 'payment-request.create' | 'payment.create' | 'payment.submit'
       | 'payment.approve' | 'payment.reject' | 'payment.execute' | 'payment.reverse'
-      | 'bank-instruction.record-outcome',
+      | 'bank-instruction.record-outcome' | 'accounting.export' | 'accounting.acknowledge',
     roleId?: string,
   ): Promise<PaymentGrant[]> {
     const result = await transaction.execute<PaymentGrant>(sql`
@@ -429,6 +429,85 @@ export class AccessAuthorizationRepository {
             )
         )
       ORDER BY pd.business_date DESC, pd.id DESC
+      LIMIT ${limit}
+    `);
+    return result.rows.map(({ id }) => id);
+  }
+
+  async visibleAccountingExportIds(
+    transaction: DatabaseTransaction,
+    organizationId: string,
+    actorUserId: string,
+    limit: number,
+    cursor?: { createdAt: string; id: string },
+  ): Promise<string[]> {
+    const result = await transaction.execute<{ id: string }>(sql`
+      SELECT ae.id
+      FROM accounting_exports ae
+      WHERE ae.organization_id = ${organizationId}
+        AND ae.source_type = 'PAYMENT'
+        AND ae.exported_by <> ${actorUserId}
+        AND ae.state IN ('QUEUED', 'SENDING', 'SENDING_UNKNOWN', 'ACCEPTED')
+        AND (
+          ${cursor?.createdAt ?? null}::timestamptz IS NULL
+          OR (ae.created_at, ae.id) < (
+            ${cursor?.createdAt ?? null}::timestamptz,
+            ${cursor?.id ?? null}::uuid
+          )
+        )
+        AND EXISTS (
+          SELECT 1
+          FROM access_grants ag
+          JOIN roles r ON r.id = ag.role_id AND r.state = 'ACTIVE'
+          JOIN role_permissions rp
+            ON rp.role_id = r.id AND rp.permission = 'accounting.acknowledge'
+          WHERE ag.organization_id = ae.organization_id
+            AND (
+              ag.user_ref_id = ${actorUserId}
+              OR EXISTS (
+                SELECT 1 FROM delegations d
+                WHERE d.organization_id = ag.organization_id
+                  AND d.access_grant_id = ag.id
+                  AND d.grantor_user_id = ag.user_ref_id
+                  AND d.delegate_user_id = ${actorUserId}
+                  AND d.revoked_at IS NULL
+                  AND d.valid_from <= now()
+                  AND d.valid_to > now()
+              )
+            )
+            AND ag.state = 'ACTIVE'
+            AND ag.valid_from <= now()
+            AND (ag.valid_to IS NULL OR ag.valid_to > now())
+            AND (
+              NOT EXISTS (SELECT 1 FROM access_grant_branch_scopes s WHERE s.access_grant_id = ag.id)
+              OR (ae.branch_id IS NOT NULL AND EXISTS (
+                SELECT 1 FROM access_grant_branch_scopes s
+                WHERE s.access_grant_id = ag.id AND s.branch_id = ae.branch_id
+              ))
+            )
+            AND (
+              NOT EXISTS (SELECT 1 FROM access_grant_treasury_unit_scopes s WHERE s.access_grant_id = ag.id)
+              OR (ae.treasury_unit_id IS NOT NULL AND EXISTS (
+                SELECT 1 FROM access_grant_treasury_unit_scopes s
+                WHERE s.access_grant_id = ag.id AND s.treasury_unit_id = ae.treasury_unit_id
+              ))
+            )
+            AND (
+              NOT EXISTS (SELECT 1 FROM access_grant_document_type_scopes s WHERE s.access_grant_id = ag.id)
+              OR EXISTS (
+                SELECT 1 FROM access_grant_document_type_scopes s
+                WHERE s.access_grant_id = ag.id AND s.document_type = ae.document_type
+              )
+            )
+            AND (
+              ag.amount_ceiling IS NULL
+              OR (
+                ag.amount_ceiling_currency = ae.base_currency
+                AND ae.aggregate_base_amount <= ag.amount_ceiling
+              )
+            )
+        )
+      ORDER BY ae.created_at DESC, ae.id DESC
       LIMIT ${limit}
     `);
     return result.rows.map(({ id }) => id);

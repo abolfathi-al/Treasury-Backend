@@ -5,6 +5,7 @@ import { RequestMethod } from '@nestjs/common';
 import { METHOD_METADATA, PATH_METADATA } from '@nestjs/common/constants';
 
 import { AuthController } from '../src/access-control/auth.controller';
+import { AccountingController } from '../src/accounting-integration/accounting.controller';
 import { AccessAdminController } from '../src/access-control/access-admin.controller';
 import { CANON_PERMISSIONS } from '../src/access-control/access-admin.dto';
 import {
@@ -82,6 +83,11 @@ const expectedOperations = [
   ['POST', 'v1/receipts/:resourceId/execute'],
   ['POST', 'v1/receipts/:resourceId/reverse'],
   ['POST', 'v1/payment-requests'],
+  ['GET', 'v1/accounting/systems'],
+  ['GET', 'v1/accounting/exports'],
+  ['POST', 'v1/accounting/exports'],
+  ['GET', 'v1/accounting/exports/:resourceId/file'],
+  ['POST', 'v1/accounting/exports/:resourceId/acknowledgements'],
   ['GET', 'v1/payments'],
   ['POST', 'v1/payments'],
   ['GET', 'v1/reports/:reportKey'],
@@ -91,6 +97,7 @@ test('all authorized operations through INC-1H are present in owner-local contro
   const operations = new Set<string>();
   for (const controller of [
     AuthController,
+    AccountingController,
     IdentityController,
     AccessAdminController,
     MasterDataController,
@@ -129,6 +136,21 @@ test('Operational reporting uses the exact one-grant permission contract', () =>
     'ONE_GRANT_RESOURCE',
   );
   assert.equal(Reflect.getMetadata(STEP_UP_REQUIRED, handler), undefined);
+});
+
+test('INC-3D Accounting routes expose only the authorized one-grant surface', () => {
+  for (const [handler, permission, operationId] of [
+    [AccountingController.prototype.listSystems, 'accounting.export', 'listAccountingSystems'],
+    [AccountingController.prototype.listExports, 'accounting.acknowledge', 'listAccountingExports'],
+    [AccountingController.prototype.createExport, 'accounting.export', 'createAccountingExport'],
+    [AccountingController.prototype.download, 'accounting.export', 'downloadAccountingExportFile'],
+    [AccountingController.prototype.acknowledge, 'accounting.acknowledge', 'recordAccountingAcknowledgement'],
+  ] as const) {
+    assert.equal(Reflect.getMetadata(REQUIRED_PERMISSION, handler), permission);
+    assert.equal(Reflect.getMetadata(AUTHORIZATION_OPERATION, handler), operationId);
+    assert.equal(Reflect.getMetadata(PERMISSION_SCOPE_MODE, handler), 'ONE_GRANT_RESOURCE');
+    assert.equal(Reflect.getMetadata(STEP_UP_REQUIRED, handler), undefined);
+  }
 });
 
 test('Payment operations through INC-3C expose only the authorized one-grant surface', () => {
