@@ -13,6 +13,7 @@ import { MasterDataModule } from './master-data/master-data.module';
 import { PaymentModule } from './payments/payment.module';
 import { ReceiptModule } from './receipts/receipt.module';
 import { ReportingModule } from './reporting/reporting.module';
+import { TransferModule } from './transfers/transfer.module';
 
 @Module({
   imports: [
@@ -26,6 +27,7 @@ import { ReportingModule } from './reporting/reporting.module';
     PaymentModule,
     ReceiptModule,
     ReportingModule,
+    TransferModule,
   ],
   providers: [
     { provide: APP_FILTER, useClass: ProblemFilter },

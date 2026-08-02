@@ -86,6 +86,7 @@ export const CANON_PERMISSIONS = [
   'settlement.reverse',
   'transfer.approve',
   'transfer.create',
+  'transfer.reject',
   'transfer.receive',
   'transfer.release',
   'transfer.submit',

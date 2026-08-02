@@ -3290,3 +3290,248 @@ export const outboxEvents = pgTable('outbox_events', {
     table.eventType,
   ),
 ]);
+
+export const transferDocuments = pgTable('transfer_documents', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  organizationId: uuid('organization_id').notNull().references(() => organizations.id),
+  businessNumber: varchar('business_number', { length: 64 }).notNull(),
+  businessDate: date('business_date').notNull(),
+  route: varchar('route', { length: 32 }).notNull(),
+  sourceType: varchar('source_type', { length: 16 }).notNull(),
+  sourceId: uuid('source_id').notNull(),
+  destinationType: varchar('destination_type', { length: 16 }).notNull(),
+  destinationId: uuid('destination_id').notNull(),
+  sourceAmount: numeric('source_amount', { precision: 38, scale: 8 }).notNull(),
+  sourceCurrency: varchar('source_currency', { length: 8 }).notNull(),
+  destinationAmount: numeric('destination_amount', { precision: 38, scale: 8 }).notNull(),
+  destinationCurrency: varchar('destination_currency', { length: 8 }).notNull(),
+  exchangeRate: numeric('exchange_rate', { precision: 38, scale: 18 }).notNull(),
+  rateType: varchar('rate_type', { length: 64 }).notNull(),
+  rateSource: varchar('rate_source', { length: 16 }).notNull(),
+  rateRecordId: uuid('rate_record_id').references(() => exchangeRates.id),
+  ratedAt: timestamp('rated_at', { withTimezone: true }).notNull(),
+  roundingDifference: numeric('rounding_difference', { precision: 38, scale: 8 }).notNull(),
+  expectedReceiptAt: timestamp('expected_receipt_at', { withTimezone: true }),
+  purpose: varchar('purpose', { length: 1000 }).notNull(),
+  accountingDimensions: jsonb('accounting_dimensions').$type<Record<string, never>>(),
+  creatorUserId: uuid('creator_user_id').notNull(),
+  currentApprovalSnapshotId: uuid('current_approval_snapshot_id'),
+  sourceCustodianUserId: uuid('source_custodian_user_id'),
+  destinationCustodianUserId: uuid('destination_custodian_user_id'),
+  state: varchar('state', { length: 32 }).notNull().default('DRAFT'),
+  version: bigint('version', { mode: 'number' }).notNull().default(0),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  unique().on(table.organizationId, table.id),
+  unique().on(table.organizationId, table.businessNumber),
+  foreignKey({
+    columns: [table.organizationId, table.sourceCurrency],
+    foreignColumns: [currencies.organizationId, currencies.code],
+    name: 'transfer_documents_source_currency_fk',
+  }),
+  foreignKey({
+    columns: [table.organizationId, table.destinationCurrency],
+    foreignColumns: [currencies.organizationId, currencies.code],
+    name: 'transfer_documents_destination_currency_fk',
+  }),
+  foreignKey({
+    columns: [table.organizationId, table.creatorUserId],
+    foreignColumns: [userRefs.organizationId, userRefs.id],
+    name: 'transfer_documents_creator_fk',
+  }),
+  foreignKey({
+    columns: [table.organizationId, table.sourceCustodianUserId],
+    foreignColumns: [userRefs.organizationId, userRefs.id],
+    name: 'transfer_documents_source_custodian_fk',
+  }),
+  foreignKey({
+    columns: [table.organizationId, table.destinationCustodianUserId],
+    foreignColumns: [userRefs.organizationId, userRefs.id],
+    name: 'transfer_documents_destination_custodian_fk',
+  }),
+  check('transfer_documents_source_positive', sql`${table.sourceAmount} > 0`),
+  check('transfer_documents_destination_positive', sql`${table.destinationAmount} > 0`),
+  check('transfer_documents_rate_positive', sql`${table.exchangeRate} > 0`),
+  check('transfer_documents_endpoint_type_check', sql`${table.sourceType} IN ('CASHBOX', 'BANK_ACCOUNT', 'USER') AND ${table.destinationType} IN ('CASHBOX', 'BANK_ACCOUNT', 'USER')`),
+  check('transfer_documents_distinct_endpoints', sql`NOT (${table.sourceType} = ${table.destinationType} AND ${table.sourceId} = ${table.destinationId})`),
+  check('transfer_documents_route_check', sql`
+    (${table.route} = 'CASHBOX_TO_CASHBOX' AND ${table.sourceType} = 'CASHBOX' AND ${table.destinationType} = 'CASHBOX')
+    OR (${table.route} = 'CASHBOX_TO_BANK' AND ${table.sourceType} = 'CASHBOX' AND ${table.destinationType} = 'BANK_ACCOUNT')
+    OR (${table.route} = 'BANK_TO_CASHBOX' AND ${table.sourceType} = 'BANK_ACCOUNT' AND ${table.destinationType} = 'CASHBOX')
+    OR (${table.route} = 'BANK_TO_BANK' AND ${table.sourceType} = 'BANK_ACCOUNT' AND ${table.destinationType} = 'BANK_ACCOUNT')
+    OR (${table.route} = 'CASHBOX_TO_USER' AND ${table.sourceType} = 'CASHBOX' AND ${table.destinationType} = 'USER')
+    OR (${table.route} = 'USER_TO_CASHBOX' AND ${table.sourceType} = 'USER' AND ${table.destinationType} = 'CASHBOX')
+    OR (${table.route} = 'USER_TO_USER' AND ${table.sourceType} = 'USER' AND ${table.destinationType} = 'USER')
+    OR (${table.route} IN ('BRANCH_TRANSFER', 'CURRENCY_EXCHANGE') AND ${table.sourceType} IN ('CASHBOX', 'BANK_ACCOUNT') AND ${table.destinationType} IN ('CASHBOX', 'BANK_ACCOUNT'))
+    OR (${table.route} = 'PETTY_CASH' AND ((${table.sourceType} = 'CASHBOX' AND ${table.destinationType} = 'USER') OR (${table.sourceType} = 'USER' AND ${table.destinationType} = 'CASHBOX')))
+  `),
+  check('transfer_documents_rate_check', sql`
+    (${table.sourceCurrency} = ${table.destinationCurrency} AND ${table.rateSource} = 'IDENTITY' AND ${table.rateRecordId} IS NULL AND ${table.exchangeRate} = 1 AND ${table.sourceAmount} = ${table.destinationAmount} AND ${table.roundingDifference} = 0)
+    OR (${table.sourceCurrency} <> ${table.destinationCurrency} AND ${table.rateSource} = 'TABLE' AND ${table.rateRecordId} IS NOT NULL)
+  `),
+  check('transfer_documents_state_check', sql`${table.state} IN ('DRAFT', 'REQUESTED', 'APPROVED', 'REJECTED')`),
+  check('transfer_documents_snapshot_check', sql`(${table.state} = 'DRAFT' AND ${table.currentApprovalSnapshotId} IS NULL) OR (${table.state} <> 'DRAFT' AND ${table.currentApprovalSnapshotId} IS NOT NULL)`),
+  check('transfer_documents_custodian_pair_check', sql`(${table.sourceCustodianUserId} IS NULL) = (${table.destinationCustodianUserId} IS NULL)`),
+  check('transfer_documents_custodian_distinct_check', sql`${table.sourceCustodianUserId} IS NULL OR ${table.sourceCustodianUserId} <> ${table.destinationCustodianUserId}`),
+  check('transfer_documents_approved_custodian_check', sql`${table.state} <> 'APPROVED' OR ${table.sourceCustodianUserId} IS NOT NULL`),
+  check('transfer_documents_version_nonnegative', sql`${table.version} >= 0`),
+  index('transfer_documents_list_idx').on(table.organizationId, table.businessDate.desc(), table.id.desc()),
+]);
+
+export const transferAssetItems = pgTable('transfer_asset_items', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  organizationId: uuid('organization_id').notNull(),
+  transferDocumentId: uuid('transfer_document_id').notNull(),
+  assetType: varchar('asset_type', { length: 24 }).notNull(),
+  assetId: uuid('asset_id').notNull(),
+  assetLabel: varchar('asset_label', { length: 240 }).notNull(),
+  quantity: numeric('quantity', { precision: 38, scale: 8 }).notNull().default('1'),
+  state: varchar('state', { length: 16 }).notNull().default('PLANNED'),
+}, (table) => [
+  unique().on(table.organizationId, table.id),
+  unique().on(table.organizationId, table.transferDocumentId, table.assetType, table.assetId),
+  foreignKey({
+    columns: [table.organizationId, table.transferDocumentId],
+    foreignColumns: [transferDocuments.organizationId, transferDocuments.id],
+    name: 'transfer_asset_items_document_fk',
+  }),
+  check('transfer_asset_items_type_check', sql`${table.assetType} IN ('RECEIVED_CHEQUE', 'ISSUED_CHEQUE', 'DOCUMENT', 'OTHER_CONTROLLED')`),
+  check('transfer_asset_items_quantity_positive', sql`${table.quantity} > 0`),
+  check('transfer_asset_items_state_check', sql`${table.state} IN ('PLANNED', 'RELEASED', 'RECEIVED', 'RETURNED')`),
+]);
+
+export const transferAttachmentLinks = pgTable('transfer_attachment_links', {
+  organizationId: uuid('organization_id').notNull(),
+  transferDocumentId: uuid('transfer_document_id').notNull(),
+  attachmentId: uuid('attachment_id').notNull(),
+  contentDigest: char('content_digest', { length: 64 }).notNull(),
+  purpose: varchar('purpose', { length: 64 }),
+}, (table) => [
+  primaryKey({ columns: [table.organizationId, table.transferDocumentId, table.attachmentId] }),
+  foreignKey({
+    columns: [table.organizationId, table.transferDocumentId],
+    foreignColumns: [transferDocuments.organizationId, transferDocuments.id],
+    name: 'transfer_attachment_links_document_fk',
+  }),
+  foreignKey({
+    columns: [table.organizationId, table.attachmentId, table.contentDigest],
+    foreignColumns: [attachments.organizationId, attachments.id, attachments.contentDigest],
+    name: 'transfer_attachment_links_attachment_fk',
+  }),
+]);
+
+export const transferApprovalPolicies = pgTable('transfer_approval_policies', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  organizationId: uuid('organization_id').notNull().references(() => organizations.id),
+  code: varchar('code', { length: 64 }).notNull(),
+  name: varchar('name', { length: 240 }).notNull(),
+  branchId: uuid('branch_id'),
+  treasuryUnitId: uuid('treasury_unit_id'),
+  currency: varchar('currency', { length: 8 }),
+  amountMinimum: numeric('amount_minimum', { precision: 38, scale: 8 }),
+  amountMaximum: numeric('amount_maximum', { precision: 38, scale: 8 }),
+  version: integer('version').notNull(),
+  state: varchar('state', { length: 16 }).notNull(),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  unique().on(table.organizationId, table.id),
+  unique().on(table.organizationId, table.code, table.version),
+  foreignKey({ columns: [table.organizationId, table.branchId], foreignColumns: [branches.organizationId, branches.id], name: 'transfer_approval_policies_branch_fk' }),
+  foreignKey({ columns: [table.organizationId, table.treasuryUnitId], foreignColumns: [treasuryUnits.organizationId, treasuryUnits.id], name: 'transfer_approval_policies_treasury_unit_fk' }),
+  foreignKey({
+    columns: [table.organizationId, table.currency],
+    foreignColumns: [currencies.organizationId, currencies.code],
+    name: 'transfer_approval_policies_currency_fk',
+  }),
+  check('transfer_approval_policies_range_check', sql`${table.amountMaximum} IS NULL OR ${table.amountMinimum} IS NULL OR ${table.amountMaximum} >= ${table.amountMinimum}`),
+  check('transfer_approval_policies_state_check', sql`${table.state} IN ('DRAFT', 'ACTIVE', 'RETIRED')`),
+  index('transfer_approval_policy_selection_idx').on(table.organizationId, table.state, table.branchId, table.treasuryUnitId, table.currency, table.amountMinimum, table.amountMaximum),
+]);
+
+export const transferApprovalPolicySteps = pgTable('transfer_approval_policy_steps', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  organizationId: uuid('organization_id').notNull(),
+  policyId: uuid('policy_id').notNull(),
+  stepOrder: integer('step_order').notNull(),
+  roleId: uuid('role_id'),
+  approverUserId: uuid('approver_user_id'),
+  approvalsRequired: integer('approvals_required').notNull().default(1),
+  separationRules: varchar('separation_rules', { length: 64 }).array().notNull().default([]),
+}, (table) => [
+  unique().on(table.organizationId, table.policyId, table.stepOrder),
+  unique().on(table.organizationId, table.policyId, table.id),
+  foreignKey({ columns: [table.organizationId, table.policyId], foreignColumns: [transferApprovalPolicies.organizationId, transferApprovalPolicies.id], name: 'transfer_approval_policy_steps_policy_fk' }),
+  foreignKey({ columns: [table.organizationId, table.roleId], foreignColumns: [roles.organizationId, roles.id], name: 'transfer_approval_policy_steps_role_fk' }),
+  foreignKey({ columns: [table.organizationId, table.approverUserId], foreignColumns: [userRefs.organizationId, userRefs.id], name: 'transfer_approval_policy_steps_approver_fk' }),
+  check('transfer_approval_policy_steps_subject_check', sql`(${table.roleId} IS NOT NULL) <> (${table.approverUserId} IS NOT NULL)`),
+  check('transfer_approval_policy_steps_order_check', sql`${table.stepOrder} > 0`),
+  check('transfer_approval_policy_steps_required_check', sql`${table.approvalsRequired} > 0`),
+  check('transfer_approval_policy_steps_separation_check', sql`${table.separationRules} <@ ARRAY['CREATOR_NOT_APPROVER','SOURCE_CUSTODIAN_NOT_APPROVER']::VARCHAR(64)[]`),
+]);
+
+export const transferApprovalSnapshots = pgTable('transfer_approval_snapshots', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  organizationId: uuid('organization_id').notNull(),
+  transferDocumentId: uuid('transfer_document_id').notNull(),
+  documentVersion: bigint('document_version', { mode: 'number' }).notNull(),
+  amountBasis: numeric('amount_basis', { precision: 38, scale: 8 }).notNull(),
+  currency: varchar('currency', { length: 8 }).notNull(),
+  evaluatedAt: timestamp('evaluated_at', { withTimezone: true }).notNull(),
+  policyId: uuid('policy_id').notNull(),
+  policyCode: varchar('policy_code', { length: 64 }).notNull(),
+  policyName: varchar('policy_name', { length: 240 }).notNull(),
+  policyVersion: integer('policy_version').notNull(),
+}, (table) => [
+  unique().on(table.organizationId, table.id),
+  unique().on(table.organizationId, table.transferDocumentId, table.id),
+  unique().on(table.organizationId, table.transferDocumentId, table.documentVersion),
+  foreignKey({ columns: [table.organizationId, table.transferDocumentId], foreignColumns: [transferDocuments.organizationId, transferDocuments.id], name: 'transfer_approval_snapshots_document_fk' }),
+  foreignKey({ columns: [table.organizationId, table.policyId], foreignColumns: [transferApprovalPolicies.organizationId, transferApprovalPolicies.id], name: 'transfer_approval_snapshots_policy_fk' }),
+  check('transfer_approval_snapshots_amount_positive', sql`${table.amountBasis} > 0`),
+]);
+
+export const transferApprovalSnapshotSteps = pgTable('transfer_approval_snapshot_steps', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  organizationId: uuid('organization_id').notNull(),
+  approvalSnapshotId: uuid('approval_snapshot_id').notNull(),
+  stepOrder: integer('step_order').notNull(),
+  roleId: uuid('role_id'),
+  roleName: varchar('role_name', { length: 240 }),
+  approverUserId: uuid('approver_user_id'),
+  approverName: varchar('approver_name', { length: 240 }),
+  approvalsRequired: integer('approvals_required').notNull(),
+  separationRules: varchar('separation_rules', { length: 64 }).array().notNull(),
+}, (table) => [
+  unique().on(table.organizationId, table.approvalSnapshotId, table.id),
+  unique().on(table.organizationId, table.approvalSnapshotId, table.stepOrder),
+  foreignKey({ columns: [table.organizationId, table.approvalSnapshotId], foreignColumns: [transferApprovalSnapshots.organizationId, transferApprovalSnapshots.id], name: 'transfer_approval_snapshot_steps_snapshot_fk' }),
+  foreignKey({ columns: [table.organizationId, table.roleId], foreignColumns: [roles.organizationId, roles.id], name: 'transfer_approval_snapshot_steps_role_fk' }),
+  foreignKey({ columns: [table.organizationId, table.approverUserId], foreignColumns: [userRefs.organizationId, userRefs.id], name: 'transfer_approval_snapshot_steps_approver_fk' }),
+  check('transfer_approval_snapshot_steps_subject_check', sql`(${table.roleId} IS NOT NULL) <> (${table.approverUserId} IS NOT NULL)`),
+  check('transfer_approval_snapshot_steps_order_check', sql`${table.stepOrder} > 0`),
+  check('transfer_approval_snapshot_steps_required_check', sql`${table.approvalsRequired} > 0`),
+  check('transfer_approval_snapshot_steps_separation_check', sql`${table.separationRules} <@ ARRAY['CREATOR_NOT_APPROVER','SOURCE_CUSTODIAN_NOT_APPROVER']::VARCHAR(64)[]`),
+]);
+
+export const transferApprovalActions = pgTable('transfer_approval_actions', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  organizationId: uuid('organization_id').notNull(),
+  approvalSnapshotId: uuid('approval_snapshot_id').notNull(),
+  approvalSnapshotStepId: uuid('approval_snapshot_step_id').notNull(),
+  stepOrder: integer('step_order').notNull(),
+  actorUserId: uuid('actor_user_id').notNull(),
+  delegatedFromUserId: uuid('delegated_from_user_id'),
+  action: varchar('action', { length: 16 }).notNull(),
+  reason: varchar('reason', { length: 500 }),
+  actedAt: timestamp('acted_at', { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  unique().on(table.organizationId, table.id),
+  unique().on(table.organizationId, table.approvalSnapshotId, table.stepOrder, table.actorUserId),
+  foreignKey({ columns: [table.organizationId, table.approvalSnapshotId], foreignColumns: [transferApprovalSnapshots.organizationId, transferApprovalSnapshots.id], name: 'transfer_approval_actions_snapshot_fk' }),
+  foreignKey({ columns: [table.organizationId, table.approvalSnapshotId, table.approvalSnapshotStepId], foreignColumns: [transferApprovalSnapshotSteps.organizationId, transferApprovalSnapshotSteps.approvalSnapshotId, transferApprovalSnapshotSteps.id], name: 'transfer_approval_actions_step_fk' }),
+  foreignKey({ columns: [table.organizationId, table.actorUserId], foreignColumns: [userRefs.organizationId, userRefs.id], name: 'transfer_approval_actions_actor_fk' }),
+  foreignKey({ columns: [table.organizationId, table.delegatedFromUserId], foreignColumns: [userRefs.organizationId, userRefs.id], name: 'transfer_approval_actions_delegated_from_fk' }),
+  check('transfer_approval_actions_action_check', sql`${table.action} IN ('APPROVED', 'REJECTED')`),
+  check('transfer_approval_actions_reason_check', sql`${table.action} = 'APPROVED' OR NULLIF(BTRIM(${table.reason}), '') IS NOT NULL`),
+]);

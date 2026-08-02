@@ -25,6 +25,7 @@ import { PrintTemplateController } from '../src/master-data/print-template.contr
 import { PaymentController } from '../src/payments/payment.controller';
 import { ReceiptController } from '../src/receipts/receipt.controller';
 import { ReportingController } from '../src/reporting/reporting.controller';
+import { TransferController } from '../src/transfers/transfer.controller';
 
 const expectedOperations = [
   ['POST', 'v1/auth/sessions'],
@@ -90,6 +91,10 @@ const expectedOperations = [
   ['POST', 'v1/accounting/exports/:resourceId/acknowledgements'],
   ['GET', 'v1/payments'],
   ['POST', 'v1/payments'],
+  ['GET', 'v1/transfers'],
+  ['POST', 'v1/transfers'],
+  ['POST', 'v1/transfers/:resourceId/submit'],
+  ['POST', 'v1/transfers/:resourceId/approval-actions'],
   ['GET', 'v1/reports/:reportKey'],
 ] as const;
 
@@ -109,6 +114,7 @@ test('all authorized operations through INC-1H are present in owner-local contro
     PaymentController,
     ReceiptController,
     ReportingController,
+    TransferController,
   ]) {
     const prefix = Reflect.getMetadata(PATH_METADATA, controller) as string;
     for (const name of Object.getOwnPropertyNames(controller.prototype)) {
@@ -641,6 +647,7 @@ test('CHG-017 admits the emergency separation override permission', async () => 
   const migrations = await Promise.all([
     readFile('migrations/0002_access_control.sql', 'utf8'),
     readFile('migrations/0012_separation_override_permission.sql', 'utf8'),
+    readFile('migrations/0021_transfer_draft_approval.sql', 'utf8'),
   ]);
   const persisted = [...migrations.join('\n').matchAll(/\('([^']+)'\)/gu)]
     .map((match) => match[1])
