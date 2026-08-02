@@ -3,6 +3,7 @@ import {
   boolean,
   char,
   check,
+  customType,
   date,
   foreignKey,
   index,
@@ -19,6 +20,8 @@ import {
   varchar,
 } from 'drizzle-orm/pg-core';
 import { sql } from 'drizzle-orm';
+
+const bytea = customType<{ data: Buffer }>({ dataType: () => 'bytea' });
 
 // Explicit annotations break the intentional organization/currency FK cycle.
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -2983,6 +2986,275 @@ export const paymentLineAttachmentLinks = pgTable('payment_line_attachment_links
     name: 'payment_line_attachment_links_attachment_fk',
   }),
   check('payment_line_attachment_links_digest_format', sql`${table.contentDigest} ~ '^[a-f0-9]{64}$'`),
+]);
+
+export const accountingSystems = pgTable('accounting_systems', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  organizationId: uuid('organization_id').notNull().references(() => organizations.id),
+  code: varchar('code', { length: 64 }).notNull(),
+  name: varchar('name', { length: 160 }).notNull(),
+  transportProfile: varchar('transport_profile', { length: 24 }).notNull(),
+  contractVersion: varchar('contract_version', { length: 32 }).notNull(),
+  supportedSourceTypes: varchar('supported_source_types', { length: 32 }).array().notNull().default(['PAYMENT']),
+  forbidSourceExecutorExport: boolean('forbid_source_executor_export').notNull().default(true),
+  state: varchar('state', { length: 16 }).notNull(),
+}, (table) => [
+  unique().on(table.organizationId, table.code),
+  unique().on(table.organizationId, table.id),
+  check('accounting_systems_transport_check', sql`${table.transportProfile} IN ('CSV_ZIP_MANIFEST', 'XLSX')`),
+  check('accounting_systems_source_types_check', sql`cardinality(${table.supportedSourceTypes}) > 0 AND ${table.supportedSourceTypes} <@ ARRAY['PAYMENT']::varchar[]`),
+  check('accounting_systems_state_check', sql`${table.state} IN ('ACTIVE', 'SUSPENDED', 'CLOSED')`),
+]);
+
+export const accountingImports = pgTable('accounting_imports', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  organizationId: uuid('organization_id').notNull().references(() => organizations.id),
+  accountingSystemId: uuid('accounting_system_id').notNull(),
+  sourceDigest: char('source_digest', { length: 64 }).notNull(),
+  contractVersion: varchar('contract_version', { length: 32 }).notNull(),
+  representation: varchar('representation', { length: 24 }).notNull(),
+  snapshotKind: varchar('snapshot_kind', { length: 16 }).notNull(),
+  sourceVersion: varchar('source_version', { length: 64 }).notNull(),
+  baseSourceVersion: varchar('base_source_version', { length: 64 }),
+  fiscalContext: varchar('fiscal_context', { length: 128 }),
+  receivedAt: timestamp('received_at', { withTimezone: true }).notNull(),
+  appliedCount: integer('applied_count').notNull().default(0),
+  errorCount: integer('error_count').notNull().default(0),
+  state: varchar('state', { length: 24 }).notNull(),
+  version: bigint('version', { mode: 'number' }).notNull().default(0),
+}, (table) => [
+  unique().on(table.organizationId, table.id),
+  unique().on(table.accountingSystemId, table.sourceDigest, table.contractVersion),
+  foreignKey({
+    columns: [table.organizationId, table.accountingSystemId],
+    foreignColumns: [accountingSystems.organizationId, accountingSystems.id],
+    name: 'accounting_imports_system_fk',
+  }),
+  check('accounting_imports_representation_check', sql`${table.representation} IN ('CSV_ZIP_MANIFEST', 'XLSX')`),
+  check('accounting_imports_snapshot_check', sql`${table.snapshotKind} IN ('FULL', 'INCREMENTAL')`),
+  check('accounting_imports_incremental_base_check', sql`${table.snapshotKind} <> 'INCREMENTAL' OR ${table.baseSourceVersion} IS NOT NULL`),
+]);
+
+export const fiscalPeriods = pgTable('fiscal_periods', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  organizationId: uuid('organization_id').notNull().references(() => organizations.id),
+  accountingSystemId: uuid('accounting_system_id').notNull(),
+  accountingImportId: uuid('accounting_import_id').notNull(),
+  externalKey: varchar('external_key', { length: 128 }).notNull(),
+  periodStart: date('period_start').notNull(),
+  periodEnd: date('period_end').notNull(),
+  sourceVersion: varchar('source_version', { length: 64 }).notNull(),
+  sourceDigest: char('source_digest', { length: 64 }).notNull(),
+  effectiveAt: timestamp('effective_at', { withTimezone: true }).notNull(),
+  externalAuthorizationRef: varchar('external_authorization_ref', { length: 128 }),
+  changeReason: varchar('change_reason', { length: 500 }),
+  state: varchar('state', { length: 16 }).notNull(),
+  version: bigint('version', { mode: 'number' }).notNull().default(0),
+}, (table) => [
+  unique().on(table.organizationId, table.id),
+  unique().on(table.accountingSystemId, table.externalKey),
+  foreignKey({
+    columns: [table.organizationId, table.accountingSystemId],
+    foreignColumns: [accountingSystems.organizationId, accountingSystems.id],
+    name: 'fiscal_periods_system_fk',
+  }),
+  foreignKey({
+    columns: [table.organizationId, table.accountingImportId],
+    foreignColumns: [accountingImports.organizationId, accountingImports.id],
+    name: 'fiscal_periods_import_fk',
+  }),
+  check('fiscal_periods_date_check', sql`${table.periodEnd} >= ${table.periodStart}`),
+  check('fiscal_periods_state_check', sql`${table.state} IN ('OPEN', 'CLOSED')`),
+]);
+
+export const accountingMappings = pgTable('accounting_mappings', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  organizationId: uuid('organization_id').notNull().references(() => organizations.id),
+  accountingSystemId: uuid('accounting_system_id').notNull(),
+  localType: varchar('local_type', { length: 32 }).notNull(),
+  localId: uuid('local_id').notNull(),
+  mappingType: varchar('mapping_type', { length: 32 }).notNull(),
+  externalKey: varchar('external_key', { length: 128 }).notNull(),
+  externalParentKey: varchar('external_parent_key', { length: 128 }),
+  sourceVersion: varchar('source_version', { length: 64 }),
+  payloadDigest: char('payload_digest', { length: 64 }),
+  state: varchar('state', { length: 16 }).notNull(),
+  version: bigint('version', { mode: 'number' }).notNull().default(0),
+}, (table) => [
+  unique().on(table.organizationId, table.id),
+  unique().on(table.accountingSystemId, table.localType, table.localId, table.mappingType),
+  foreignKey({
+    columns: [table.organizationId, table.accountingSystemId],
+    foreignColumns: [accountingSystems.organizationId, accountingSystems.id],
+    name: 'accounting_mappings_system_fk',
+  }),
+  check('accounting_mappings_state_check', sql`${table.state} IN ('ACTIVE', 'INACTIVE', 'CONFLICT')`),
+]);
+
+export const accountingExports = pgTable('accounting_exports', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  organizationId: uuid('organization_id').notNull().references(() => organizations.id),
+  accountingSystemId: uuid('accounting_system_id').notNull(),
+  branchId: uuid('branch_id'),
+  treasuryUnitId: uuid('treasury_unit_id'),
+  sourceType: varchar('source_type', { length: 32 }).notNull(),
+  sourceId: uuid('source_id').notNull(),
+  sourceVersion: bigint('source_version', { mode: 'number' }).notNull(),
+  documentType: varchar('document_type', { length: 64 }).notNull(),
+  baseCurrency: varchar('base_currency', { length: 8 }).notNull(),
+  aggregateBaseAmount: numeric('aggregate_base_amount', { precision: 38, scale: 8 }).notNull(),
+  exportKind: varchar('export_kind', { length: 64 }).notNull(),
+  contractVersion: varchar('contract_version', { length: 32 }).notNull(),
+  idempotencyKey: varchar('idempotency_key', { length: 128 }).notNull(),
+  payloadDigest: char('payload_digest', { length: 64 }).notNull(),
+  mappingSnapshotDigest: char('mapping_snapshot_digest', { length: 64 }).notNull(),
+  fiscalSnapshotDigest: char('fiscal_snapshot_digest', { length: 64 }).notNull(),
+  exportedBy: uuid('exported_by').notNull(),
+  externalDocumentId: varchar('external_document_id', { length: 128 }),
+  externalDocumentNumber: varchar('external_document_number', { length: 128 }),
+  acceptedAt: timestamp('accepted_at', { withTimezone: true }),
+  state: varchar('state', { length: 32 }).notNull(),
+  version: bigint('version', { mode: 'number' }).notNull().default(0),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  unique().on(table.organizationId, table.id),
+  unique().on(table.organizationId, table.accountingSystemId, table.idempotencyKey),
+  unique().on(table.organizationId, table.accountingSystemId, table.sourceType, table.sourceId, table.sourceVersion, table.exportKind),
+  foreignKey({
+    columns: [table.organizationId, table.accountingSystemId],
+    foreignColumns: [accountingSystems.organizationId, accountingSystems.id],
+    name: 'accounting_exports_system_fk',
+  }),
+  foreignKey({ columns: [table.organizationId, table.branchId], foreignColumns: [branches.organizationId, branches.id], name: 'accounting_exports_branch_fk' }),
+  foreignKey({ columns: [table.organizationId, table.treasuryUnitId], foreignColumns: [treasuryUnits.organizationId, treasuryUnits.id], name: 'accounting_exports_unit_fk' }),
+  foreignKey({ columns: [table.organizationId, table.exportedBy], foreignColumns: [userRefs.organizationId, userRefs.id], name: 'accounting_exports_exporter_fk' }),
+  check('accounting_exports_amount_check', sql`${table.aggregateBaseAmount} >= 0`),
+  check('accounting_exports_source_check', sql`${table.sourceType} = 'PAYMENT'`),
+  check('accounting_exports_state_check', sql`${table.state} IN ('NOT_READY', 'MAPPING_REQUIRED', 'READY', 'QUEUED', 'SENDING', 'SENDING_UNKNOWN', 'ACCEPTED', 'FAILED', 'RETURNED', 'CORRECTED')`),
+]);
+
+export const accountingExportArtifacts = pgTable('accounting_export_artifacts', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  organizationId: uuid('organization_id').notNull().references(() => organizations.id),
+  accountingExportId: uuid('accounting_export_id').notNull(),
+  representation: varchar('representation', { length: 24 }).notNull(),
+  contractVersion: varchar('contract_version', { length: 32 }).notNull(),
+  manifestVersion: varchar('manifest_version', { length: 32 }).notNull(),
+  mediaType: varchar('media_type', { length: 96 }).notNull(),
+  fileName: varchar('file_name', { length: 255 }).notNull(),
+  contentAddress: varchar('content_address', { length: 192 }).notNull(),
+  content: bytea('content').notNull(),
+  byteSize: bigint('byte_size', { mode: 'number' }).notNull(),
+  payloadDigest: char('payload_digest', { length: 64 }).notNull(),
+  rowCount: integer('row_count').notNull(),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  unique().on(table.organizationId, table.id),
+  unique().on(table.organizationId, table.accountingExportId, table.representation),
+  unique().on(table.organizationId, table.contentAddress),
+  foreignKey({ columns: [table.organizationId, table.accountingExportId], foreignColumns: [accountingExports.organizationId, accountingExports.id], name: 'accounting_export_artifacts_export_fk' }),
+  check('accounting_export_artifacts_representation_check', sql`${table.representation} IN ('CSV_ZIP_MANIFEST', 'XLSX')`),
+  check('accounting_export_artifacts_size_check', sql`${table.byteSize} > 0 AND ${table.rowCount} > 0`),
+]);
+
+export const accountingExportRowResults = pgTable('accounting_export_row_results', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  organizationId: uuid('organization_id').notNull().references(() => organizations.id),
+  accountingExportArtifactId: uuid('accounting_export_artifact_id').notNull(),
+  rowNumber: integer('row_number').notNull(),
+  sourceType: varchar('source_type', { length: 64 }).notNull(),
+  sourceId: uuid('source_id').notNull(),
+  sourceVersion: bigint('source_version', { mode: 'number' }).notNull(),
+  payloadDigest: char('payload_digest', { length: 64 }).notNull(),
+  outcome: varchar('outcome', { length: 16 }).notNull(),
+  errorCode: varchar('error_code', { length: 64 }),
+  errorDetail: varchar('error_detail', { length: 2000 }),
+}, (table) => [
+  unique().on(table.organizationId, table.id),
+  unique().on(table.organizationId, table.accountingExportArtifactId, table.rowNumber),
+  foreignKey({ columns: [table.organizationId, table.accountingExportArtifactId], foreignColumns: [accountingExportArtifacts.organizationId, accountingExportArtifacts.id], name: 'accounting_export_rows_artifact_fk' }),
+  check('accounting_export_rows_number_check', sql`${table.rowNumber} > 0`),
+  check('accounting_export_rows_outcome_check', sql`${table.outcome} IN ('ACCEPTED', 'ERROR')`),
+  check('accounting_export_rows_error_check', sql`(${table.outcome} = 'ACCEPTED' AND ${table.errorCode} IS NULL AND ${table.errorDetail} IS NULL) OR (${table.outcome} = 'ERROR' AND ${table.errorCode} IS NOT NULL)`),
+]);
+
+export const accountingExportAttempts = pgTable('accounting_export_attempts', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  organizationId: uuid('organization_id').notNull().references(() => organizations.id),
+  accountingExportId: uuid('accounting_export_id').notNull(),
+  attemptNumber: integer('attempt_number').notNull(),
+  requestSnapshot: jsonb('request_snapshot').$type<Record<string, unknown>>().notNull(),
+  requestDigest: char('request_digest', { length: 64 }).notNull(),
+  responseSnapshot: jsonb('response_snapshot').$type<Record<string, unknown>>(),
+  responseDigest: char('response_digest', { length: 64 }),
+  outcome: varchar('outcome', { length: 24 }).notNull(),
+  errorCode: varchar('error_code', { length: 64 }),
+  actorId: uuid('actor_id'),
+  workerKey: varchar('worker_key', { length: 128 }),
+  externalDocumentId: varchar('external_document_id', { length: 128 }),
+  externalDocumentNumber: varchar('external_document_number', { length: 128 }),
+  attemptedAt: timestamp('attempted_at', { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  unique().on(table.organizationId, table.id),
+  unique().on(table.organizationId, table.accountingExportId, table.attemptNumber),
+  foreignKey({ columns: [table.organizationId, table.accountingExportId], foreignColumns: [accountingExports.organizationId, accountingExports.id], name: 'accounting_export_attempts_export_fk' }),
+  foreignKey({ columns: [table.organizationId, table.actorId], foreignColumns: [userRefs.organizationId, userRefs.id], name: 'accounting_export_attempts_actor_fk' }),
+  check('accounting_export_attempts_number_check', sql`${table.attemptNumber} > 0`),
+  check('accounting_export_attempts_outcome_check', sql`${table.outcome} IN ('QUEUED', 'SENDING', 'SENDING_UNKNOWN', 'ACCEPTED', 'FAILED')`),
+  check('accounting_export_attempts_actor_check', sql`(${table.actorId} IS NOT NULL) <> (${table.workerKey} IS NOT NULL)`),
+]);
+
+export const accountingAcknowledgements = pgTable('accounting_acknowledgements', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  organizationId: uuid('organization_id').notNull().references(() => organizations.id),
+  accountingExportId: uuid('accounting_export_id').notNull(),
+  idempotencyKey: varchar('idempotency_key', { length: 128 }).notNull(),
+  requestDigest: char('request_digest', { length: 64 }).notNull(),
+  outcome: varchar('outcome', { length: 24 }).notNull(),
+  responseDigest: char('response_digest', { length: 64 }).notNull(),
+  externalDocumentId: varchar('external_document_id', { length: 128 }),
+  externalDocumentNumber: varchar('external_document_number', { length: 128 }),
+  externalReturnId: varchar('external_return_id', { length: 128 }),
+  errorCode: varchar('error_code', { length: 64 }),
+  errorDetail: varchar('error_detail', { length: 2000 }),
+  acknowledgedBy: uuid('acknowledged_by').notNull(),
+  acknowledgedAt: timestamp('acknowledged_at', { withTimezone: true }).notNull(),
+  exportVersion: bigint('export_version', { mode: 'number' }).notNull(),
+  responseBody: jsonb('response_body').$type<Record<string, unknown>>().notNull(),
+}, (table) => [
+  unique().on(table.organizationId, table.id),
+  unique().on(table.organizationId, table.accountingExportId, table.idempotencyKey),
+  foreignKey({ columns: [table.organizationId, table.accountingExportId], foreignColumns: [accountingExports.organizationId, accountingExports.id], name: 'accounting_acknowledgements_export_fk' }),
+  foreignKey({ columns: [table.organizationId, table.acknowledgedBy], foreignColumns: [userRefs.organizationId, userRefs.id], name: 'accounting_acknowledgements_actor_fk' }),
+  check('accounting_acknowledgements_outcome_check', sql`${table.outcome} IN ('ACCEPTED', 'REJECTED', 'OUTCOME_UNKNOWN', 'RETURNED')`),
+  check('accounting_acknowledgements_accepted_check', sql`${table.outcome} <> 'ACCEPTED' OR ${table.externalDocumentId} IS NOT NULL`),
+  check('accounting_acknowledgements_rejected_check', sql`${table.outcome} <> 'REJECTED' OR ${table.errorCode} IS NOT NULL`),
+  check('accounting_acknowledgements_returned_check', sql`${table.outcome} <> 'RETURNED' OR (${table.externalDocumentId} IS NOT NULL AND ${table.externalReturnId} IS NOT NULL AND ${table.errorCode} IS NOT NULL)`),
+]);
+
+export const postingLocks = pgTable('posting_locks', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  organizationId: uuid('organization_id').notNull().references(() => organizations.id),
+  accountingExportId: uuid('accounting_export_id').notNull(),
+  accountingSystemId: uuid('accounting_system_id').notNull(),
+  sourceType: varchar('source_type', { length: 32 }).notNull(),
+  sourceId: uuid('source_id').notNull(),
+  sourceVersion: bigint('source_version', { mode: 'number' }).notNull(),
+  lockedDigest: char('locked_digest', { length: 64 }).notNull(),
+  lockedAt: timestamp('locked_at', { withTimezone: true }).notNull(),
+  state: varchar('state', { length: 16 }).notNull(),
+}, (table) => [
+  unique().on(table.organizationId, table.id),
+  unique().on(table.organizationId, table.accountingExportId),
+  unique('posting_locks_one_accepted_source').on(
+    table.organizationId,
+    table.sourceType,
+    table.sourceId,
+    table.sourceVersion,
+  ),
+  foreignKey({ columns: [table.organizationId, table.accountingExportId], foreignColumns: [accountingExports.organizationId, accountingExports.id], name: 'posting_locks_export_fk' }),
+  foreignKey({ columns: [table.organizationId, table.accountingSystemId], foreignColumns: [accountingSystems.organizationId, accountingSystems.id], name: 'posting_locks_system_fk' }),
+  check('posting_locks_state_check', sql`${table.state} IN ('ACTIVE', 'RETURNED', 'CORRECTED')`),
 ]);
 
 export const auditEvents = pgTable('audit_events', {

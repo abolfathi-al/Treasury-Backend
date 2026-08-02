@@ -54,7 +54,11 @@ const titles = {
   'TRS-PAY-008': 'Payment approval policy unresolved',
   'TRS-PAY-009': 'Payment reversal blocked',
   'TRS-BNK-005': 'Bank instruction outcome conflict',
+  'TRS-ACT-001': 'Accounting mapping required',
+  'TRS-ACT-002': 'Accounting export duplicate',
+  'TRS-ACT-004': 'Accounting outcome unknown',
   'TRS-ACT-005': 'Accounting posting lock active',
+  'TRS-ACT-006': 'Accounting export period unavailable',
   'TRS-RPT-001': 'Unsupported report request',
   'TRS-RPT-002': 'Projection stale',
 } as const;
@@ -68,6 +72,7 @@ const retryable = new Set<ProblemCode>([
   'TRS-CSH-002',
   'TRS-PAY-006',
   'TRS-PAY-007',
+  'TRS-ACT-004',
   'TRS-RPT-002',
 ]);
 

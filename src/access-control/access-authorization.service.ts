@@ -1,5 +1,6 @@
 import { Inject, Injectable } from '@nestjs/common';
 
+import { digest, stableJson } from '../common/http';
 import type { DatabaseTransaction } from '../database/database.service';
 import { AccessAuthorizationRepository } from './access-authorization.repository';
 import type { PaymentAuthorizationContext, PaymentGrant } from './access-authorization.repository';
@@ -110,7 +111,8 @@ export class AccessAuthorizationService {
     actorUserId: string,
     context: PaymentAuthorizationContext,
     permission: 'payment.submit' | 'payment.approve' | 'payment.reject'
-      | 'payment.execute' | 'payment.reverse' | 'bank-instruction.record-outcome',
+      | 'payment.execute' | 'payment.reverse' | 'bank-instruction.record-outcome'
+      | 'accounting.export' | 'accounting.acknowledge',
     roleId?: string,
   ): Promise<boolean> {
     return !!this.paymentAuthority(
@@ -125,13 +127,65 @@ export class AccessAuthorizationService {
     );
   }
 
+  async canOperateAccounting(
+    transaction: DatabaseTransaction,
+    organizationId: string,
+    actorUserId: string,
+    context: PaymentAuthorizationContext,
+    permission: 'accounting.export' | 'accounting.acknowledge',
+  ): Promise<boolean> {
+    return !!this.paymentAuthority(
+      await this.repository.paymentGrants(
+        transaction,
+        organizationId,
+        actorUserId,
+        permission,
+      ),
+      context,
+      undefined,
+      'ACCOUNTING',
+    );
+  }
+
+  async accountingScopeFingerprint(
+    transaction: DatabaseTransaction,
+    organizationId: string,
+    actorUserId: string,
+    permission: 'accounting.export' | 'accounting.acknowledge',
+  ): Promise<string | undefined> {
+    const grants = await this.repository.paymentGrants(
+      transaction,
+      organizationId,
+      actorUserId,
+      permission,
+    );
+    return grants.length ? digest(stableJson(grants)) : undefined;
+  }
+
+  listVisibleAccountingExportIds(
+    transaction: DatabaseTransaction,
+    organizationId: string,
+    actorUserId: string,
+    limit: number,
+    cursor?: { createdAt: string; id: string },
+  ): Promise<string[]> {
+    return this.repository.visibleAccountingExportIds(
+      transaction,
+      organizationId,
+      actorUserId,
+      limit,
+      cursor,
+    );
+  }
+
   async resolvePaymentAuthority(
     transaction: DatabaseTransaction,
     organizationId: string,
     actorUserId: string,
     context: PaymentAuthorizationContext,
     permission: 'payment.submit' | 'payment.approve' | 'payment.reject'
-      | 'payment.execute' | 'payment.reverse' | 'bank-instruction.record-outcome',
+      | 'payment.execute' | 'payment.reverse' | 'bank-instruction.record-outcome'
+      | 'accounting.export' | 'accounting.acknowledge',
     roleId?: string,
     requiredAuthorityUserId?: string | null,
   ): Promise<PaymentAuthority | null> {
@@ -176,14 +230,16 @@ export class AccessAuthorizationService {
     grants: PaymentGrant[],
     context: PaymentAuthorizationContext,
     requiredAuthorityUserId?: string | null,
+    scopeProfile: 'PAYMENT' | 'ACCOUNTING' = 'PAYMENT',
   ): PaymentAuthority | null {
     let eligible = grants.filter((grant) => (
       covers(grant.branchIds, context.branchId ? [context.branchId] : [])
       && covers(grant.treasuryUnitIds, context.treasuryUnitId ? [context.treasuryUnitId] : [])
       && covers(grant.documentTypes, [context.documentType])
-      && covers(grant.currencies, context.currencies)
+      && (scopeProfile === 'ACCOUNTING' || covers(grant.currencies, context.currencies))
       && (
-        context.documentType === 'PAYMENT_REQUEST'
+        scopeProfile === 'ACCOUNTING'
+        || context.documentType === 'PAYMENT_REQUEST'
         || (
           covers(grant.cashboxIds, context.cashboxIds)
           && covers(grant.bankAccountIds, context.bankAccountIds)

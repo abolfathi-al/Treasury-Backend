@@ -58,7 +58,7 @@ export class FoundationEffectsRepository {
       organizationId: string;
       requestId: string;
       actorUserId: string;
-      entityType?: 'Receipt' | 'Payment' | 'BankInstruction';
+      entityType?: 'Receipt' | 'Payment' | 'BankInstruction' | 'AccountingExport';
       entityId: string;
       action: string;
       reason?: string;
@@ -81,7 +81,7 @@ export class FoundationEffectsRepository {
     transaction: DatabaseTransaction,
     input: {
       organizationId: string;
-      aggregateType?: 'Receipt' | 'Payment' | 'BankInstruction';
+      aggregateType?: 'Receipt' | 'Payment' | 'BankInstruction' | 'AccountingExport';
       aggregateId: string;
       aggregateVersion: number;
       eventType: string;

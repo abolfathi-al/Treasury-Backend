@@ -2,6 +2,7 @@ import { Module } from '@nestjs/common';
 import { APP_FILTER, APP_INTERCEPTOR } from '@nestjs/core';
 
 import { AccessControlModule } from './access-control/access-control.module';
+import { AccountingModule } from './accounting-integration/accounting.module';
 import { BankingModule } from './banking/banking.module';
 import { ProblemFilter } from './common/problem';
 import { NoStoreInterceptor } from './common/no-store.interceptor';
@@ -17,6 +18,7 @@ import { ReportingModule } from './reporting/reporting.module';
   imports: [
     DatabaseModule,
     AccessControlModule,
+    AccountingModule,
     MasterDataModule,
     CashboxModule,
     BankingModule,

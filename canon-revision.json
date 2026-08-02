@@ -1,23 +1,37 @@
 {
   "repository": "Treasury-Canon",
-  "revision": "e0e3bb683172ee4a5c9af9431445a63307b415af",
+  "revision": "dd7b9b542f9bfe7ab6aecd6ec3b197b180eda491",
   "canon_root": "canon-v4",
   "authorized_delivery_slice": "SLICE-3-PAYMENT",
-  "authorized_increment": "INC-3C-PAYMENT-EXECUTION-OUTCOME",
+  "authorized_increment": "INC-3D-ACCOUNTING-EXPORT-ACK",
   "requirements": [
-    "REQ-PAY-007",
-    "REQ-PAY-008",
-    "REQ-PAY-009",
-    "REQ-PAY-011",
-    "REQ-PAY-012",
-    "REQ-BNK-009"
+    "REQ-ACT-003",
+    "REQ-ACT-004",
+    "REQ-ACT-005",
+    "REQ-ACT-006",
+    "REQ-ACT-007",
+    "REQ-ACT-008",
+    "REQ-ACT-009",
+    "REQ-ACT-011",
+    "REQ-ACT-012",
+    "REQ-ACT-013"
   ],
   "acceptance_scenarios": [
-    "SCN-PAY-004"
+    "SCN-ACT-002",
+    "SCN-ACT-003",
+    "SCN-ACT-004",
+    "SCN-ACT-005",
+    "SCN-ACT-006",
+    "SCN-ACT-007",
+    "SCN-ACT-008",
+    "SCN-ACT-009",
+    "SCN-ACT-010"
   ],
   "authorized_operations": [
-    "executePayment",
-    "reversePayment",
-    "recordBankInstructionOutcome"
+    "listAccountingSystems",
+    "listAccountingExports",
+    "createAccountingExport",
+    "downloadAccountingExportFile",
+    "recordAccountingAcknowledgement"
   ]
 }
