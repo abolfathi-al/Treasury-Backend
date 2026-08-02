@@ -1,37 +1,27 @@
 {
   "repository": "Treasury-Canon",
-  "revision": "dd7b9b542f9bfe7ab6aecd6ec3b197b180eda491",
+  "revision": "19e8423a6855a684d0a29b01f1f91a2a5f6cc4b5",
   "canon_root": "canon-v4",
-  "authorized_delivery_slice": "SLICE-3-PAYMENT",
-  "authorized_increment": "INC-3D-ACCOUNTING-EXPORT-ACK",
+  "authorized_delivery_slice": "SLICE-4-TRANSFER-SETTLEMENT",
+  "authorized_increment": "INC-4A-TRANSFER-DRAFT-APPROVAL",
   "requirements": [
-    "REQ-ACT-003",
-    "REQ-ACT-004",
-    "REQ-ACT-005",
-    "REQ-ACT-006",
-    "REQ-ACT-007",
-    "REQ-ACT-008",
-    "REQ-ACT-009",
-    "REQ-ACT-011",
-    "REQ-ACT-012",
-    "REQ-ACT-013"
+    "REQ-TRF-001",
+    "REQ-TRF-002",
+    "REQ-TRF-003",
+    "REQ-TRF-004"
   ],
   "acceptance_scenarios": [
-    "SCN-ACT-002",
-    "SCN-ACT-003",
-    "SCN-ACT-004",
-    "SCN-ACT-005",
-    "SCN-ACT-006",
-    "SCN-ACT-007",
-    "SCN-ACT-008",
-    "SCN-ACT-009",
-    "SCN-ACT-010"
+    "SCN-TRF-009",
+    "SCN-TRF-010",
+    "SCN-TRF-011",
+    "SCN-TRF-012",
+    "SCN-TRF-013",
+    "SCN-TRF-014"
   ],
   "authorized_operations": [
-    "listAccountingSystems",
-    "listAccountingExports",
-    "createAccountingExport",
-    "downloadAccountingExportFile",
-    "recordAccountingAcknowledgement"
+    "listTransfers",
+    "createTransfer",
+    "submitTransfer",
+    "actOnTransferApproval"
   ]
 }

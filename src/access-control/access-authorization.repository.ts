@@ -10,7 +10,7 @@ export interface PaymentAuthorizationContext {
   bankAccountIds: string[];
   currencies: string[];
   methodCategories: string[];
-  documentType: 'PAYMENT_REQUEST' | 'PAYMENT';
+  documentType: 'PAYMENT_REQUEST' | 'PAYMENT' | 'TRANSFER';
   amount: string;
   amountCurrency: string;
 }
@@ -268,7 +268,8 @@ export class AccessAuthorizationRepository {
     actorUserId: string,
     permission: 'payment-request.create' | 'payment.create' | 'payment.submit'
       | 'payment.approve' | 'payment.reject' | 'payment.execute' | 'payment.reverse'
-      | 'bank-instruction.record-outcome' | 'accounting.export' | 'accounting.acknowledge',
+      | 'bank-instruction.record-outcome' | 'accounting.export' | 'accounting.acknowledge'
+      | 'transfer.create' | 'transfer.submit' | 'transfer.approve' | 'transfer.reject',
     roleId?: string,
   ): Promise<PaymentGrant[]> {
     const result = await transaction.execute<PaymentGrant>(sql`

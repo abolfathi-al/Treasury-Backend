@@ -9,6 +9,16 @@ export interface PaymentAuthority {
   delegatedFromUserId?: string;
 }
 
+export interface TransferAuthorizationContext {
+  branchIds: string[];
+  treasuryUnitIds: string[];
+  cashboxIds: string[];
+  bankAccountIds: string[];
+  currencies: string[];
+  amount: string;
+  amountCurrency: string;
+}
+
 @Injectable()
 export class AccessAuthorizationService {
   constructor(
@@ -220,6 +230,46 @@ export class AccessAuthorizationService {
       from,
       to,
     );
+  }
+
+  async resolveTransferAuthority(
+    transaction: DatabaseTransaction,
+    organizationId: string,
+    actorUserId: string,
+    context: TransferAuthorizationContext,
+    permission: 'transfer.create' | 'transfer.submit' | 'transfer.approve' | 'transfer.reject',
+    roleId?: string,
+    requiredAuthorityUserId?: string | null,
+  ): Promise<PaymentAuthority | null> {
+    let grants = await this.repository.paymentGrants(
+      transaction,
+      organizationId,
+      actorUserId,
+      permission,
+      roleId,
+    );
+    grants = grants.filter((grant) => (
+      covers(grant.branchIds, context.branchIds)
+      && covers(grant.treasuryUnitIds, context.treasuryUnitIds)
+      && covers(grant.cashboxIds, context.cashboxIds)
+      && covers(grant.bankAccountIds, context.bankAccountIds)
+      && covers(grant.currencies, context.currencies)
+      && covers(grant.documentTypes, ['TRANSFER'])
+      && (
+        grant.amountCeiling === null
+        || (
+          grant.amountCeilingCurrency === context.amountCurrency
+          && decimal(context.amount) <= decimal(grant.amountCeiling)
+        )
+      )
+    ));
+    if (requiredAuthorityUserId) {
+      grants = grants.filter(({ grantUserId }) => grantUserId === requiredAuthorityUserId);
+    }
+    if (grants.some(({ delegatedFromUserId }) => delegatedFromUserId === null)) return {};
+    const grantors = [...new Set(grants.flatMap(({ delegatedFromUserId }) =>
+      delegatedFromUserId ? [delegatedFromUserId] : []))];
+    return grantors.length === 1 ? { delegatedFromUserId: grantors[0] } : null;
   }
 
   private paymentAllowed(grants: PaymentGrant[], context: PaymentAuthorizationContext): boolean {
