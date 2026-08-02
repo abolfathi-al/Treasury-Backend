@@ -16,6 +16,7 @@ import {
 
 const CURRENCY = /^[A-Z0-9]{3,8}$/u;
 const POSITIVE_DECIMAL = /^(?:0\.0*[1-9][0-9]*|[1-9][0-9]*(?:\.[0-9]{1,12})?)$/u;
+const NON_NEGATIVE_DECIMAL = /^(?:0(?:\.0{1,12})?|0\.0*[1-9][0-9]*|[1-9][0-9]*(?:\.[0-9]{1,12})?)$/u;
 const DIGEST = /^[a-f0-9]{64}$/u;
 const DATE = /^\d{4}-\d{2}-\d{2}$/u;
 
@@ -97,6 +98,22 @@ export class TransferApprovalActionDto {
   @IsOptional() @IsString() @MinLength(1) @MaxLength(500) reason?: string;
 }
 
+export class TransferReceivedMoneyDto {
+  @IsString() @Matches(NON_NEGATIVE_DECIMAL) amount!: string;
+  @IsString() @Matches(CURRENCY) currency!: string;
+}
+
+export class TransferAcknowledgeDto {
+  @ValidateNested() @Type(() => TransferReceivedMoneyDto) receivedMoney!: TransferReceivedMoneyDto;
+  @IsDateString({ strict: true }) receivedAt!: string;
+  @IsOptional() @IsArray() @ArrayUnique() @IsUUID(undefined, { each: true }) receivedAssetIds?: string[];
+  @IsOptional() @IsString() @MinLength(1) @MaxLength(500) discrepancyReason?: string;
+  @IsOptional() @IsArray()
+  @ArrayUnique((item: TransferAttachmentDto) => item.id)
+  @ValidateNested({ each: true }) @Type(() => TransferAttachmentDto)
+  attachments?: TransferAttachmentDto[];
+}
+
 export interface TransferSemanticRef { id: string; label: string }
 export interface TransferEndpointView extends TransferEndpointDto { resource: TransferSemanticRef }
 export interface TransferRateSnapshot {
@@ -164,6 +181,30 @@ export interface TransferApprovalSnapshotView {
   actions: TransferApprovalActionView[];
   state: 'PENDING' | 'APPROVED' | 'REJECTED';
 }
+export interface TransferReleaseView {
+  releasedByUserId: string;
+  releasedBy: TransferSemanticRef;
+  releasedAt: string;
+}
+export interface TransferReceiptView {
+  receivedByUserId: string;
+  receivedBy: TransferSemanticRef;
+  receivedMoney: TransferReceivedMoneyDto;
+  receivedAt: string;
+  recordedAt: string;
+  receivedAssetIds: string[];
+  discrepancyMoney: TransferMoneyDto;
+  discrepancyReason?: string;
+  attachments: TransferEvidenceRef[];
+}
+export interface TransferTransitObligationView {
+  id: string;
+  state: 'OPEN' | 'DISCREPANCY' | 'CLOSED' | 'RETURNED';
+  sourceMoney: TransferMoneyDto;
+  destinationMoney: TransferMoneyDto;
+  sourceMovementFactId: string;
+  destinationMovementFactId?: string;
+}
 export interface TransferView {
   id: string;
   organizationId: string;
@@ -189,7 +230,10 @@ export interface TransferView {
   approvalSnapshot?: TransferApprovalSnapshotView;
   assets: TransferAssetView[];
   attachments: TransferEvidenceRef[];
-  state: 'DRAFT' | 'REQUESTED' | 'APPROVED' | 'REJECTED';
+  release?: TransferReleaseView;
+  receipt?: TransferReceiptView;
+  transitObligation?: TransferTransitObligationView;
+  state: 'DRAFT' | 'REQUESTED' | 'APPROVED' | 'IN_TRANSIT' | 'DISCREPANCY' | 'COMPLETED' | 'REJECTED';
   version: number;
   createdAt: string;
   updatedAt: string;
