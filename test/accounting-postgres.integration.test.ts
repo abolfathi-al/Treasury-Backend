@@ -22,8 +22,10 @@ test('INC-3D PostgreSQL export/ack flow is scoped, deterministic, replay-safe, a
   const authorization = new AccessAuthorizationService(new AccessAuthorizationRepository());
   const foundation = new FoundationEffectsService(new FoundationEffectsRepository());
   const service = new AccountingService(database, repository, authorization, foundation);
+  let cleanupSeed: Awaited<ReturnType<typeof seedData>> | undefined;
   try {
     const seed = await seedData(database);
+    cleanupSeed = seed;
     const body = (sourceId: string, exportKind: string, accountingSystemId = seed.accountingSystemId) => ({
       accountingSystemId,
       sourceType: 'PAYMENT' as const,
@@ -483,6 +485,7 @@ test('INC-3D PostgreSQL export/ack flow is scoped, deterministic, replay-safe, a
       state: 'QUEUED', version: '1', acknowledgements: '0', locks: '0',
     });
   } finally {
+    if (cleanupSeed) await cleanup(database, cleanupSeed);
     await database.onModuleDestroy();
   }
 });
@@ -512,6 +515,7 @@ async function seedData(database: DatabaseService) {
     JOIN treasury_units t ON t.organization_id = o.id AND t.branch_id = b.id
     ORDER BY o.created_at LIMIT 1
   `);
+  const ownsFoundation = !existing.rows[0];
   if (existing.rows[0]) {
     organizationId = existing.rows[0].organization_id;
     branchId = existing.rows[0].branch_id;
@@ -679,7 +683,107 @@ async function seedData(database: DatabaseService) {
     secondAccountingImportId,
     paymentIds,
     executorId,
+    exportRoleId,
+    acknowledgeRoleId,
+    ownsFoundation,
   };
+}
+
+async function cleanup(
+  database: DatabaseService,
+  seed: Awaited<ReturnType<typeof seedData>>,
+): Promise<void> {
+  const actors = [seed.exporterId, ...seed.acknowledgerIds, seed.deniedId, seed.executorId];
+  const roles = [seed.exportRoleId, seed.acknowledgeRoleId];
+  const systems = [seed.accountingSystemId, seed.secondAccountingSystemId];
+  const client = await database.pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query('SET LOCAL session_replication_role = replica');
+    const exports = await client.query<{ id: string }>(`
+      SELECT id FROM accounting_exports
+      WHERE organization_id = $1 AND source_id = ANY($2::uuid[])
+    `, [seed.organizationId, seed.paymentIds]);
+    const exportIds = exports.rows.map(({ id }) => id);
+    await client.query(`
+      DELETE FROM audit_events WHERE organization_id = $1
+        AND entity_type = 'AccountingExport' AND entity_id = ANY($2::uuid[])
+    `, [seed.organizationId, exportIds]);
+    await client.query(`
+      DELETE FROM outbox_events WHERE organization_id = $1
+        AND aggregate_type = 'AccountingExport' AND aggregate_id = ANY($2::uuid[])
+    `, [seed.organizationId, exportIds]);
+    await client.query(`
+      DELETE FROM idempotency_records WHERE organization_id = $1 AND scope = ANY($2::text[])
+    `, [seed.organizationId, [
+      ...systems.map((id) => `createAccountingExport:${id}`),
+      ...exportIds.map((id) => `recordAccountingAcknowledgement:${id}`),
+    ]]);
+    await client.query(`
+      DELETE FROM accounting_export_row_results WHERE organization_id = $1
+        AND accounting_export_artifact_id IN (
+          SELECT id FROM accounting_export_artifacts
+          WHERE accounting_export_id = ANY($2::uuid[])
+        )
+    `, [seed.organizationId, exportIds]);
+    for (const table of [
+      'accounting_acknowledgements', 'posting_locks', 'accounting_export_attempts',
+      'accounting_export_artifacts',
+    ]) {
+      await client.query(`DELETE FROM ${table} WHERE organization_id = $1
+        AND accounting_export_id = ANY($2::uuid[])`, [seed.organizationId, exportIds]);
+    }
+    await client.query(`DELETE FROM accounting_exports WHERE organization_id = $1
+      AND id = ANY($2::uuid[])`, [seed.organizationId, exportIds]);
+    for (const table of ['fiscal_periods', 'accounting_mappings', 'accounting_imports']) {
+      await client.query(`DELETE FROM ${table} WHERE organization_id = $1
+        AND accounting_system_id = ANY($2::uuid[])`, [seed.organizationId, systems]);
+    }
+    await client.query(`DELETE FROM accounting_systems WHERE organization_id = $1
+      AND id = ANY($2::uuid[])`, [seed.organizationId, systems]);
+    await client.query(`DELETE FROM payment_lines WHERE organization_id = $1
+      AND payment_document_id = ANY($2::uuid[])`, [seed.organizationId, seed.paymentIds]);
+    await client.query(`DELETE FROM payment_documents WHERE organization_id = $1
+      AND id = ANY($2::uuid[])`, [seed.organizationId, seed.paymentIds]);
+    for (const table of [
+      'access_grant_branch_scopes', 'access_grant_treasury_unit_scopes',
+      'access_grant_document_type_scopes',
+    ]) {
+      await client.query(`DELETE FROM ${table} WHERE access_grant_id IN (
+        SELECT id FROM access_grants WHERE organization_id = $1 AND user_ref_id = ANY($2::uuid[])
+      )`, [seed.organizationId, actors]);
+    }
+    await client.query(`DELETE FROM access_grants WHERE organization_id = $1
+      AND user_ref_id = ANY($2::uuid[])`, [seed.organizationId, actors]);
+    await client.query('DELETE FROM role_permissions WHERE role_id = ANY($1::uuid[])', [roles]);
+    await client.query(`DELETE FROM roles WHERE organization_id = $1
+      AND id = ANY($2::uuid[])`, [seed.organizationId, roles]);
+    await client.query(`DELETE FROM user_refs WHERE organization_id = $1
+      AND id = ANY($2::uuid[])`, [seed.organizationId, actors]);
+    await client.query('DELETE FROM method_definitions WHERE organization_id = $1 AND id = $2',
+      [seed.organizationId, seed.methodId]);
+    await client.query('DELETE FROM parties WHERE organization_id = $1 AND id = $2',
+      [seed.organizationId, seed.partyId]);
+    await client.query(`DELETE FROM treasury_units
+      WHERE organization_id = $1 AND name = 'INC-3D drift unit'`, [seed.organizationId]);
+    await client.query(`DELETE FROM branches
+      WHERE organization_id = $1 AND name = 'INC-3D drift branch'`, [seed.organizationId]);
+    if (seed.ownsFoundation) {
+      await client.query('DELETE FROM treasury_units WHERE organization_id = $1 AND id = $2',
+        [seed.organizationId, seed.treasuryUnitId]);
+      await client.query('DELETE FROM branches WHERE organization_id = $1 AND id = $2',
+        [seed.organizationId, seed.branchId]);
+      await client.query("DELETE FROM currencies WHERE organization_id = $1 AND code = 'IRR'",
+        [seed.organizationId]);
+      await client.query('DELETE FROM organizations WHERE id = $1', [seed.organizationId]);
+    }
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
 }
 
 async function insertMappings(
