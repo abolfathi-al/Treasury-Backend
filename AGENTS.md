@@ -33,6 +33,20 @@ commit or PR.
   framework, GraphQL, cache, microservice, or Kubernetes boundary without a
   current Canon obligation.
 
+## Context navigation
+
+- Use codebase-memory `search_graph` and `get_code_snippet` first, then exact
+  source and scoped `rg`. Verify NestJS dependency-injection edges against
+  source before changing shared logic.
+- Use `trace_path` only for a bounded known symbol; it is not a substitute for
+  reading transaction, authorization, repository, and caller code.
+- Graphify is optional: explicit owner request or proven bounded broad
+  architecture/multimodal need only. It is never an automatic hook, discovery
+  default, or completion gate.
+- In the coordinated workspace, Treasury Canon's
+  `docs/AI-CONTEXT-WORKFLOW.md` owns the benchmark, exclusions, token policy,
+  and refresh flow.
+
 ## Verification
 
 Use only package scripts committed by the authorized scaffold. Every
