@@ -9,7 +9,9 @@ import {
 import { commandDigest } from '../common/http';
 import { TreasuryProblem } from '../common/problem';
 import { DatabaseService, type DatabaseTransaction } from '../database/database.service';
+import { FoundationEffectsService } from '../foundation-effects/foundation-effects.service';
 import {
+  TransferAcknowledgeDto,
   TransferApprovalAction,
   TransferApprovalActionDto,
   TransferCreateDto,
@@ -23,10 +25,12 @@ import {
   TransferFacts,
   TransferPolicy,
   TransferRepository,
+  type TransferSourceAvailability,
 } from './transfer.repository';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 const DATE = /^\d{4}-\d{2}-\d{2}$/u;
+const NON_NEGATIVE_DECIMAL = /^(?:0(?:\.0{1,12})?|0\.0*[1-9][0-9]*|[1-9][0-9]*(?:\.[0-9]{1,12})?)$/u;
 
 @Injectable()
 export class TransferService {
@@ -34,6 +38,7 @@ export class TransferService {
     @Inject(DatabaseService) private readonly database: DatabaseService,
     @Inject(TransferRepository) private readonly repository: TransferRepository,
     @Inject(AccessAuthorizationService) private readonly authorization: AccessAuthorizationService,
+    @Inject(FoundationEffectsService) private readonly effects: FoundationEffectsService,
   ) {}
 
   create(
@@ -249,6 +254,209 @@ export class TransferService {
     }));
   }
 
+  release(
+    organizationId: string,
+    actorUserId: string,
+    transferId: string,
+    rawKey: string,
+    rawIfMatch: string,
+    requestId: string,
+  ): Promise<TransferView> {
+    this.uuid(transferId);
+    this.requiredRequestId(requestId);
+    const key = this.key(rawKey);
+    const expectedVersion = this.ifMatch(rawIfMatch);
+    const scope = `releaseTransfer:${actorUserId}:${transferId}`;
+    const digest = commandDigest('releaseTransfer', { actorUserId, transferId, ifMatch: rawIfMatch });
+    return this.map(() => this.database.db.transaction(async (transaction) => {
+      await this.repository.acquireIdempotencyLock(transaction, organizationId, scope, key);
+      const replay = await this.repository.findIdempotency<TransferView>(transaction, organizationId, scope, key);
+      if (replay) {
+        if (replay.requestDigest !== digest || !replay.response?.release) throw new Error('IDEMPOTENCY_CONFLICT');
+        await this.assertCustodyCommand(transaction, organizationId, actorUserId, replay.response, 'transfer.release', 'source');
+        return replay.response;
+      }
+      await this.repository.startIdempotency(transaction, organizationId, scope, key, digest);
+      const locked = await this.repository.lock(transaction, organizationId, transferId);
+      if (!locked) throw new Error('RESOURCE_HIDDEN');
+      if (locked.version !== expectedVersion) throw new Error('STALE_VERSION');
+      if (locked.state !== 'APPROVED') throw new Error('STATE_CONFLICT');
+      const view = (await this.repository.views(transaction, organizationId, [transferId]))[0]!;
+      await this.assertCustodyCommand(transaction, organizationId, actorUserId, view, 'transfer.release', 'source');
+      const availability = await this.repository.sourceAvailability(transaction, view);
+      if (!this.sourceAvailable(view, availability) || view.assets.some(({ state }) => state !== 'PLANNED')) {
+        throw new Error('SOURCE_UNAVAILABLE');
+      }
+      const releasedAt = new Date();
+      const sourceMovementFactId = await this.effects.appendMovement(transaction, {
+        organizationId,
+        owner: 'domain.transfers',
+        sourceType: 'Transfer',
+        sourceId: transferId,
+        effectKey: 'SOURCE_RELEASE',
+        endpointType: view.source.type,
+        endpointId: view.source.id,
+        direction: 'DEBIT',
+        amount: view.sourceMoney.amount,
+        currency: view.sourceMoney.currency,
+        businessDate: view.businessDate,
+        state: 'POSTED',
+      });
+      await this.repository.recordRelease(transaction, {
+        organizationId, transferId, actorUserId, releasedAt, sourceMovementFactId, view,
+      });
+      await this.effects.appendAudit(transaction, {
+        organizationId, requestId, actorUserId, entityType: 'Transfer', entityId: transferId, action: 'TRANSFER_RELEASED',
+      });
+      const response = (await this.repository.views(transaction, organizationId, [transferId]))[0]!;
+      await this.repository.finishIdempotency(transaction, organizationId, scope, key, response);
+      return response;
+    }));
+  }
+
+  acknowledge(
+    organizationId: string,
+    actorUserId: string,
+    transferId: string,
+    dto: TransferAcknowledgeDto,
+    rawKey: string,
+    rawIfMatch: string,
+    requestId: string,
+  ): Promise<TransferView> {
+    this.uuid(transferId);
+    this.requiredRequestId(requestId);
+    this.validateAcknowledgement(dto);
+    const key = this.key(rawKey);
+    const expectedVersion = this.ifMatch(rawIfMatch);
+    const scope = `acknowledgeTransfer:${actorUserId}:${transferId}`;
+    const digest = commandDigest('acknowledgeTransfer', { actorUserId, transferId, ifMatch: rawIfMatch, body: dto });
+    return this.map(() => this.database.db.transaction(async (transaction) => {
+      await this.repository.acquireIdempotencyLock(transaction, organizationId, scope, key);
+      const replay = await this.repository.findIdempotency<TransferView>(transaction, organizationId, scope, key);
+      if (replay) {
+        if (replay.requestDigest !== digest || !replay.response?.receipt) throw new Error('IDEMPOTENCY_CONFLICT');
+        await this.assertCustodyCommand(transaction, organizationId, actorUserId, replay.response, 'transfer.receive', 'destination');
+        return replay.response;
+      }
+      await this.repository.startIdempotency(transaction, organizationId, scope, key, digest);
+      const locked = await this.repository.lock(transaction, organizationId, transferId);
+      if (!locked) throw new Error('RESOURCE_HIDDEN');
+      if (locked.version !== expectedVersion) throw new Error('STALE_VERSION');
+      if (locked.state !== 'IN_TRANSIT') {
+        if (locked.receivedByUserId) throw new Error('ALREADY_ACKNOWLEDGED');
+        throw new Error('STATE_CONFLICT');
+      }
+      const view = (await this.repository.views(transaction, organizationId, [transferId]))[0]!;
+      const facts = await this.assertCustodyCommand(transaction, organizationId, actorUserId, view, 'transfer.receive', 'destination');
+      const recordedAt = new Date();
+      const receivedAt = new Date(dto.receivedAt);
+      if (!view.release || receivedAt < new Date(view.release.releasedAt) || receivedAt > recordedAt
+        || dto.receivedMoney.currency !== view.destinationMoney.currency
+        || decimalPlaces(dto.receivedMoney.amount) > facts.currencies.find(({ code }) => code === dto.receivedMoney.currency)!.decimalPlaces) {
+        throw new Error('RECEIPT_INVALID');
+      }
+      const expectedAssets = view.assets.map(({ id }) => id);
+      const receivedAssetIds = dto.receivedAssetIds ?? [];
+      if (view.assets.some(({ state }) => state !== 'RELEASED')
+        || receivedAssetIds.some((id) => !expectedAssets.includes(id))) throw new Error('RECEIPT_INVALID');
+      const exact = compareDecimal(dto.receivedMoney.amount, view.destinationMoney.amount) === 0
+        && expectedAssets.length === receivedAssetIds.length
+        && expectedAssets.every((id) => receivedAssetIds.includes(id));
+      const reason = dto.discrepancyReason?.trim();
+      if ((exact && reason) || (!exact && !reason)) throw new Error('RECEIPT_INVALID');
+      const evidence = await this.repository.evidence(transaction, organizationId, dto.attachments ?? []);
+      if (evidence.length !== (dto.attachments?.length ?? 0)
+        || (dto.attachments ?? []).some((input) => !evidence.some((row) => row.id === input.id
+          && row.contentDigest === input.contentDigest && row.state === 'ACTIVE'))) throw new Error('RECEIPT_INVALID');
+      const destinationMovementFactId = exact ? await this.effects.appendMovement(transaction, {
+        organizationId,
+        owner: 'domain.transfers',
+        sourceType: 'Transfer',
+        sourceId: transferId,
+        effectKey: 'DESTINATION_RECEIPT',
+        endpointType: view.destination.type,
+        endpointId: view.destination.id,
+        direction: 'CREDIT',
+        amount: view.destinationMoney.amount,
+        currency: view.destinationMoney.currency,
+        businessDate: view.businessDate,
+        state: 'POSTED',
+      }) : undefined;
+      await this.repository.recordAcknowledgement(transaction, {
+        organizationId, transferId, actorUserId, recordedAt, receivedAt,
+        receivedAmount: dto.receivedMoney.amount, receivedCurrency: dto.receivedMoney.currency,
+        receivedAssetIds, discrepancyAmount: decimalDifference(view.destinationMoney.amount, dto.receivedMoney.amount),
+        discrepancyReason: reason, attachments: dto.attachments ?? [], destinationMovementFactId,
+      });
+      await this.effects.appendAudit(transaction, {
+        organizationId, requestId, actorUserId, entityType: 'Transfer', entityId: transferId,
+        action: exact ? 'TRANSFER_COMPLETED' : 'TRANSFER_DISCREPANCY', reason,
+      });
+      if (exact) {
+        const eventId = randomUUID();
+        await this.effects.appendOutbox(transaction, {
+          organizationId,
+          aggregateType: 'Transfer',
+          aggregateId: transferId,
+          aggregateVersion: view.version + 1,
+          eventType: 'treasury.transfer.completed.v1',
+          payload: {
+            specVersion: '1.0', eventId, eventType: 'treasury.transfer.completed.v1',
+            occurredAt: recordedAt.toISOString(), organizationId, aggregateType: 'Transfer',
+            aggregateId: transferId, aggregateVersion: view.version + 1, correlationId: eventId,
+            actorId: actorUserId,
+            data: { sourceType: 'Transfer', sourceId: transferId, sourceVersion: view.version + 1,
+              businessDate: view.businessDate, money: view.destinationMoney, state: 'COMPLETED', previousState: 'IN_TRANSIT', requestId },
+          },
+        });
+      }
+      const response = (await this.repository.views(transaction, organizationId, [transferId]))[0]!;
+      await this.repository.finishIdempotency(transaction, organizationId, scope, key, response);
+      return response;
+    }));
+  }
+
+  private async assertCustodyCommand(
+    transaction: DatabaseTransaction,
+    organizationId: string,
+    actorUserId: string,
+    view: TransferView,
+    permission: 'transfer.release' | 'transfer.receive',
+    side: 'source' | 'destination',
+  ): Promise<TransferFacts> {
+    const facts = await this.repository.facts(transaction, organizationId, view.creatorUserId, this.dto(view), new Date());
+    const current = await this.requiredCustodians(transaction, organizationId, view);
+    if (current.source !== view.sourceCustodianUserId || current.destination !== view.destinationCustodianUserId
+      || actorUserId !== (side === 'source' ? view.sourceCustodianUserId : view.destinationCustodianUserId)
+      || (view.release && view.release.releasedByUserId !== view.sourceCustodianUserId)) {
+      throw new Error('CUSTODIAN_UNAVAILABLE');
+    }
+    await this.assertAuthorized(transaction, organizationId, actorUserId, view, facts, permission);
+    return facts;
+  }
+
+  private sourceAvailable(view: TransferView, fact: TransferSourceAvailability | undefined): boolean {
+    if (!fact || fact.state !== 'ACTIVE' || !fact.canTransfer || !fact.active) return false;
+    const amount = decimalValue(view.sourceMoney.amount);
+    if (fact.transactionCeiling !== null && amount > decimalValue(fact.transactionCeiling)) return false;
+    return fact.minimumPosition === null
+      || decimalValue(fact.position) - decimalValue(fact.reserved) - amount >= decimalValue(fact.minimumPosition);
+  }
+
+  private validateAcknowledgement(dto: TransferAcknowledgeDto): void {
+    if (!dto || containsNull(dto) || !dto.receivedMoney
+      || !NON_NEGATIVE_DECIMAL.test(dto.receivedMoney.amount ?? '')
+      || !/^[A-Z0-9]{3,8}$/u.test(dto.receivedMoney.currency ?? '')
+      || !Number.isFinite(new Date(dto.receivedAt).getTime())) {
+      this.validation('Transfer acknowledgement contains invalid receipt facts.');
+    }
+    if (new Set(dto.receivedAssetIds ?? []).size !== (dto.receivedAssetIds?.length ?? 0)
+      || new Set((dto.attachments ?? []).map(({ id }) => id)).size !== (dto.attachments?.length ?? 0)
+      || (dto.discrepancyReason !== undefined && !dto.discrepancyReason.trim())) {
+      this.validation('Transfer acknowledgement contains duplicate or empty evidence.');
+    }
+  }
+
   private derive(dto: TransferCreateDto, facts: TransferFacts, commandAt: Date) {
     this.validateFacts(dto, facts);
     const target = facts.currencies.find(({ code }) => code === dto.destinationCurrency)!;
@@ -349,7 +557,7 @@ export class TransferService {
     actorUserId: string,
     view: Pick<TransferView, 'sourceMoney'>,
     facts: TransferFacts,
-    permission: 'transfer.create' | 'transfer.submit' | 'transfer.approve' | 'transfer.reject',
+    permission: 'transfer.create' | 'transfer.submit' | 'transfer.approve' | 'transfer.reject' | 'transfer.release' | 'transfer.receive',
     roleId?: string,
     requiredAuthorityUserId?: string | null,
   ): Promise<PaymentAuthority> {
@@ -508,6 +716,9 @@ export class TransferService {
         INACTIVE_REFERENCE: ['TRS-MST-001', 409],
         RATE_INVALID: ['TRS-MST-003', 422],
         TRANSFER_INVALID: ['TRS-TRF-001', 422],
+        SOURCE_UNAVAILABLE: ['TRS-TRF-002', 409],
+        RECEIPT_INVALID: ['TRS-TRF-003', 422],
+        ALREADY_ACKNOWLEDGED: ['TRS-TRF-004', 409],
         CUSTODIAN_UNAVAILABLE: ['TRS-TRF-005', 409],
         APPROVAL_POLICY_UNAVAILABLE: ['TRS-TRF-006', 409],
         STATE_CONFLICT: ['TRS-GEN-005', 409],
@@ -601,6 +812,18 @@ function compareDecimal(left: string, right: string): number {
 function decimalParts(value: string): { value: bigint; scale: number } {
   const [whole, fraction = ''] = value.split('.');
   return { value: BigInt(`${whole}${fraction}`), scale: fraction.length };
+}
+function decimalValue(value: string): bigint {
+  const negative = value.startsWith('-');
+  const [whole, fraction = ''] = (negative ? value.slice(1) : value).split('.');
+  const scaled = BigInt(whole) * 1_000_000_000_000n + BigInt(fraction.padEnd(12, '0'));
+  return negative ? -scaled : scaled;
+}
+function decimalDifference(left: string, right: string): string {
+  const a = decimalParts(left); const b = decimalParts(right); const scale = Math.max(a.scale, b.scale);
+  const difference = a.value * 10n ** BigInt(scale - a.scale) - b.value * 10n ** BigInt(scale - b.scale);
+  const formatted = formatScaled(difference < 0n ? -difference : difference, scale);
+  return formatted.includes('.') ? formatted.replace(/0+$/u, '').replace(/\.$/u, '') : formatted;
 }
 function roundDivision(numerator: bigint, denominator: bigint): bigint { return (numerator + denominator / 2n) / denominator; }
 function roundSignedDivision(numerator: bigint, denominator: bigint): bigint { return numerator < 0n ? -roundDivision(-numerator, denominator) : roundDivision(numerator, denominator); }

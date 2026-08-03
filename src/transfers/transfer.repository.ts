@@ -7,11 +7,14 @@ import {
   bankAccounts,
   cashboxAssignments,
   cashboxCurrencyControls,
+  cashboxDays,
   cashboxes,
   currencies,
   exchangeRates,
   idempotencyRecords,
+  movementFacts,
   organizations,
+  paymentReservations,
   receivedCheques,
   roles,
   transferApprovalActions,
@@ -22,10 +25,12 @@ import {
   transferAssetItems,
   transferAttachmentLinks,
   transferDocuments,
+  transferTransitObligations,
   userRefs,
 } from '../database/schema';
 import {
   TransferApprovalActionView,
+  TransferAttachmentDto,
   TransferApprovalSnapshotView,
   TransferApprovalStepView,
   TransferAssetType,
@@ -98,6 +103,16 @@ export interface CurrentTransferStep {
   approvalsRequired: number;
   approvalsRecorded: number;
   separationRules: string[];
+}
+
+export interface TransferSourceAvailability {
+  state: string;
+  canTransfer: boolean;
+  active: boolean;
+  transactionCeiling: string | null;
+  minimumPosition: string | null;
+  position: string;
+  reserved: string;
 }
 
 @Injectable()
@@ -392,6 +407,181 @@ export class TransferRepository {
     return row;
   }
 
+  async sourceAvailability(
+    transaction: DatabaseTransaction,
+    view: TransferView,
+  ): Promise<TransferSourceAvailability | undefined> {
+    let state = 'ACTIVE';
+    let canTransfer = true;
+    let active = true;
+    let transactionCeiling: string | null = null;
+    let minimumPosition: string | null = '0';
+    if (view.source.type === TransferEndpointType.CASHBOX) {
+      const [source] = await transaction.select({
+        state: cashboxes.state,
+        canTransfer: cashboxes.canTransfer,
+        activeFrom: cashboxes.activeFrom,
+        activeTo: cashboxes.activeTo,
+        transactionCeiling: cashboxCurrencyControls.transactionCeiling,
+        minimumPosition: cashboxCurrencyControls.minimumPosition,
+        allowNegative: cashboxCurrencyControls.allowNegative,
+      }).from(cashboxes).innerJoin(cashboxCurrencyControls, and(
+        eq(cashboxCurrencyControls.organizationId, cashboxes.organizationId),
+        eq(cashboxCurrencyControls.cashboxId, cashboxes.id),
+        eq(cashboxCurrencyControls.currency, view.sourceMoney.currency),
+      )).where(and(
+        eq(cashboxes.organizationId, view.organizationId),
+        eq(cashboxes.id, view.source.id),
+      )).for('update', { of: cashboxes });
+      if (!source) return undefined;
+      const at = new Date(`${view.businessDate}T00:00:00.000Z`);
+      const [day] = await transaction.select({ state: cashboxDays.state }).from(cashboxDays).where(and(
+        eq(cashboxDays.organizationId, view.organizationId),
+        eq(cashboxDays.cashboxId, view.source.id),
+        eq(cashboxDays.businessDate, view.businessDate),
+      )).orderBy(desc(cashboxDays.closeCycle)).limit(1).for('update');
+      state = source.state;
+      canTransfer = source.canTransfer;
+      active = source.activeFrom <= at && (source.activeTo === null || source.activeTo > at) && day?.state !== 'CLOSED';
+      transactionCeiling = source.transactionCeiling;
+      minimumPosition = source.minimumPosition ?? (source.allowNegative ? null : '0');
+    } else if (view.source.type === TransferEndpointType.BANK_ACCOUNT) {
+      const [source] = await transaction.select({
+        state: bankAccounts.state,
+        canTransfer: bankAccounts.canTransfer,
+        openingDate: bankAccounts.openingDate,
+        closingDate: bankAccounts.closingDate,
+        transactionCeiling: bankAccounts.withdrawalCeiling,
+      }).from(bankAccounts).where(and(
+        eq(bankAccounts.organizationId, view.organizationId),
+        eq(bankAccounts.id, view.source.id),
+        eq(bankAccounts.currency, view.sourceMoney.currency),
+      )).for('update');
+      if (!source) return undefined;
+      state = source.state;
+      canTransfer = source.canTransfer;
+      active = source.openingDate <= view.businessDate && (source.closingDate === null || source.closingDate >= view.businessDate);
+      transactionCeiling = source.transactionCeiling;
+    } else {
+      const [source] = await transaction.select({ state: userRefs.state }).from(userRefs).where(and(
+        eq(userRefs.organizationId, view.organizationId), eq(userRefs.id, view.source.id),
+      )).for('update');
+      if (!source) return undefined;
+      state = source.state;
+    }
+    const [position] = await transaction.select({
+      balance: sql<string>`COALESCE(SUM(CASE WHEN ${movementFacts.direction} = 'CREDIT' THEN ${movementFacts.amount} ELSE -${movementFacts.amount} END), 0)::text`,
+    }).from(movementFacts).where(and(
+      eq(movementFacts.organizationId, view.organizationId),
+      eq(movementFacts.endpointType, view.source.type),
+      eq(movementFacts.endpointId, view.source.id),
+      eq(movementFacts.currency, view.sourceMoney.currency),
+    ));
+    const [reservations] = await transaction.select({
+      amount: sql<string>`COALESCE(SUM(${paymentReservations.amount}), 0)::text`,
+    }).from(paymentReservations).where(and(
+      eq(paymentReservations.organizationId, view.organizationId),
+      eq(paymentReservations.sourceType, view.source.type),
+      eq(paymentReservations.sourceId, view.source.id),
+      eq(paymentReservations.currency, view.sourceMoney.currency),
+      inArray(paymentReservations.state, ['ACTIVE', 'REVIEW_REQUIRED']),
+    ));
+    return {
+      state,
+      canTransfer,
+      active,
+      transactionCeiling,
+      minimumPosition,
+      position: position?.balance ?? '0',
+      reserved: reservations?.amount ?? '0',
+    };
+  }
+
+  async evidence(
+    transaction: DatabaseTransaction,
+    organizationId: string,
+    inputs: TransferAttachmentDto[],
+  ): Promise<Array<{ id: string; contentDigest: string; state: string }>> {
+    if (!inputs.length) return [];
+    return transaction.select({ id: attachments.id, contentDigest: attachments.contentDigest, state: attachments.state })
+      .from(attachments).where(and(eq(attachments.organizationId, organizationId), inArray(attachments.id, inputs.map(({ id }) => id))));
+  }
+
+  async recordRelease(
+    transaction: DatabaseTransaction,
+    input: { organizationId: string; transferId: string; actorUserId: string; releasedAt: Date; sourceMovementFactId: string; view: TransferView },
+  ): Promise<void> {
+    await transaction.insert(transferTransitObligations).values({
+      organizationId: input.organizationId,
+      transferDocumentId: input.transferId,
+      sourceAmount: input.view.sourceMoney.amount,
+      sourceCurrency: input.view.sourceMoney.currency,
+      destinationAmount: input.view.destinationMoney.amount,
+      destinationCurrency: input.view.destinationMoney.currency,
+      sourceMovementFactId: input.sourceMovementFactId,
+      state: 'OPEN',
+      createdAt: input.releasedAt,
+      updatedAt: input.releasedAt,
+    });
+    await transaction.update(transferAssetItems).set({ state: 'RELEASED' }).where(and(
+      eq(transferAssetItems.organizationId, input.organizationId),
+      eq(transferAssetItems.transferDocumentId, input.transferId),
+      eq(transferAssetItems.state, 'PLANNED'),
+    ));
+    await transaction.update(transferDocuments).set({
+      state: 'IN_TRANSIT',
+      releasedByUserId: input.actorUserId,
+      releasedAt: input.releasedAt,
+      version: sql`${transferDocuments.version} + 1`,
+      updatedAt: input.releasedAt,
+    }).where(and(eq(transferDocuments.organizationId, input.organizationId), eq(transferDocuments.id, input.transferId)));
+  }
+
+  async recordAcknowledgement(
+    transaction: DatabaseTransaction,
+    input: {
+      organizationId: string; transferId: string; actorUserId: string; recordedAt: Date; receivedAt: Date;
+      receivedAmount: string; receivedCurrency: string; receivedAssetIds: string[]; discrepancyAmount: string;
+      discrepancyReason?: string; attachments: TransferAttachmentDto[]; destinationMovementFactId?: string;
+    },
+  ): Promise<void> {
+    if (input.receivedAssetIds.length) await transaction.update(transferAssetItems).set({ state: 'RECEIVED' }).where(and(
+      eq(transferAssetItems.organizationId, input.organizationId),
+      eq(transferAssetItems.transferDocumentId, input.transferId),
+      inArray(transferAssetItems.assetId, input.receivedAssetIds),
+      eq(transferAssetItems.state, 'RELEASED'),
+    ));
+    if (input.attachments.length) await transaction.insert(transferAttachmentLinks).values(input.attachments.map((attachment) => ({
+      organizationId: input.organizationId,
+      transferDocumentId: input.transferId,
+      attachmentId: attachment.id,
+      contentDigest: attachment.contentDigest,
+      purpose: attachment.purpose,
+    }))).onConflictDoNothing();
+    const completed = !!input.destinationMovementFactId;
+    await transaction.update(transferTransitObligations).set({
+      state: completed ? 'CLOSED' : 'DISCREPANCY',
+      destinationMovementFactId: input.destinationMovementFactId,
+      receivedAmount: input.receivedAmount,
+      receivedCurrency: input.receivedCurrency,
+      updatedAt: input.recordedAt,
+    }).where(and(
+      eq(transferTransitObligations.organizationId, input.organizationId),
+      eq(transferTransitObligations.transferDocumentId, input.transferId),
+      eq(transferTransitObligations.state, 'OPEN'),
+    ));
+    await transaction.update(transferDocuments).set({
+      state: completed ? 'COMPLETED' : 'DISCREPANCY',
+      receivedByUserId: input.actorUserId,
+      receivedAt: input.receivedAt,
+      receiptRecordedAt: input.recordedAt,
+      discrepancyAmount: input.discrepancyAmount,
+      discrepancyReason: input.discrepancyReason,
+      version: sql`${transferDocuments.version} + 1`,
+      updatedAt: input.recordedAt,
+    }).where(and(eq(transferDocuments.organizationId, input.organizationId), eq(transferDocuments.id, input.transferId)));
+  }
+
   async policies(
     transaction: DatabaseTransaction,
     organizationId: string,
@@ -518,6 +708,16 @@ export class TransferRepository {
     source: { type: string; id: string },
     destination: { type: string; id: string },
   ): Promise<{ source: string; destination: string } | undefined> {
+    const cashboxIds = [...new Set([source, destination]
+      .filter(({ type }) => type === 'CASHBOX')
+      .map(({ id }) => id))].sort();
+    if (cashboxIds.length) {
+      const locked = await transaction.select({ id: cashboxes.id }).from(cashboxes).where(and(
+        eq(cashboxes.organizationId, organizationId),
+        inArray(cashboxes.id, cashboxIds),
+      )).orderBy(cashboxes.id).for('update');
+      if (locked.length !== cashboxIds.length) return undefined;
+    }
     const sourceUser = await this.custodian(transaction, organizationId, source);
     const destinationUser = await this.custodian(transaction, organizationId, destination);
     return sourceUser && destinationUser && sourceUser !== destinationUser
@@ -533,7 +733,7 @@ export class TransferRepository {
     if (endpoint.type === 'USER') {
       const [user] = await transaction.select({ id: userRefs.id }).from(userRefs).where(and(
         eq(userRefs.organizationId, organizationId), eq(userRefs.id, endpoint.id), eq(userRefs.state, 'ACTIVE'),
-      ));
+      )).for('share');
       return user?.id;
     }
     if (endpoint.type !== 'CASHBOX') return undefined;
@@ -595,6 +795,10 @@ export class TransferRepository {
     const attachmentRows = await transaction.select({ id: transferAttachmentLinks.attachmentId, label: attachments.fileName, digest: transferAttachmentLinks.contentDigest, purpose: transferAttachmentLinks.purpose }).from(transferAttachmentLinks).innerJoin(attachments, and(eq(attachments.organizationId, transferAttachmentLinks.organizationId), eq(attachments.id, transferAttachmentLinks.attachmentId))).where(and(eq(transferAttachmentLinks.organizationId, row.organizationId), eq(transferAttachmentLinks.transferDocumentId, row.id)));
     const [rateRecord] = row.rateRecordId ? await transaction.select({ id: exchangeRates.id, label: exchangeRates.sourceName }).from(exchangeRates).where(eq(exchangeRates.id, row.rateRecordId)) : [];
     const custodians = row.sourceCustodianUserId && row.destinationCustodianUserId ? await transaction.select({ id: userRefs.id, label: userRefs.displayName }).from(userRefs).where(and(eq(userRefs.organizationId, row.organizationId), inArray(userRefs.id, [row.sourceCustodianUserId, row.destinationCustodianUserId]))) : [];
+    const [obligation] = await transaction.select().from(transferTransitObligations).where(and(
+      eq(transferTransitObligations.organizationId, row.organizationId),
+      eq(transferTransitObligations.transferDocumentId, row.id),
+    ));
     const semanticEndpoint = (fact: TransferEndpointFact): TransferEndpointView => ({ type: fact.type, id: fact.id, resource: { id: fact.id, label: fact.label } });
     return {
       id: row.id, organizationId: row.organizationId, organization: organization!, businessNumber: row.businessNumber,
@@ -611,6 +815,30 @@ export class TransferRepository {
       ...(approvalSnapshot ? { approvalSnapshot } : {}),
       assets: assetRows.map((asset) => ({ type: asset.assetType as TransferAssetType, id: asset.assetId, asset: { id: asset.assetId, label: asset.assetLabel }, quantity: asset.quantity, state: asset.state as 'PLANNED' | 'RELEASED' | 'RECEIVED' | 'RETURNED' })),
       attachments: attachmentRows.map(({ id, label, digest, purpose }) => ({ attachmentId: id, attachment: { id, label }, digest, ...(purpose ? { purpose } : {}) } as TransferEvidenceRef)),
+      ...(row.releasedByUserId && row.releasedAt ? { release: {
+        releasedByUserId: row.releasedByUserId,
+        releasedBy: custodians.find(({ id }) => id === row.releasedByUserId)!,
+        releasedAt: row.releasedAt.toISOString(),
+      } } : {}),
+      ...(row.receivedByUserId && row.receivedAt && row.receiptRecordedAt && obligation?.receivedAmount !== null && obligation?.receivedCurrency ? { receipt: {
+        receivedByUserId: row.receivedByUserId,
+        receivedBy: custodians.find(({ id }) => id === row.receivedByUserId)!,
+        receivedMoney: { amount: obligation.receivedAmount, currency: obligation.receivedCurrency },
+        receivedAt: row.receivedAt.toISOString(),
+        recordedAt: row.receiptRecordedAt.toISOString(),
+        receivedAssetIds: assetRows.filter(({ state }) => state === 'RECEIVED').map(({ assetId }) => assetId),
+        discrepancyMoney: { amount: row.discrepancyAmount, currency: row.destinationCurrency },
+        ...(row.discrepancyReason ? { discrepancyReason: row.discrepancyReason } : {}),
+        attachments: attachmentRows.map(({ id, label, digest, purpose }) => ({ attachmentId: id, attachment: { id, label }, digest, ...(purpose ? { purpose } : {}) } as TransferEvidenceRef)),
+      } } : {}),
+      ...(obligation ? { transitObligation: {
+        id: obligation.id,
+        state: obligation.state as 'OPEN' | 'DISCREPANCY' | 'CLOSED' | 'RETURNED',
+        sourceMoney: { amount: obligation.sourceAmount, currency: obligation.sourceCurrency },
+        destinationMoney: { amount: obligation.destinationAmount, currency: obligation.destinationCurrency },
+        sourceMovementFactId: obligation.sourceMovementFactId,
+        ...(obligation.destinationMovementFactId ? { destinationMovementFactId: obligation.destinationMovementFactId } : {}),
+      } } : {}),
       state: row.state as TransferView['state'], version: row.version, createdAt: row.createdAt.toISOString(), updatedAt: row.updatedAt.toISOString(),
     };
   }

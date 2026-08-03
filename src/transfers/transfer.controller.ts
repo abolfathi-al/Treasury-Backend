@@ -3,7 +3,7 @@ import type { Response } from 'express';
 
 import { RequirePermission } from '../access-control/auth.decorators';
 import type { TreasuryRequest } from '../access-control/auth.guard';
-import { TransferApprovalActionDto, TransferCreateDto } from './transfer.dto';
+import { TransferAcknowledgeDto, TransferApprovalActionDto, TransferCreateDto } from './transfer.dto';
 import { TransferService } from './transfer.service';
 
 @Controller('v1')
@@ -82,6 +82,43 @@ export class TransferController {
       key,
       ifMatch,
       requestId,
+    );
+    response.setHeader('ETag', `"${updated.version}"`);
+    return updated;
+  }
+
+  @Post('transfers/:resourceId/release')
+  @HttpCode(200)
+  @RequirePermission('transfer.release', 'releaseTransfer', 'ONE_GRANT_RESOURCE')
+  async release(
+    @Req() request: TreasuryRequest,
+    @Param('resourceId') resourceId: string,
+    @Headers('Idempotency-Key') key: string,
+    @Headers('If-Match') ifMatch: string,
+    @Headers('X-Request-Id') requestId: string,
+    @Res({ passthrough: true }) response: Response,
+  ) {
+    const updated = await this.service.release(
+      request.auth!.organizationId, request.auth!.session.userId, resourceId, key, ifMatch, requestId,
+    );
+    response.setHeader('ETag', `"${updated.version}"`);
+    return updated;
+  }
+
+  @Post('transfers/:resourceId/acknowledge')
+  @HttpCode(200)
+  @RequirePermission('transfer.receive', 'acknowledgeTransfer', 'ONE_GRANT_RESOURCE')
+  async acknowledge(
+    @Req() request: TreasuryRequest,
+    @Param('resourceId') resourceId: string,
+    @Headers('Idempotency-Key') key: string,
+    @Headers('If-Match') ifMatch: string,
+    @Headers('X-Request-Id') requestId: string,
+    @Body() body: TransferAcknowledgeDto,
+    @Res({ passthrough: true }) response: Response,
+  ) {
+    const updated = await this.service.acknowledge(
+      request.auth!.organizationId, request.auth!.session.userId, resourceId, body, key, ifMatch, requestId,
     );
     response.setHeader('ETag', `"${updated.version}"`);
     return updated;
