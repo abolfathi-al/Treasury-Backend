@@ -377,7 +377,7 @@ export class SettlementService {
             sourceType: 'SettlementBatch',
             sourceId: reversalId,
             sourceLineId: reversalId,
-            effectKey: 'bank-credit-reversal',
+            effectKey: effect.effectKey,
             endpointType: 'BANK_ACCOUNT',
             endpointId: locked.batch.destinationBankAccountId,
             direction: 'DEBIT',
@@ -391,7 +391,7 @@ export class SettlementService {
         await this.repository.appendEffect(transaction, {
           organizationId: context.organizationId,
           settlementBatchId: reversalId,
-          effectKey: `reverse:${effect.effectKey}`,
+          effectKey: effect.effectKey,
           effectType: effect.effectType as SettlementEffectType,
           direction: 'REVERSAL',
           amount: effect.amount,

@@ -181,6 +181,250 @@ CREATE TABLE settlement_effects (
   )
 );
 
+CREATE FUNCTION enforce_settlement_effect_evidence()
+RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE
+  batch settlement_batches%ROWTYPE;
+  original settlement_effects%ROWTYPE;
+BEGIN
+  SELECT * INTO batch
+  FROM settlement_batches
+  WHERE organization_id = NEW.organization_id
+    AND id = NEW.settlement_batch_id;
+  IF NOT FOUND
+    OR batch.currency <> NEW.currency
+    OR batch.settlement_date <> NEW.business_date
+    OR batch.version <> NEW.source_version
+    OR (NEW.direction = 'SETTLEMENT' AND batch.state NOT IN ('CONFIRMED', 'REVERSED'))
+    OR (NEW.direction = 'REVERSAL' AND batch.state <> 'REVERSAL') THEN
+    RAISE EXCEPTION 'Settlement effect batch provenance mismatch'
+      USING ERRCODE = '23514', CONSTRAINT = 'settlement_effect_batch_provenance';
+  END IF;
+
+  IF NEW.direction = 'REVERSAL' THEN
+    SELECT * INTO original
+    FROM settlement_effects
+    WHERE organization_id = NEW.organization_id
+      AND id = NEW.reversal_of_effect_id
+      AND direction = 'SETTLEMENT'
+      AND settlement_batch_id = batch.reversal_of_batch_id
+      AND effect_key = NEW.effect_key
+      AND effect_type = NEW.effect_type
+      AND currency = NEW.currency
+      AND amount = NEW.amount
+      AND collection_item_id IS NOT DISTINCT FROM NEW.collection_item_id;
+    IF NOT FOUND THEN
+      RAISE EXCEPTION 'Settlement reversal effect provenance mismatch'
+        USING ERRCODE = '23514', CONSTRAINT = 'settlement_effect_reversal_provenance';
+    END IF;
+  END IF;
+
+  IF NEW.effect_type = 'BANK_CREDIT' AND NOT EXISTS (
+    SELECT 1
+    FROM movement_facts fact
+    WHERE fact.organization_id = NEW.organization_id
+      AND fact.id = NEW.movement_fact_id
+      AND fact.owner = 'domain.collection-and-settlement'
+      AND fact.source_type = 'SettlementBatch'
+      AND fact.source_id = NEW.settlement_batch_id
+      AND fact.effect_key = NEW.effect_key
+      AND fact.endpoint_type = 'BANK_ACCOUNT'
+      AND fact.endpoint_id = batch.destination_bank_account_id
+      AND fact.direction = CASE NEW.direction WHEN 'SETTLEMENT' THEN 'CREDIT' ELSE 'DEBIT' END
+      AND fact.amount = NEW.amount
+      AND fact.currency = NEW.currency
+      AND fact.business_date = NEW.business_date
+      AND (NEW.direction <> 'SETTLEMENT' OR NEW.amount = batch.actual_net_amount)
+      AND (NEW.direction <> 'REVERSAL' OR fact.reversal_of_fact_id = original.movement_fact_id)
+  ) THEN
+    RAISE EXCEPTION 'Settlement bank movement evidence mismatch'
+      USING ERRCODE = '23514', CONSTRAINT = 'settlement_effect_bank_movement_provenance';
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+CREATE CONSTRAINT TRIGGER settlement_effect_evidence_consistency
+AFTER INSERT ON settlement_effects
+DEFERRABLE INITIALLY DEFERRED
+FOR EACH ROW EXECUTE FUNCTION enforce_settlement_effect_evidence();
+
+CREATE FUNCTION enforce_settlement_batch_effect_set()
+RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE
+  checked_batch settlement_batches%ROWTYPE;
+BEGIN
+  IF TG_TABLE_NAME = 'settlement_effects' THEN
+    SELECT * INTO checked_batch
+    FROM settlement_batches
+    WHERE organization_id = NEW.organization_id
+      AND id = NEW.settlement_batch_id;
+  ELSE
+    SELECT * INTO checked_batch
+    FROM settlement_batches
+    WHERE organization_id = NEW.organization_id
+      AND id = NEW.id;
+  END IF;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Settlement effect-set batch is missing'
+      USING ERRCODE = '23503', CONSTRAINT = 'settlement_effect_set_batch';
+  END IF;
+
+  IF checked_batch.state = 'CONFIRMED' AND (
+    (SELECT COUNT(*) FROM settlement_effects effect
+      WHERE effect.organization_id = checked_batch.organization_id
+        AND effect.settlement_batch_id = checked_batch.id
+        AND effect.direction = 'SETTLEMENT'
+        AND effect.effect_type = 'BANK_CREDIT'
+        AND effect.amount = checked_batch.actual_net_amount
+        AND effect.currency = checked_batch.currency) <> 1
+    OR EXISTS (
+      SELECT 1 FROM settlement_allocations allocation
+      WHERE allocation.organization_id = checked_batch.organization_id
+        AND allocation.settlement_batch_id = checked_batch.id
+        AND (allocation.state <> 'CONFIRMED' OR NOT EXISTS (
+          SELECT 1 FROM settlement_effects effect
+          WHERE effect.organization_id = allocation.organization_id
+            AND effect.settlement_batch_id = allocation.settlement_batch_id
+            AND effect.direction = 'SETTLEMENT'
+            AND effect.effect_type = 'ALLOCATION_CONSUMPTION'
+            AND effect.collection_item_id = allocation.collection_item_id
+            AND effect.amount = allocation.allocated_amount
+            AND effect.currency = allocation.currency))
+    )
+    OR (SELECT COUNT(*) FROM settlement_allocations allocation
+      WHERE allocation.organization_id = checked_batch.organization_id
+        AND allocation.settlement_batch_id = checked_batch.id)
+      <> (SELECT COUNT(*) FROM settlement_effects effect
+        WHERE effect.organization_id = checked_batch.organization_id
+          AND effect.settlement_batch_id = checked_batch.id
+          AND effect.direction = 'SETTLEMENT'
+          AND effect.effect_type = 'ALLOCATION_CONSUMPTION')
+    OR (SELECT COUNT(*) FROM settlement_effects effect
+      WHERE effect.organization_id = checked_batch.organization_id
+        AND effect.settlement_batch_id = checked_batch.id
+        AND effect.direction = 'SETTLEMENT'
+        AND effect.effect_type = 'FEE_EVIDENCE')
+      <> CASE WHEN checked_batch.fee_amount > 0 THEN 1 ELSE 0 END
+    OR EXISTS (
+      SELECT 1 FROM settlement_effects effect
+      WHERE effect.organization_id = checked_batch.organization_id
+        AND effect.settlement_batch_id = checked_batch.id
+        AND effect.direction = 'SETTLEMENT'
+        AND effect.effect_type = 'FEE_EVIDENCE'
+        AND (effect.amount <> checked_batch.fee_amount OR effect.currency <> checked_batch.currency)
+    )
+    OR (SELECT COUNT(*) FROM settlement_effects effect
+      WHERE effect.organization_id = checked_batch.organization_id
+        AND effect.settlement_batch_id = checked_batch.id
+        AND effect.direction = 'SETTLEMENT'
+        AND effect.effect_type = 'DEDUCTION_EVIDENCE')
+      <> CASE WHEN checked_batch.deduction_amount > 0 THEN 1 ELSE 0 END
+    OR EXISTS (
+      SELECT 1 FROM settlement_effects effect
+      WHERE effect.organization_id = checked_batch.organization_id
+        AND effect.settlement_batch_id = checked_batch.id
+        AND effect.direction = 'SETTLEMENT'
+        AND effect.effect_type = 'DEDUCTION_EVIDENCE'
+        AND (effect.amount <> checked_batch.deduction_amount OR effect.currency <> checked_batch.currency)
+    )
+    OR (SELECT COUNT(*) FROM settlement_effects effect
+      WHERE effect.organization_id = checked_batch.organization_id
+        AND effect.settlement_batch_id = checked_batch.id
+        AND effect.direction = 'SETTLEMENT'
+        AND effect.effect_type = 'APPROVED_DISCREPANCY_EVIDENCE')
+      <> CASE WHEN checked_batch.discrepancy_amount <> 0 THEN 1 ELSE 0 END
+    OR EXISTS (
+      SELECT 1 FROM settlement_effects effect
+      WHERE effect.organization_id = checked_batch.organization_id
+        AND effect.settlement_batch_id = checked_batch.id
+        AND effect.direction = 'SETTLEMENT'
+        AND effect.effect_type = 'APPROVED_DISCREPANCY_EVIDENCE'
+        AND (effect.amount <> checked_batch.discrepancy_amount OR effect.currency <> checked_batch.currency)
+    )
+  ) THEN
+    RAISE EXCEPTION 'Confirmed Settlement effect set is incomplete or inconsistent'
+      USING ERRCODE = '23514', CONSTRAINT = 'settlement_confirmed_effect_set';
+  END IF;
+
+  IF checked_batch.state = 'REVERSED' AND (
+    NOT EXISTS (
+      SELECT 1 FROM settlement_batches reversal
+      WHERE reversal.organization_id = checked_batch.organization_id
+        AND reversal.reversal_of_batch_id = checked_batch.id
+        AND reversal.state = 'REVERSAL'
+    )
+    OR EXISTS (
+      SELECT 1 FROM settlement_allocations allocation
+      WHERE allocation.organization_id = checked_batch.organization_id
+        AND allocation.settlement_batch_id = checked_batch.id
+        AND allocation.state <> 'REVERSED'
+    )
+    OR EXISTS (
+      SELECT 1 FROM settlement_effects original
+      WHERE original.organization_id = checked_batch.organization_id
+        AND original.settlement_batch_id = checked_batch.id
+        AND original.direction = 'SETTLEMENT'
+        AND NOT EXISTS (
+          SELECT 1 FROM settlement_batches reversal
+          JOIN settlement_effects inverse
+            ON inverse.organization_id = reversal.organization_id
+            AND inverse.settlement_batch_id = reversal.id
+            AND inverse.direction = 'REVERSAL'
+            AND inverse.reversal_of_effect_id = original.id
+            AND inverse.effect_key = original.effect_key
+          WHERE reversal.organization_id = checked_batch.organization_id
+            AND reversal.reversal_of_batch_id = checked_batch.id
+            AND reversal.state = 'REVERSAL')
+    )
+  ) THEN
+    RAISE EXCEPTION 'Reversed Settlement lacks one complete linked inverse effect set'
+      USING ERRCODE = '23514', CONSTRAINT = 'settlement_reversed_effect_set';
+  END IF;
+
+  IF checked_batch.state = 'REVERSAL' AND (
+    NOT EXISTS (
+      SELECT 1 FROM settlement_batches original
+      WHERE original.organization_id = checked_batch.organization_id
+        AND original.id = checked_batch.reversal_of_batch_id
+        AND original.state = 'REVERSED'
+    )
+    OR EXISTS (
+      SELECT 1 FROM settlement_effects original_effect
+      WHERE original_effect.organization_id = checked_batch.organization_id
+        AND original_effect.settlement_batch_id = checked_batch.reversal_of_batch_id
+        AND original_effect.direction = 'SETTLEMENT'
+        AND NOT EXISTS (
+          SELECT 1 FROM settlement_effects inverse
+          WHERE inverse.organization_id = checked_batch.organization_id
+            AND inverse.settlement_batch_id = checked_batch.id
+            AND inverse.direction = 'REVERSAL'
+            AND inverse.reversal_of_effect_id = original_effect.id)
+    )
+    OR EXISTS (
+      SELECT 1 FROM settlement_effects inverse
+      WHERE inverse.organization_id = checked_batch.organization_id
+        AND inverse.settlement_batch_id = checked_batch.id
+        AND inverse.direction <> 'REVERSAL'
+    )
+  ) THEN
+    RAISE EXCEPTION 'Settlement Reversal does not exactly cover its original effect set'
+      USING ERRCODE = '23514', CONSTRAINT = 'settlement_reversal_effect_set';
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+CREATE CONSTRAINT TRIGGER settlement_batch_effect_set_consistency
+AFTER INSERT OR UPDATE OF state ON settlement_batches
+DEFERRABLE INITIALLY DEFERRED
+FOR EACH ROW EXECUTE FUNCTION enforce_settlement_batch_effect_set();
+
+CREATE CONSTRAINT TRIGGER settlement_effect_append_revalidates_batch
+AFTER INSERT ON settlement_effects
+DEFERRABLE INITIALLY DEFERRED
+FOR EACH ROW EXECUTE FUNCTION enforce_settlement_batch_effect_set();
+
 CREATE FUNCTION enforce_settlement_allocation_consistency()
 RETURNS trigger LANGUAGE plpgsql AS $$
 DECLARE

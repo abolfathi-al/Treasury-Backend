@@ -181,6 +181,51 @@ test('INC-4C preserves rollback, replay, stale, concurrency, credit, and reversa
       WHERE organization_id = $1
         AND settlement_batch_id IN ($2, $3)
     `, [seeded.organizationId, created.id, reversed.reversal.id]), 6);
+    assert.equal(await count(database, `
+      SELECT count(*)
+      FROM settlement_effects inverse
+      JOIN settlement_effects original
+        ON original.organization_id = inverse.organization_id
+       AND original.id = inverse.reversal_of_effect_id
+       AND original.effect_key = inverse.effect_key
+       AND original.effect_type = inverse.effect_type
+       AND original.currency = inverse.currency
+       AND original.amount = inverse.amount
+       AND original.collection_item_id IS NOT DISTINCT FROM inverse.collection_item_id
+      WHERE inverse.organization_id = $1
+        AND inverse.settlement_batch_id = $2
+        AND inverse.direction = 'REVERSAL'
+    `, [seeded.organizationId, reversed.reversal.id]), 3);
+    assert.equal(await count(database, `
+      SELECT count(*)
+      FROM settlement_effects effect
+      JOIN settlement_batches batch
+        ON batch.organization_id = effect.organization_id
+       AND batch.id = effect.settlement_batch_id
+      JOIN movement_facts fact
+        ON fact.organization_id = effect.organization_id
+       AND fact.id = effect.movement_fact_id
+       AND fact.source_id = effect.settlement_batch_id
+       AND fact.effect_key = effect.effect_key
+       AND fact.endpoint_id = batch.destination_bank_account_id
+       AND fact.amount = effect.amount
+       AND fact.currency = effect.currency
+       AND fact.business_date = effect.business_date
+       AND fact.direction = CASE effect.direction
+         WHEN 'SETTLEMENT' THEN 'CREDIT' ELSE 'DEBIT' END
+      WHERE effect.organization_id = $1
+        AND effect.settlement_batch_id IN ($2, $3)
+        AND effect.effect_type = 'BANK_CREDIT'
+    `, [seeded.organizationId, created.id, reversed.reversal.id]), 2);
+    assert.equal(await count(database, `
+      SELECT count(*) FROM pg_trigger
+      WHERE NOT tgisinternal
+        AND tgname = ANY($1::text[])
+    `, [[
+      'settlement_effect_evidence_consistency',
+      'settlement_batch_effect_set_consistency',
+      'settlement_effect_append_revalidates_batch',
+    ]]), 3);
   } finally {
     await database.onModuleDestroy();
   }
