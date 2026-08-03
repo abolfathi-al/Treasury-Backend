@@ -1980,6 +1980,7 @@ export const movementFacts = pgTable('movement_facts', {
     table.effectKey,
   ),
   unique().on(table.organizationId, table.reversalOfFactId),
+  check('movement_facts_endpoint_type_check', sql`${table.endpointType} IN ('CASHBOX', 'BANK_ACCOUNT', 'USER')`),
 ]);
 
 export const receivedCheques = pgTable('received_cheques', {
@@ -3601,6 +3602,13 @@ export const transferDocuments = pgTable('transfer_documents', {
   currentApprovalSnapshotId: uuid('current_approval_snapshot_id'),
   sourceCustodianUserId: uuid('source_custodian_user_id'),
   destinationCustodianUserId: uuid('destination_custodian_user_id'),
+  releasedByUserId: uuid('released_by_user_id'),
+  releasedAt: timestamp('released_at', { withTimezone: true }),
+  receivedByUserId: uuid('received_by_user_id'),
+  receivedAt: timestamp('received_at', { withTimezone: true }),
+  receiptRecordedAt: timestamp('receipt_recorded_at', { withTimezone: true }),
+  discrepancyAmount: numeric('discrepancy_amount', { precision: 38, scale: 8 }).notNull().default('0'),
+  discrepancyReason: varchar('discrepancy_reason', { length: 500 }),
   state: varchar('state', { length: 32 }).notNull().default('DRAFT'),
   version: bigint('version', { mode: 'number' }).notNull().default(0),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
@@ -3633,6 +3641,16 @@ export const transferDocuments = pgTable('transfer_documents', {
     foreignColumns: [userRefs.organizationId, userRefs.id],
     name: 'transfer_documents_destination_custodian_fk',
   }),
+  foreignKey({
+    columns: [table.organizationId, table.releasedByUserId],
+    foreignColumns: [userRefs.organizationId, userRefs.id],
+    name: 'transfer_documents_released_by_fk',
+  }),
+  foreignKey({
+    columns: [table.organizationId, table.receivedByUserId],
+    foreignColumns: [userRefs.organizationId, userRefs.id],
+    name: 'transfer_documents_received_by_fk',
+  }),
   check('transfer_documents_source_positive', sql`${table.sourceAmount} > 0`),
   check('transfer_documents_destination_positive', sql`${table.destinationAmount} > 0`),
   check('transfer_documents_rate_positive', sql`${table.exchangeRate} > 0`),
@@ -3653,11 +3671,22 @@ export const transferDocuments = pgTable('transfer_documents', {
     (${table.sourceCurrency} = ${table.destinationCurrency} AND ${table.rateSource} = 'IDENTITY' AND ${table.rateRecordId} IS NULL AND ${table.exchangeRate} = 1 AND ${table.sourceAmount} = ${table.destinationAmount} AND ${table.roundingDifference} = 0)
     OR (${table.sourceCurrency} <> ${table.destinationCurrency} AND ${table.rateSource} = 'TABLE' AND ${table.rateRecordId} IS NOT NULL)
   `),
-  check('transfer_documents_state_check', sql`${table.state} IN ('DRAFT', 'REQUESTED', 'APPROVED', 'REJECTED')`),
+  check('transfer_documents_state_check', sql`${table.state} IN ('DRAFT', 'REQUESTED', 'APPROVED', 'IN_TRANSIT', 'DISCREPANCY', 'COMPLETED', 'REJECTED')`),
   check('transfer_documents_snapshot_check', sql`(${table.state} = 'DRAFT' AND ${table.currentApprovalSnapshotId} IS NULL) OR (${table.state} <> 'DRAFT' AND ${table.currentApprovalSnapshotId} IS NOT NULL)`),
   check('transfer_documents_custodian_pair_check', sql`(${table.sourceCustodianUserId} IS NULL) = (${table.destinationCustodianUserId} IS NULL)`),
   check('transfer_documents_custodian_distinct_check', sql`${table.sourceCustodianUserId} IS NULL OR ${table.sourceCustodianUserId} <> ${table.destinationCustodianUserId}`),
-  check('transfer_documents_approved_custodian_check', sql`${table.state} <> 'APPROVED' OR ${table.sourceCustodianUserId} IS NOT NULL`),
+  check('transfer_documents_approved_custodian_check', sql`${table.state} NOT IN ('APPROVED', 'IN_TRANSIT', 'DISCREPANCY', 'COMPLETED') OR ${table.sourceCustodianUserId} IS NOT NULL`),
+  check('transfer_documents_release_actor_check', sql`${table.releasedByUserId} IS NULL OR ${table.releasedByUserId} = ${table.sourceCustodianUserId}`),
+  check('transfer_documents_release_pair_check', sql`(${table.releasedByUserId} IS NULL) = (${table.releasedAt} IS NULL)`),
+  check('transfer_documents_receipt_actor_check', sql`${table.receivedByUserId} IS NULL OR (${table.releasedByUserId} IS NOT NULL AND ${table.receivedByUserId} = ${table.destinationCustodianUserId} AND ${table.receivedByUserId} <> ${table.releasedByUserId})`),
+  check('transfer_documents_receipt_time_pair_check', sql`(${table.receivedByUserId} IS NULL) = (${table.receivedAt} IS NULL) AND (${table.receivedByUserId} IS NULL) = (${table.receiptRecordedAt} IS NULL)`),
+  check('transfer_documents_receipt_time_bounds_check', sql`${table.receivedAt} IS NULL OR (${table.receivedAt} >= ${table.releasedAt} AND ${table.receivedAt} <= ${table.receiptRecordedAt})`),
+  check('transfer_documents_release_state_check', sql`${table.releasedByUserId} IS NULL OR ${table.state} IN ('IN_TRANSIT', 'DISCREPANCY', 'COMPLETED')`),
+  check('transfer_documents_receipt_state_check', sql`${table.receivedByUserId} IS NULL OR ${table.state} IN ('DISCREPANCY', 'COMPLETED')`),
+  check('transfer_documents_later_release_check', sql`${table.state} NOT IN ('IN_TRANSIT', 'DISCREPANCY', 'COMPLETED') OR ${table.releasedByUserId} IS NOT NULL`),
+  check('transfer_documents_later_receipt_check', sql`${table.state} NOT IN ('DISCREPANCY', 'COMPLETED') OR ${table.receivedByUserId} IS NOT NULL`),
+  check('transfer_documents_discrepancy_reason_check', sql`${table.state} <> 'DISCREPANCY' OR NULLIF(BTRIM(${table.discrepancyReason}), '') IS NOT NULL`),
+  check('transfer_documents_discrepancy_nonnegative', sql`${table.discrepancyAmount} >= 0`),
   check('transfer_documents_version_nonnegative', sql`${table.version} >= 0`),
   index('transfer_documents_list_idx').on(table.organizationId, table.businessDate.desc(), table.id.desc()),
 ]);
@@ -3682,6 +3711,40 @@ export const transferAssetItems = pgTable('transfer_asset_items', {
   check('transfer_asset_items_type_check', sql`${table.assetType} IN ('RECEIVED_CHEQUE', 'ISSUED_CHEQUE', 'DOCUMENT', 'OTHER_CONTROLLED')`),
   check('transfer_asset_items_quantity_positive', sql`${table.quantity} > 0`),
   check('transfer_asset_items_state_check', sql`${table.state} IN ('PLANNED', 'RELEASED', 'RECEIVED', 'RETURNED')`),
+]);
+
+export const transferTransitObligations = pgTable('transfer_transit_obligations', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  organizationId: uuid('organization_id').notNull().references(() => organizations.id),
+  transferDocumentId: uuid('transfer_document_id').notNull(),
+  sourceAmount: numeric('source_amount', { precision: 38, scale: 8 }).notNull(),
+  sourceCurrency: varchar('source_currency', { length: 8 }).notNull(),
+  destinationAmount: numeric('destination_amount', { precision: 38, scale: 8 }).notNull(),
+  destinationCurrency: varchar('destination_currency', { length: 8 }).notNull(),
+  sourceMovementFactId: uuid('source_movement_fact_id').notNull(),
+  destinationMovementFactId: uuid('destination_movement_fact_id'),
+  receivedAmount: numeric('received_amount', { precision: 38, scale: 8 }),
+  receivedCurrency: varchar('received_currency', { length: 8 }),
+  state: varchar('state', { length: 16 }).notNull(),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  unique().on(table.organizationId, table.id),
+  unique().on(table.organizationId, table.transferDocumentId),
+  unique().on(table.organizationId, table.sourceMovementFactId),
+  unique().on(table.organizationId, table.destinationMovementFactId),
+  foreignKey({ columns: [table.organizationId, table.transferDocumentId], foreignColumns: [transferDocuments.organizationId, transferDocuments.id], name: 'transfer_transit_obligations_document_fk' }),
+  foreignKey({ columns: [table.organizationId, table.sourceMovementFactId], foreignColumns: [movementFacts.organizationId, movementFacts.id], name: 'transfer_transit_obligations_source_movement_fk' }),
+  foreignKey({ columns: [table.organizationId, table.destinationMovementFactId], foreignColumns: [movementFacts.organizationId, movementFacts.id], name: 'transfer_transit_obligations_destination_movement_fk' }),
+  check('transfer_transit_obligations_source_positive', sql`${table.sourceAmount} > 0`),
+  check('transfer_transit_obligations_destination_positive', sql`${table.destinationAmount} > 0`),
+  check('transfer_transit_obligations_state_check', sql`${table.state} IN ('OPEN', 'DISCREPANCY', 'CLOSED', 'RETURNED')`),
+  check('transfer_transit_obligations_receipt_check', sql`
+    (${table.state} = 'OPEN' AND ${table.destinationMovementFactId} IS NULL AND ${table.receivedAmount} IS NULL AND ${table.receivedCurrency} IS NULL)
+    OR (${table.state} = 'DISCREPANCY' AND ${table.destinationMovementFactId} IS NULL AND ${table.receivedAmount} IS NOT NULL AND ${table.receivedAmount} >= 0 AND ${table.receivedCurrency} = ${table.destinationCurrency})
+    OR (${table.state} = 'CLOSED' AND ${table.destinationMovementFactId} IS NOT NULL AND ${table.receivedAmount} = ${table.destinationAmount} AND ${table.receivedCurrency} = ${table.destinationCurrency})
+    OR (${table.state} = 'RETURNED' AND ${table.destinationMovementFactId} IS NULL)
+  `),
 ]);
 
 export const transferAttachmentLinks = pgTable('transfer_attachment_links', {

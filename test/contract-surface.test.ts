@@ -99,6 +99,8 @@ const expectedOperations = [
   ['POST', 'v1/transfers'],
   ['POST', 'v1/transfers/:resourceId/submit'],
   ['POST', 'v1/transfers/:resourceId/approval-actions'],
+  ['POST', 'v1/transfers/:resourceId/release'],
+  ['POST', 'v1/transfers/:resourceId/acknowledge'],
   ['GET', 'v1/reports/:reportKey'],
 ] as const;
 

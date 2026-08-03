@@ -6,13 +6,14 @@ import { AccessAuthorizationRepository } from '../src/access-control/access-auth
 import { AccessAuthorizationService } from '../src/access-control/access-authorization.service';
 import { TreasuryProblem } from '../src/common/problem';
 import { DatabaseService } from '../src/database/database.service';
+import { FoundationEffectsRepository, FoundationEffectsService } from '../src/foundation-effects/foundation-effects.service';
 import { TransferApprovalAction, TransferAssetType, TransferEndpointType, TransferRoute } from '../src/transfers/transfer.dto';
 import { TransferRepository } from '../src/transfers/transfer.repository';
 import { TransferService } from '../src/transfers/transfer.service';
 
 const connectionString = process.env.TEST_DATABASE_URL;
 
-test('INC-4A preserves scoped visibility, rollback, replay, stale-version, and concurrency invariants', {
+test('INC-4A/4B preserves scoped visibility, rollback, replay, stale-version, and concurrency invariants', {
   skip: connectionString ? false : 'TEST_DATABASE_URL is not configured',
 }, async () => {
   process.env.DATABASE_URL = connectionString;
@@ -22,6 +23,7 @@ test('INC-4A preserves scoped visibility, rollback, replay, stale-version, and c
     database,
     new TransferRepository(),
     new AccessAuthorizationService(new AccessAuthorizationRepository()),
+    new FoundationEffectsService(new FoundationEffectsRepository()),
   );
   let seeded: Awaited<ReturnType<typeof seed>> | undefined;
   try {
@@ -148,6 +150,143 @@ test('INC-4A preserves scoped visibility, rollback, replay, stale-version, and c
     assert.notEqual(approved.sourceCustodian?.id, approved.destinationCustodian?.id);
     assert.equal(approved.approvalSnapshot?.actions.length, 2);
 
+    await database.pool.query('UPDATE cashbox_assignments SET user_id = $1 WHERE id = $2', [seeded.actorId, seeded.assignmentId]);
+    await assert.rejects(
+      service.release(
+        seeded.organizationId, seeded.sourceCustodianId, approved.id,
+        'transfer-release-stale-custodian', `"${approved.version}"`, 'release-stale-custodian',
+      ),
+      isProblem('TRS-TRF-005'),
+    );
+    await database.pool.query('UPDATE cashbox_assignments SET user_id = $1 WHERE id = $2', [seeded.sourceCustodianId, seeded.assignmentId]);
+    await assert.rejects(
+      service.release(
+        seeded.organizationId, seeded.sourceCustodianId, approved.id,
+        'transfer-release-no-value', `"${approved.version}"`, 'release-no-value',
+      ),
+      isProblem('TRS-TRF-002'),
+    );
+    const deniedRelease = await database.pool.query<{ movements: string; obligations: string; idempotency: string }>(`
+      SELECT
+        (SELECT count(*) FROM movement_facts WHERE organization_id = $1 AND source_type = 'Transfer' AND source_id = $2)::text AS movements,
+        (SELECT count(*) FROM transfer_transit_obligations WHERE organization_id = $1 AND transfer_document_id = $2)::text AS obligations,
+        (SELECT count(*) FROM idempotency_records WHERE organization_id = $1 AND idempotency_key IN ('transfer-release-stale-custodian','transfer-release-no-value'))::text AS idempotency
+    `, [seeded.organizationId, approved.id]);
+    assert.deepEqual(deniedRelease.rows[0], { movements: '0', obligations: '0', idempotency: '0' });
+
+    await database.pool.query(`
+      INSERT INTO movement_facts (
+        id, organization_id, owner, source_type, source_id, effect_key,
+        endpoint_type, endpoint_id, direction, amount, currency, business_date, state
+      ) VALUES ($1,$2,'foundation','Seed',$3,'OPENING_BALANCE','CASHBOX',$4,'CREDIT',5000,$5,'2026-08-02','POSTED')
+    `, [randomUUID(), seeded.organizationId, randomUUID(), seeded.cashboxId, seeded.currency]);
+    const [released, releaseReplay] = await Promise.all([
+      service.release(
+        seeded.organizationId, seeded.sourceCustodianId, approved.id,
+        'transfer-release-shared', `"${approved.version}"`, 'release-a',
+      ),
+      service.release(
+        seeded.organizationId, seeded.sourceCustodianId, approved.id,
+        'transfer-release-shared', `"${approved.version}"`, 'release-b',
+      ),
+    ]);
+    assert.deepEqual(releaseReplay, released);
+    assert.equal(released.state, 'IN_TRANSIT');
+    assert.equal(released.release?.releasedByUserId, seeded.sourceCustodianId);
+    assert.equal(released.transitObligation?.state, 'OPEN');
+    await assert.rejects(
+      service.acknowledge(
+        seeded.organizationId, seeded.sourceCustodianId, approved.id,
+        { receivedMoney: released.destinationMoney, receivedAt: new Date().toISOString(), receivedAssetIds: [] },
+        'transfer-ack-source-denied', `"${released.version}"`, 'ack-source-denied',
+      ),
+      isProblem('TRS-TRF-005'),
+    );
+    await assert.rejects(
+      service.acknowledge(
+        seeded.organizationId, seeded.destinationId, approved.id,
+        { receivedMoney: { amount: '0', currency: released.destinationMoney.currency }, receivedAt: new Date().toISOString(), receivedAssetIds: [] },
+        'transfer-ack-missing-reason', `"${released.version}"`, 'ack-missing-reason',
+      ),
+      isProblem('TRS-TRF-003'),
+    );
+    await database.pool.query("UPDATE user_refs SET state = 'INACTIVE' WHERE id = $1", [seeded.actorId]);
+    await database.pool.query("UPDATE cashboxes SET state = 'SUSPENDED' WHERE id = $1", [seeded.cashboxId]);
+    const acknowledgement = {
+      receivedMoney: released.destinationMoney,
+      receivedAt: new Date().toISOString(),
+      receivedAssetIds: [],
+    };
+    const [completed, acknowledgementReplay] = await Promise.all([
+      service.acknowledge(
+        seeded.organizationId, seeded.destinationId, approved.id, acknowledgement,
+        'transfer-ack-shared', `"${released.version}"`, 'ack-a',
+      ),
+      service.acknowledge(
+        seeded.organizationId, seeded.destinationId, approved.id, acknowledgement,
+        'transfer-ack-shared', `"${released.version}"`, 'ack-b',
+      ),
+    ]);
+    assert.deepEqual(acknowledgementReplay, completed);
+    assert.equal(completed.state, 'COMPLETED');
+    assert.equal(completed.receipt?.receivedByUserId, seeded.destinationId);
+    assert.equal(completed.transitObligation?.state, 'CLOSED');
+    assert.ok(completed.transitObligation?.destinationMovementFactId);
+    await database.pool.query("UPDATE user_refs SET state = 'ACTIVE' WHERE id = $1", [seeded.actorId]);
+    await database.pool.query("UPDATE cashboxes SET state = 'ACTIVE' WHERE id = $1", [seeded.cashboxId]);
+    await assert.rejects(
+      service.acknowledge(
+        seeded.organizationId, seeded.destinationId, approved.id, acknowledgement,
+        'transfer-ack-stale', `"${released.version}"`, 'ack-stale',
+      ),
+      isProblem('TRS-GEN-006'),
+    );
+    await assert.rejects(
+      service.acknowledge(
+        seeded.organizationId, seeded.destinationId, approved.id,
+        { ...acknowledgement, receivedMoney: { ...acknowledgement.receivedMoney, amount: '99' } },
+        'transfer-ack-shared', `"${released.version}"`, 'ack-changed-digest',
+      ),
+      isProblem('TRS-GEN-007'),
+    );
+    const exactEffects = await database.pool.query<{ movements: string; obligations: string; events: string }>(`
+      SELECT
+        (SELECT count(*) FROM movement_facts WHERE organization_id = $1 AND source_type = 'Transfer' AND source_id = $2)::text AS movements,
+        (SELECT count(*) FROM transfer_transit_obligations WHERE organization_id = $1 AND transfer_document_id = $2)::text AS obligations,
+        (SELECT count(*) FROM outbox_events WHERE organization_id = $1 AND aggregate_type = 'Transfer' AND aggregate_id = $2)::text AS events
+    `, [seeded.organizationId, approved.id]);
+    assert.deepEqual(exactEffects.rows[0], { movements: '2', obligations: '1', events: '1' });
+    await assert.rejects(
+      database.pool.query(
+        'DELETE FROM transfer_transit_obligations WHERE organization_id = $1 AND transfer_document_id = $2',
+        [seeded.organizationId, approved.id],
+      ),
+      (error: unknown) => (error as { code?: string }).code === '23514',
+    );
+
+    const discrepancyReleased = await service.release(
+      seeded.organizationId, seeded.sourceCustodianId, zeroStepApproved.id,
+      'transfer-release-discrepancy', `"${zeroStepApproved.version}"`, 'release-discrepancy',
+    );
+    const discrepancy = await service.acknowledge(
+      seeded.organizationId, seeded.destinationId, zeroStepApproved.id,
+      {
+        receivedMoney: { amount: '0', currency: discrepancyReleased.destinationMoney.currency },
+        receivedAt: new Date().toISOString(), receivedAssetIds: [], discrepancyReason: 'Nothing arrived',
+      },
+      'transfer-ack-discrepancy', `"${discrepancyReleased.version}"`, 'ack-discrepancy',
+    );
+    assert.equal(discrepancy.state, 'DISCREPANCY');
+    assert.equal(discrepancy.transitObligation?.state, 'DISCREPANCY');
+    assert.equal(discrepancy.transitObligation?.destinationMovementFactId, undefined);
+    assert.equal(discrepancy.receipt?.discrepancyReason, 'Nothing arrived');
+    const discrepancyEffects = await database.pool.query<{ movements: string; events: string }>(`
+      SELECT
+        (SELECT count(*) FROM movement_facts WHERE organization_id = $1 AND source_type = 'Transfer' AND source_id = $2)::text AS movements,
+        (SELECT count(*) FROM outbox_events WHERE organization_id = $1 AND aggregate_type = 'Transfer' AND aggregate_id = $2)::text AS events
+    `, [seeded.organizationId, zeroStepApproved.id]);
+    assert.deepEqual(discrepancyEffects.rows[0], { movements: '1', events: '0' });
+
     await assert.rejects(
       database.pool.query('UPDATE transfer_approval_snapshots SET policy_name = policy_name WHERE id = $1', [approved.approvalSnapshot!.id]),
       (error: unknown) => (error as { code?: string }).code === '23514',
@@ -229,10 +368,13 @@ async function seed(database: DatabaseService) {
   const approverRoleId = randomUUID();
   const secondApproverRoleId = randomUUID();
   const deniedRoleId = randomUUID();
+  const custodyRoleId = randomUUID();
   const actorGrantId = randomUUID();
   const approverGrantId = randomUUID();
   const secondApproverGrantId = randomUUID();
   const deniedGrantId = randomUUID();
+  const sourceCustodianGrantId = randomUUID();
+  const destinationCustodianGrantId = randomUUID();
   const policyId = randomUUID();
   const policyStepId = randomUUID();
   const policyStep2Id = randomUUID();
@@ -313,17 +455,19 @@ async function seed(database: DatabaseService) {
     await client.query(`
       INSERT INTO roles (id, organization_id, code, name) VALUES
         ($1,$4,$5,'INC-4A creator'),($2,$4,$6,'INC-4A approver'),($3,$4,$7,'INC-4A denied viewer'),
-        ($8,$4,$9,'INC-4A second approver')
+        ($8,$4,$9,'INC-4A second approver'),($10,$4,$11,'INC-4B custody')
     `, [
       actorRoleId, approverRoleId, deniedRoleId, effectiveOrganizationId,
       `CRT-${suffix}`, `APR-${suffix}`, `DEN-${suffix}`, secondApproverRoleId, `APR2-${suffix}`,
+      custodyRoleId, `CUS-${suffix}`,
     ]);
     await client.query(`
       INSERT INTO role_permissions (role_id, permission) VALUES
         ($1,'transfer.view'),($1,'transfer.create'),($1,'transfer.submit'),
         ($2,'transfer.view'),($2,'transfer.approve'),
-        ($3,'transfer.view'),($4,'transfer.view'),($4,'transfer.approve'),($4,'transfer.reject')
-    `, [actorRoleId, approverRoleId, deniedRoleId, secondApproverRoleId]);
+        ($3,'transfer.view'),($4,'transfer.view'),($4,'transfer.approve'),($4,'transfer.reject'),
+        ($5,'transfer.view'),($5,'transfer.release'),($5,'transfer.receive')
+    `, [actorRoleId, approverRoleId, deniedRoleId, secondApproverRoleId, custodyRoleId]);
     await client.query(`
       INSERT INTO access_grants (
         id, organization_id, user_ref_id, role_id, scope_type, scope_id, organization_wide,
@@ -332,17 +476,23 @@ async function seed(database: DatabaseService) {
         ($1,$4,$5,$6,'ORGANIZATION',$4,false,2000,$10),
         ($2,$4,$7,$8,'ORGANIZATION',$4,false,2000,$10),
         ($3,$4,$9,$11,'ORGANIZATION',$4,false,2000,$10),
-        ($12,$4,$13,$14,'ORGANIZATION',$4,false,2000,$10)
+        ($12,$4,$13,$14,'ORGANIZATION',$4,false,2000,$10),
+        ($15,$4,$16,$17,'ORGANIZATION',$4,false,2000,$10),
+        ($18,$4,$19,$17,'ORGANIZATION',$4,false,2000,$10)
     `, [
       actorGrantId, approverGrantId, deniedGrantId, effectiveOrganizationId,
       actorId, actorRoleId, approverId, approverRoleId, deniedId, currency, deniedRoleId,
       secondApproverGrantId, secondApproverId, secondApproverRoleId,
+      sourceCustodianGrantId, sourceCustodianId, custodyRoleId,
+      destinationCustodianGrantId, destinationId,
     ]);
     for (const [grantId, scopedBranchId, scopedUnitId] of [
       [actorGrantId, branchId, treasuryUnitId],
       [approverGrantId, branchId, treasuryUnitId],
       [deniedGrantId, deniedBranchId, deniedTreasuryUnitId],
       [secondApproverGrantId, branchId, treasuryUnitId],
+      [sourceCustodianGrantId, branchId, treasuryUnitId],
+      [destinationCustodianGrantId, branchId, treasuryUnitId],
     ]) {
       await client.query('INSERT INTO access_grant_branch_scopes (access_grant_id, branch_id) VALUES ($1,$2)', [grantId, scopedBranchId]);
       await client.query('INSERT INTO access_grant_treasury_unit_scopes (access_grant_id, treasury_unit_id) VALUES ($1,$2)', [grantId, scopedUnitId]);
@@ -352,8 +502,9 @@ async function seed(database: DatabaseService) {
     }
     await client.query(`
       INSERT INTO access_grant_currency_scopes (access_grant_id, organization_id, currency)
-      VALUES ($1,$3,$4),($2,$3,$4),($5,$3,$4)
-    `, [actorGrantId, approverGrantId, effectiveOrganizationId, crossCurrency, secondApproverGrantId]);
+      VALUES ($1,$3,$4),($2,$3,$4),($5,$3,$4),($6,$3,$4),($7,$3,$4)
+    `, [actorGrantId, approverGrantId, effectiveOrganizationId, crossCurrency, secondApproverGrantId,
+      sourceCustodianGrantId, destinationCustodianGrantId]);
     await client.query(`
       INSERT INTO transfer_approval_policies (
         id, organization_id, code, name, branch_id, treasury_unit_id, currency,
@@ -375,7 +526,7 @@ async function seed(database: DatabaseService) {
       treasuryUnitId, deniedTreasuryUnitId, actorId, approverId, sourceCustodianId,
       destinationId, deniedId, cashboxId, assignmentId, actorRoleId, approverRoleId,
       secondApproverId, secondApproverRoleId, deniedRoleId, actorGrantId, approverGrantId, secondApproverGrantId,
-      deniedGrantId, policyId, zeroStepPolicyId,
+      deniedGrantId, custodyRoleId, sourceCustodianGrantId, destinationCustodianGrantId, policyId, zeroStepPolicyId,
       crossCurrency, tableRateId, manualRateId,
     };
   } catch (error) {
@@ -397,9 +548,16 @@ async function cleanup(database: DatabaseService, seeded: Awaited<ReturnType<typ
     await client.query(`
       UPDATE transfer_documents
       SET state = 'DRAFT', current_approval_snapshot_id = NULL,
-          source_custodian_user_id = NULL, destination_custodian_user_id = NULL
+          source_custodian_user_id = NULL, destination_custodian_user_id = NULL,
+          released_by_user_id = NULL, released_at = NULL,
+          received_by_user_id = NULL, received_at = NULL, receipt_recorded_at = NULL,
+          discrepancy_amount = 0, discrepancy_reason = NULL
       WHERE organization_id = $1 AND creator_user_id = $2
     `, [seeded.organizationId, seeded.actorId]);
+    await client.query(`DELETE FROM transfer_transit_obligations WHERE organization_id = $1 AND transfer_document_id IN (${ownedDocuments})`, [seeded.organizationId, seeded.actorId]);
+    await client.query(`DELETE FROM movement_facts WHERE organization_id = $1 AND source_type = 'Transfer' AND source_id IN (${ownedDocuments})`, [seeded.organizationId, seeded.actorId]);
+    await client.query(`DELETE FROM audit_events WHERE organization_id = $1 AND entity_type = 'Transfer' AND entity_id IN (${ownedDocuments})`, [seeded.organizationId, seeded.actorId]);
+    await client.query(`DELETE FROM outbox_events WHERE organization_id = $1 AND aggregate_type = 'Transfer' AND aggregate_id IN (${ownedDocuments})`, [seeded.organizationId, seeded.actorId]);
     await client.query(`DELETE FROM transfer_approval_actions WHERE organization_id = $1 AND approval_snapshot_id IN (${ownedSnapshots})`, [seeded.organizationId, seeded.actorId]);
     await client.query(`DELETE FROM transfer_approval_snapshot_steps WHERE organization_id = $1 AND approval_snapshot_id IN (${ownedSnapshots})`, [seeded.organizationId, seeded.actorId]);
     await client.query(`DELETE FROM transfer_approval_snapshots WHERE organization_id = $1 AND transfer_document_id IN (${ownedDocuments})`, [seeded.organizationId, seeded.actorId]);
@@ -413,17 +571,19 @@ async function cleanup(database: DatabaseService, seeded: Awaited<ReturnType<typ
       WHERE organization_id = $1
         AND (scope LIKE '%' || $2 || '%' OR scope LIKE '%' || $3 || '%' OR scope LIKE '%' || $4 || '%')
     `, [seeded.organizationId, seeded.actorId, seeded.approverId, seeded.secondApproverId]);
-    const grantIds = [seeded.actorGrantId, seeded.approverGrantId, seeded.secondApproverGrantId, seeded.deniedGrantId];
+    const grantIds = [seeded.actorGrantId, seeded.approverGrantId, seeded.secondApproverGrantId, seeded.deniedGrantId,
+      seeded.sourceCustodianGrantId, seeded.destinationCustodianGrantId];
     await client.query('DELETE FROM access_grant_currency_scopes WHERE access_grant_id = ANY($1::uuid[])', [grantIds]);
     await client.query('DELETE FROM access_grant_document_type_scopes WHERE access_grant_id = ANY($1::uuid[])', [grantIds]);
     await client.query('DELETE FROM access_grant_cashbox_scopes WHERE access_grant_id = ANY($1::uuid[])', [grantIds]);
     await client.query('DELETE FROM access_grant_treasury_unit_scopes WHERE access_grant_id = ANY($1::uuid[])', [grantIds]);
     await client.query('DELETE FROM access_grant_branch_scopes WHERE access_grant_id = ANY($1::uuid[])', [grantIds]);
     await client.query('DELETE FROM access_grants WHERE id = ANY($1::uuid[])', [grantIds]);
-    const roleIds = [seeded.actorRoleId, seeded.approverRoleId, seeded.secondApproverRoleId, seeded.deniedRoleId];
+    const roleIds = [seeded.actorRoleId, seeded.approverRoleId, seeded.secondApproverRoleId, seeded.deniedRoleId, seeded.custodyRoleId];
     await client.query('DELETE FROM role_permissions WHERE role_id = ANY($1::uuid[])', [roleIds]);
     await client.query('DELETE FROM roles WHERE id = ANY($1::uuid[])', [roleIds]);
     await client.query('DELETE FROM cashbox_assignments WHERE id = $1', [seeded.assignmentId]);
+    await client.query("DELETE FROM movement_facts WHERE organization_id = $1 AND endpoint_id = $2 AND owner = 'foundation'", [seeded.organizationId, seeded.cashboxId]);
     await client.query('DELETE FROM cashbox_currency_controls WHERE cashbox_id = $1', [seeded.cashboxId]);
     await client.query('DELETE FROM cashboxes WHERE id = $1', [seeded.cashboxId]);
     await client.query('DELETE FROM exchange_rates WHERE id = ANY($1::uuid[])', [[seeded.tableRateId, seeded.manualRateId]]);

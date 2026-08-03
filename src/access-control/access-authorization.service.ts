@@ -245,7 +245,7 @@ export class AccessAuthorizationService {
     organizationId: string,
     actorUserId: string,
     context: TransferAuthorizationContext,
-    permission: 'transfer.create' | 'transfer.submit' | 'transfer.approve' | 'transfer.reject',
+    permission: 'transfer.create' | 'transfer.submit' | 'transfer.approve' | 'transfer.reject' | 'transfer.release' | 'transfer.receive',
     roleId?: string,
     requiredAuthorityUserId?: string | null,
   ): Promise<PaymentAuthority | null> {

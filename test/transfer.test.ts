@@ -6,6 +6,7 @@ import { AccessAuthorizationService } from '../src/access-control/access-authori
 import type { AccessAuthorizationRepository, PaymentGrant } from '../src/access-control/access-authorization.repository';
 import { TreasuryProblem } from '../src/common/problem';
 import type { DatabaseService, DatabaseTransaction } from '../src/database/database.service';
+import type { FoundationEffectsService } from '../src/foundation-effects/foundation-effects.service';
 import { TransferAssetType, TransferEndpointType, TransferRoute, type TransferCreateDto } from '../src/transfers/transfer.dto';
 import type { TransferFacts, TransferRepository } from '../src/transfers/transfer.repository';
 import { TransferService } from '../src/transfers/transfer.service';
@@ -58,7 +59,7 @@ test('Transfer authorization requires one grant to cover both endpoint scopes an
 });
 
 test('Transfer rejects explicit nulls and whitespace before opening a transaction', async () => {
-  const service = new TransferService({} as DatabaseService, {} as TransferRepository, {} as AccessAuthorizationService);
+  const service = new TransferService({} as DatabaseService, {} as TransferRepository, {} as AccessAuthorizationService, {} as FoundationEffectsService);
   const body = {
     businessDate: '2026-08-02',
     route: TransferRoute.USER_TO_USER,
@@ -77,7 +78,7 @@ test('Transfer rejects explicit nulls and whitespace before opening a transactio
 });
 
 test('Transfer accepts an active received cheque and rejects its inactive lifecycle states', () => {
-  const service = new TransferService({} as DatabaseService, {} as TransferRepository, {} as AccessAuthorizationService);
+  const service = new TransferService({} as DatabaseService, {} as TransferRepository, {} as AccessAuthorizationService, {} as FoundationEffectsService);
   const dto: TransferCreateDto = {
     businessDate: '2026-08-02', route: TransferRoute.USER_TO_USER,
     source: { type: TransferEndpointType.USER, id: '00000000-0000-4000-8000-000000000001' },
@@ -108,7 +109,7 @@ test('Stale Transfer submission stops before approval evidence is written', asyn
     insertSnapshot: async () => { snapshotWrites += 1; },
   } as unknown as TransferRepository;
   const database = { db: { transaction: async (work: (transaction: DatabaseTransaction) => unknown) => work({} as DatabaseTransaction) } } as unknown as DatabaseService;
-  const service = new TransferService(database, repository, {} as AccessAuthorizationService);
+  const service = new TransferService(database, repository, {} as AccessAuthorizationService, {} as FoundationEffectsService);
   await assert.rejects(
     service.submit('org', 'actor', '00000000-0000-4000-8000-000000000001', 'transfer-key', '"0"', 'request-id'),
     (error: unknown) => error instanceof TreasuryProblem && (error.getResponse() as { code?: string }).code === 'TRS-GEN-006',
@@ -125,7 +126,7 @@ test('Changed Transfer idempotency replay fails before mutation', async () => {
     startIdempotency: async () => { started += 1; },
   } as unknown as TransferRepository;
   const database = { db: { transaction: async (work: (transaction: DatabaseTransaction) => unknown) => work({} as DatabaseTransaction) } } as unknown as DatabaseService;
-  const service = new TransferService(database, repository, {} as AccessAuthorizationService);
+  const service = new TransferService(database, repository, {} as AccessAuthorizationService, {} as FoundationEffectsService);
   await assert.rejects(
     service.submit('org', 'actor', '00000000-0000-4000-8000-000000000001', 'transfer-key', '"0"', 'request-id'),
     (error: unknown) => error instanceof TreasuryProblem && (error.getResponse() as { code?: string }).code === 'TRS-GEN-007',
@@ -157,4 +158,17 @@ test('INC-4A migration preserves Transfer route, rate, approval, and custody con
   assert.match(migration, /transfer_endpoint_scope_guard/u);
   assert.match(migration, /source_custodian_user_id <> destination_custodian_user_id/u);
   assert.match(migration, /INSERT INTO operation_permissions\(permission\) VALUES \('transfer\.reject'\)/u);
+});
+
+test('INC-4B migration binds exact movements to one transit obligation', async () => {
+  const migration = await readFile('migrations/0022_transfer_release_ack.sql', 'utf8');
+  assert.match(migration, /CREATE TABLE transfer_transit_obligations/u);
+  assert.match(migration, /endpoint_type IN \('CASHBOX', 'BANK_ACCOUNT', 'USER'\)/u);
+  assert.match(migration, /UNIQUE \(organization_id, transfer_document_id\)/u);
+  assert.match(migration, /source_fact\.effect_key = 'SOURCE_RELEASE'/u);
+  assert.match(migration, /destination_fact\.effect_key = 'DESTINATION_RECEIPT'/u);
+  assert.match(migration, /transfer_transit_obligation_consistency_guard/u);
+  assert.match(migration, /transfer_transit_obligations_no_delete/u);
+  assert.match(migration, /received_by_user_id = destination_custodian_user_id/u);
+  assert.match(migration, /received_by_user_id <> released_by_user_id/u);
 });

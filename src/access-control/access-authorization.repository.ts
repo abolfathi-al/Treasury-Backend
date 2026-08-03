@@ -270,6 +270,7 @@ export class AccessAuthorizationRepository {
       | 'payment.approve' | 'payment.reject' | 'payment.execute' | 'payment.reverse'
       | 'bank-instruction.record-outcome' | 'accounting.export' | 'accounting.acknowledge'
       | 'transfer.create' | 'transfer.submit' | 'transfer.approve' | 'transfer.reject'
+      | 'transfer.release' | 'transfer.receive'
       | 'settlement.create' | 'settlement.confirm' | 'settlement.reverse',
     roleId?: string,
   ): Promise<PaymentGrant[]> {
