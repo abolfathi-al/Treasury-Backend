@@ -154,7 +154,7 @@ test('INC-4C Settlement routes expose only the authorized one-grant surface', ()
 });
 
 test('INC-4C Settlement migration preserves immutable evidence and lifecycle constraints', async () => {
-  const migration = await readFile('migrations/0022_settlement_lifecycle.sql', 'utf8');
+  const migration = await readFile('migrations/0023_settlement_lifecycle.sql', 'utf8');
   for (const table of [
     'settlement_batches',
     'settlement_allocations',
