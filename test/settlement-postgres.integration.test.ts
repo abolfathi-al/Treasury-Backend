@@ -82,6 +82,12 @@ test('INC-4C preserves rollback, replay, stale, concurrency, credit, and reversa
     assert.deepEqual(createReplay, created);
     assert.equal(created.state, 'MATCHED');
     assert.equal(created.allocations.length, 2);
+    assert.deepEqual(
+      created.allocations
+        .map(({ collectionItem }) => collectionItem.label)
+        .sort(),
+      [1, 2].map((line) => `Receipt REC-${seeded.suffix} · line ${line}`),
+    );
     assert.equal(await count(database, `
       SELECT count(*) FROM movement_facts
       WHERE organization_id = $1 AND source_id = $2

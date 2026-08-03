@@ -6,9 +6,13 @@ import type { DatabaseTransaction } from '../database/database.service';
 import {
   attachments,
   bankAccounts,
+  chequeEvents,
   collectionItems,
   idempotencyRecords,
   organizations,
+  receiptDocuments,
+  receiptLines,
+  receivedCheques,
   settlementAllocations,
   settlementAttachmentLinks,
   settlementBatches,
@@ -483,9 +487,34 @@ export class SettlementRepository {
       sourceType: collectionItems.sourceFactType,
       sourceId: collectionItems.sourceFactId,
       providerReference: collectionItems.providerReference,
+      sourceLabel: sql<string>`CASE
+        WHEN ${collectionItems.sourceFactType} = 'RECEIPT_LINE' THEN concat(
+          'Receipt ', ${receiptDocuments.businessNumber}, ' · line ',
+          ${receiptLines.lineNumber}::text
+        )
+        WHEN ${collectionItems.sourceFactType} = 'CHEQUE_EVENT' THEN concat(
+          'Received cheque ', ${receivedCheques.chequeNumber}, ' · event ',
+          ${chequeEvents.sequenceNo}::text
+        )
+        ELSE 'Collection item'
+      END`,
     }).from(settlementAllocations).innerJoin(collectionItems, and(
       eq(collectionItems.organizationId, settlementAllocations.organizationId),
       eq(collectionItems.id, settlementAllocations.collectionItemId),
+    )).leftJoin(receiptLines, and(
+      eq(collectionItems.sourceFactType, 'RECEIPT_LINE'),
+      eq(receiptLines.organizationId, collectionItems.organizationId),
+      eq(receiptLines.id, collectionItems.sourceFactId),
+    )).leftJoin(receiptDocuments, and(
+      eq(receiptDocuments.organizationId, receiptLines.organizationId),
+      eq(receiptDocuments.id, receiptLines.receiptDocumentId),
+    )).leftJoin(chequeEvents, and(
+      eq(collectionItems.sourceFactType, 'CHEQUE_EVENT'),
+      eq(chequeEvents.id, collectionItems.sourceFactId),
+      eq(chequeEvents.chequeType, 'RECEIVED'),
+    )).leftJoin(receivedCheques, and(
+      eq(receivedCheques.organizationId, collectionItems.organizationId),
+      eq(receivedCheques.id, chequeEvents.chequeId),
     )).where(and(
       eq(settlementAllocations.organizationId, organizationId),
       eq(settlementAllocations.settlementBatchId, batchId),
@@ -533,12 +562,12 @@ export class SettlementRepository {
       ...(row.batch.discrepancyReason ? { discrepancyReason: row.batch.discrepancyReason } : {}),
       ...(row.batch.replacementForBatchId ? { replacementForBatchId: row.batch.replacementForBatchId } : {}),
       ...(reversal ? { reversalBatchId: reversal.id } : {}),
-      allocations: allocationRows.map(({ allocation, sourceType, sourceId, providerReference }) => ({
+      allocations: allocationRows.map(({ allocation, providerReference, sourceLabel }) => ({
         id: allocation.id,
         collectionItemId: allocation.collectionItemId,
         collectionItem: {
           id: allocation.collectionItemId,
-          label: providerReference || `${sourceType} • ${sourceId}`,
+          label: providerReference || sourceLabel,
         },
         collectionItemVersion: Number(allocation.collectionItemVersion),
         amount: { amount: allocation.allocatedAmount, currency: allocation.currency },
