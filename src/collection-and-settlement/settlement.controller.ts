@@ -1,14 +1,43 @@
-import { Body, Controller, Headers, HttpCode, Inject, Param, Post, Req, Res } from '@nestjs/common';
+import { Body, Controller, Get, Headers, HttpCode, Inject, Param, Post, Query, Req, Res } from '@nestjs/common';
 import type { Response } from 'express';
 
 import { RequirePermission, RequireStepUp } from '../access-control/auth.decorators';
 import type { TreasuryRequest } from '../access-control/auth.guard';
-import { SettlementCreateDto, SettlementReverseDto } from './settlement.dto';
+import { SettlementBatchQuery, SettlementCreateDto, SettlementReverseDto } from './settlement.dto';
 import { SettlementService } from './settlement.service';
 
 @Controller('v1')
 export class SettlementController {
   constructor(@Inject(SettlementService) private readonly service: SettlementService) {}
+
+  @Get('settlement-batches')
+  @RequirePermission('settlement.view', 'listSettlementBatches', 'ONE_GRANT_RESOURCE')
+  list(
+    @Req() request: TreasuryRequest,
+    @Query() query: SettlementBatchQuery,
+  ) {
+    return this.service.list(
+      request.auth!.organizationId,
+      request.auth!.session.userId,
+      query,
+    );
+  }
+
+  @Get('settlement-batches/:resourceId')
+  @RequirePermission('settlement.view', 'getSettlementBatch', 'ONE_GRANT_RESOURCE')
+  async get(
+    @Req() request: TreasuryRequest,
+    @Param('resourceId') resourceId: string,
+    @Res({ passthrough: true }) response: Response,
+  ) {
+    const batch = await this.service.get(
+      request.auth!.organizationId,
+      request.auth!.session.userId,
+      resourceId,
+    );
+    response.setHeader('ETag', `"${batch.version}"`);
+    return batch;
+  }
 
   @Post('settlement-batches')
   @RequirePermission('settlement.create', 'createSettlementBatch', 'ONE_GRANT_RESOURCE')

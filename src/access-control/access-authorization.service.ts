@@ -27,6 +27,11 @@ export interface SettlementAuthorizationContext {
   amount: string;
 }
 
+export interface SettlementReadScope {
+  grantIds: string[];
+  fingerprint: string;
+}
+
 @Injectable()
 export class AccessAuthorizationService {
   constructor(
@@ -178,6 +183,22 @@ export class AccessAuthorizationService {
       permission,
     );
     return grants.length ? digest(stableJson(grants)) : undefined;
+  }
+
+  async settlementReadScope(
+    transaction: DatabaseTransaction,
+    organizationId: string,
+    actorUserId: string,
+  ): Promise<SettlementReadScope | undefined> {
+    const grants = await this.repository.paymentGrants(
+      transaction,
+      organizationId,
+      actorUserId,
+      'settlement.view',
+    );
+    return grants.length
+      ? { grantIds: grants.map(({ id }) => id), fingerprint: digest(stableJson(grants)) }
+      : undefined;
   }
 
   listVisibleAccountingExportIds(

@@ -10,6 +10,7 @@ import { TreasuryProblem } from '../src/common/problem';
 import type { DatabaseService, DatabaseTransaction } from '../src/database/database.service';
 import type { FoundationEffectsService } from '../src/foundation-effects/foundation-effects.service';
 import {
+  SettlementBatchView,
   SettlementCreateDto,
   SettlementDiscrepancyDisposition,
   SettlementMatchKind,
@@ -113,15 +114,30 @@ function dto(overrides: Partial<SettlementCreateDto> = {}): SettlementCreateDto 
   };
 }
 
-function database(): DatabaseService {
+function database(transactionOptions?: unknown[]): DatabaseService {
   return {
-    db: { transaction: async <T>(work: (transaction: object) => Promise<T>) => work({}) },
+    db: {
+      transaction: async <T>(
+        work: (transaction: object) => Promise<T>,
+        options?: unknown,
+      ) => {
+        transactionOptions?.push(options);
+        return work({});
+      },
+    },
   } as unknown as DatabaseService;
 }
 
-function authorization(allowed = true): AccessAuthorizationService {
+function authorization(
+  allowed = true,
+  readScope: { grantIds: string[]; fingerprint: string } | null = {
+    grantIds: ['00000000-0000-4000-8000-000000000020'],
+    fingerprint: 'a'.repeat(64),
+  },
+): AccessAuthorizationService {
   return {
     resolveSettlementAuthority: async () => allowed ? {} : null,
+    settlementReadScope: async () => readScope ?? undefined,
     consumeStepUpProof: async () => true,
   } as unknown as AccessAuthorizationService;
 }
@@ -133,6 +149,89 @@ function foundation(): FoundationEffectsService {
     appendOutbox: async () => undefined,
   } as unknown as FoundationEffectsService;
 }
+
+function batchView(overrides: Partial<SettlementBatchView> = {}): SettlementBatchView {
+  return {
+    id: BATCH_ID,
+    organizationId: ORGANIZATION_ID,
+    organization: { id: ORGANIZATION_ID, label: 'Treasury' },
+    businessNumber: 'SET-00000001',
+    destinationBankAccountId: ACCOUNT_ID,
+    destinationBankAccount: { id: ACCOUNT_ID, label: 'Treasury • 1001' },
+    settlementDate: '2026-08-03',
+    match: { kind: SettlementMatchKind.MANUAL, reason: 'Verified credit' },
+    gross: { amount: '100', currency: 'IRR' },
+    fee: { amount: '0', currency: 'IRR' },
+    deduction: { amount: '0', currency: 'IRR' },
+    expectedNet: { amount: '100', currency: 'IRR' },
+    actualNet: { amount: '100', currency: 'IRR' },
+    discrepancy: { amount: '0', currency: 'IRR' },
+    discrepancyDisposition: SettlementDiscrepancyDisposition.NONE,
+    allocations: [],
+    attachments: [],
+    creatorUserId: CREATOR_ID,
+    creator: { id: CREATOR_ID, label: 'Creator' },
+    effects: [],
+    state: 'MATCHED',
+    version: 0,
+    createdAt: '2026-08-03T00:00:00.000Z',
+    updatedAt: '2026-08-03T00:00:00.000Z',
+    ...overrides,
+  };
+}
+
+test('settlement handoff binds pagination to the current one-grant scope', async () => {
+  let fingerprint = 'a'.repeat(64);
+  const transactionOptions: unknown[] = [];
+  const repository = {
+    list: async (_transaction: unknown, input: { states: string[] }) => ({
+      items: [batchView()],
+      hasMore: true,
+      input,
+    }),
+  } as unknown as SettlementRepository;
+  const access = {
+    settlementReadScope: async () => ({
+      grantIds: ['00000000-0000-4000-8000-000000000020'],
+      fingerprint,
+    }),
+  } as unknown as AccessAuthorizationService;
+  const service = new SettlementService(database(transactionOptions), repository, access, foundation());
+  const first = await service.list(ORGANIZATION_ID, CREATOR_ID, { limit: '1' });
+  assert.equal(first.items[0]?.businessNumber, 'SET-00000001');
+  assert.ok(first.page.nextCursor);
+  assert.deepEqual(transactionOptions[0], {
+    isolationLevel: 'repeatable read',
+    accessMode: 'read only',
+  });
+  fingerprint = 'b'.repeat(64);
+  await assert.rejects(
+    service.list(ORGANIZATION_ID, CREATOR_ID, { limit: '1', cursor: first.page.nextCursor }),
+    problem('TRS-GEN-001', 422),
+  );
+});
+
+test('settlement exact read does not disclose hidden or out-of-scope batches', async () => {
+  const transactionOptions: unknown[] = [];
+  const hidden = new SettlementService(
+    database(transactionOptions),
+    { readView: async () => undefined } as unknown as SettlementRepository,
+    authorization(),
+    foundation(),
+  );
+  await assert.rejects(hidden.get(ORGANIZATION_ID, CREATOR_ID, BATCH_ID), problem('TRS-GEN-004', 404));
+  assert.deepEqual(transactionOptions[0], {
+    isolationLevel: 'repeatable read',
+    accessMode: 'read only',
+  });
+  const denied = new SettlementService(
+    database(),
+    {} as SettlementRepository,
+    authorization(true, null),
+    foundation(),
+  );
+  await assert.rejects(denied.get(ORGANIZATION_ID, CREATOR_ID, BATCH_ID), problem('TRS-GEN-003', 403));
+});
 
 function createRepository(options: { evidenceState?: string; replay?: object } = {}) {
   let inserted = 0;

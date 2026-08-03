@@ -137,8 +137,10 @@ test('all authorized operations through INC-1H are present in owner-local contro
   }
 });
 
-test('INC-4C Settlement routes expose only the authorized one-grant surface', () => {
+test('INC-4D Settlement routes expose the authorized one-grant command and read surface', () => {
   for (const [handler, permission, operationId] of [
+    [SettlementController.prototype.list, 'settlement.view', 'listSettlementBatches'],
+    [SettlementController.prototype.get, 'settlement.view', 'getSettlementBatch'],
     [SettlementController.prototype.create, 'settlement.create', 'createSettlementBatch'],
     [SettlementController.prototype.confirm, 'settlement.confirm', 'confirmSettlementBatch'],
     [SettlementController.prototype.reverse, 'settlement.reverse', 'reverseSettlementBatch'],
@@ -687,6 +689,7 @@ test('CHG-017 admits the emergency separation override permission', async () => 
     readFile('migrations/0002_access_control.sql', 'utf8'),
     readFile('migrations/0012_separation_override_permission.sql', 'utf8'),
     readFile('migrations/0021_transfer_draft_approval.sql', 'utf8'),
+    readFile('migrations/0024_settlement_action_handoff.sql', 'utf8'),
   ]);
   const persisted = [...migrations.join('\n').matchAll(/\('([^']+)'\)/gu)]
     .map((match) => match[1])
