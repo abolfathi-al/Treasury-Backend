@@ -161,6 +161,25 @@ export interface SettlementBatchView {
   updatedAt: string;
 }
 
+export const SETTLEMENT_ACTION_STATES = ['MATCHED', 'DISCREPANCY', 'CONFIRMED'] as const;
+export type SettlementActionState = typeof SETTLEMENT_ACTION_STATES[number];
+
+export interface SettlementBatchQuery {
+  state?: string | string[];
+  limit?: string;
+  cursor?: string;
+}
+
+export interface SettlementBatchPage {
+  items: SettlementBatchView[];
+  page: {
+    limit: number;
+    hasMore: boolean;
+    asOf: string;
+    nextCursor?: string;
+  };
+}
+
 export interface SettlementReversalView {
   id: string;
   organizationId: string;

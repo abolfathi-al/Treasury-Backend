@@ -271,7 +271,7 @@ export class AccessAuthorizationRepository {
       | 'bank-instruction.record-outcome' | 'accounting.export' | 'accounting.acknowledge'
       | 'transfer.create' | 'transfer.submit' | 'transfer.approve' | 'transfer.reject'
       | 'transfer.release' | 'transfer.receive'
-      | 'settlement.create' | 'settlement.confirm' | 'settlement.reverse',
+      | 'settlement.create' | 'settlement.confirm' | 'settlement.reverse' | 'settlement.view',
     roleId?: string,
   ): Promise<PaymentGrant[]> {
     const result = await transaction.execute<PaymentGrant>(sql`

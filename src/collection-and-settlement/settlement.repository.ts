@@ -1,5 +1,5 @@
 import { Injectable } from '@nestjs/common';
-import { and, asc, eq, InferSelectModel, inArray, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, InferSelectModel, inArray, lt, lte, or, sql } from 'drizzle-orm';
 import { randomUUID } from 'node:crypto';
 
 import type { DatabaseTransaction } from '../database/database.service';
@@ -21,6 +21,7 @@ import {
 } from '../database/schema';
 import type {
   SettlementBatchView,
+  SettlementActionState,
   SettlementCreateDto,
   SettlementEffectType,
   SettlementEffectView,
@@ -68,6 +69,26 @@ export interface SettlementConfirmationFacts {
     currentDigest: string | null;
     state: string | null;
   }>;
+}
+
+export interface SettlementBatchKeyset {
+  createdAt: string;
+  id: string;
+}
+
+export interface SettlementBatchListInput {
+  organizationId: string;
+  actorUserId: string;
+  authorizedGrantIds: string[];
+  states: SettlementActionState[];
+  limit: number;
+  asOf: string;
+  after?: SettlementBatchKeyset;
+}
+
+export interface SettlementBatchListResult {
+  items: SettlementBatchView[];
+  hasMore: boolean;
 }
 
 @Injectable()
@@ -596,6 +617,208 @@ export class SettlementRepository {
     };
   }
 
+  async list(
+    transaction: DatabaseTransaction,
+    input: SettlementBatchListInput,
+  ): Promise<SettlementBatchListResult> {
+    const conditions = [
+      eq(settlementBatches.organizationId, input.organizationId),
+      inArray(settlementBatches.state, input.states),
+      lte(settlementBatches.createdAt, new Date(input.asOf)),
+      this.oneGrantScope(input.organizationId, input.actorUserId, input.authorizedGrantIds),
+    ];
+    if (input.after) {
+      const createdAt = new Date(input.after.createdAt);
+      conditions.push(or(
+        lt(settlementBatches.createdAt, createdAt),
+        and(eq(settlementBatches.createdAt, createdAt), lt(settlementBatches.id, input.after.id)),
+      )!);
+    }
+    const rows = await transaction.select({ id: settlementBatches.id })
+      .from(settlementBatches)
+      .where(and(...conditions))
+      .orderBy(desc(settlementBatches.createdAt), desc(settlementBatches.id))
+      .limit(input.limit + 1);
+    const ids = rows.slice(0, input.limit).map(({ id }) => id);
+    return {
+      items: await this.views(transaction, input.organizationId, ids),
+      hasMore: rows.length > input.limit,
+    };
+  }
+
+  async readView(
+    transaction: DatabaseTransaction,
+    organizationId: string,
+    actorUserId: string,
+    authorizedGrantIds: string[],
+    batchId: string,
+  ): Promise<SettlementBatchView | undefined> {
+    const [row] = await transaction.select({ id: settlementBatches.id })
+      .from(settlementBatches)
+      .where(and(
+        eq(settlementBatches.organizationId, organizationId),
+        eq(settlementBatches.id, batchId),
+        inArray(settlementBatches.state, ['MATCHED', 'DISCREPANCY', 'CONFIRMED', 'REVERSED']),
+        this.oneGrantScope(organizationId, actorUserId, authorizedGrantIds),
+      ))
+      .limit(1);
+    return row ? (await this.views(transaction, organizationId, [row.id]))[0] : undefined;
+  }
+
+  private async views(
+    transaction: DatabaseTransaction,
+    organizationId: string,
+    batchIds: string[],
+  ): Promise<SettlementBatchView[]> {
+    if (!batchIds.length) return [];
+    const rows = await transaction.select({
+      batch: settlementBatches,
+      organizationLabel: organizations.legalName,
+      accountOwner: bankAccounts.legalOwnerName,
+      accountNumber: bankAccounts.accountNumber,
+    }).from(settlementBatches)
+      .innerJoin(organizations, eq(organizations.id, settlementBatches.organizationId))
+      .innerJoin(bankAccounts, and(
+        eq(bankAccounts.organizationId, settlementBatches.organizationId),
+        eq(bankAccounts.id, settlementBatches.destinationBankAccountId),
+      )).where(and(
+        eq(settlementBatches.organizationId, organizationId),
+        inArray(settlementBatches.id, batchIds),
+      ));
+    const actorIds = [...new Set(rows.flatMap(({ batch }) => [
+      batch.creatorUserId,
+      batch.confirmedBy,
+      batch.reversedBy,
+    ].filter((id): id is string => !!id)))];
+    const actors = actorIds.length
+      ? await transaction.select({ id: userRefs.id, label: userRefs.displayName })
+        .from(userRefs).where(and(
+          eq(userRefs.organizationId, organizationId),
+          inArray(userRefs.id, actorIds),
+        ))
+      : [];
+    const actor = new Map(actors.map(({ id, label }) => [id, { id, label }]));
+    const allocationRows = await transaction.select({
+      batchId: settlementAllocations.settlementBatchId,
+      allocation: settlementAllocations,
+      providerReference: collectionItems.providerReference,
+      sourceLabel: sql<string>`CASE
+        WHEN ${collectionItems.sourceFactType} = 'RECEIPT_LINE' THEN concat(
+          'Receipt ', ${receiptDocuments.businessNumber}, ' · line ', ${receiptLines.lineNumber}::text
+        )
+        WHEN ${collectionItems.sourceFactType} = 'CHEQUE_EVENT' THEN concat(
+          'Received cheque ', ${receivedCheques.chequeNumber}, ' · event ', ${chequeEvents.sequenceNo}::text
+        )
+        ELSE 'Collection item'
+      END`,
+    }).from(settlementAllocations).innerJoin(collectionItems, and(
+      eq(collectionItems.organizationId, settlementAllocations.organizationId),
+      eq(collectionItems.id, settlementAllocations.collectionItemId),
+    )).leftJoin(receiptLines, and(
+      eq(collectionItems.sourceFactType, 'RECEIPT_LINE'),
+      eq(receiptLines.organizationId, collectionItems.organizationId),
+      eq(receiptLines.id, collectionItems.sourceFactId),
+    )).leftJoin(receiptDocuments, and(
+      eq(receiptDocuments.organizationId, receiptLines.organizationId),
+      eq(receiptDocuments.id, receiptLines.receiptDocumentId),
+    )).leftJoin(chequeEvents, and(
+      eq(collectionItems.sourceFactType, 'CHEQUE_EVENT'),
+      eq(chequeEvents.id, collectionItems.sourceFactId),
+      eq(chequeEvents.chequeType, 'RECEIVED'),
+    )).leftJoin(receivedCheques, and(
+      eq(receivedCheques.organizationId, collectionItems.organizationId),
+      eq(receivedCheques.id, chequeEvents.chequeId),
+    )).where(and(
+      eq(settlementAllocations.organizationId, organizationId),
+      inArray(settlementAllocations.settlementBatchId, batchIds),
+    )).orderBy(asc(settlementAllocations.id));
+    const attachmentRows = await transaction.select({
+      batchId: settlementAttachmentLinks.settlementBatchId,
+      id: settlementAttachmentLinks.attachmentId,
+      contentDigest: settlementAttachmentLinks.contentDigest,
+    }).from(settlementAttachmentLinks).where(and(
+      eq(settlementAttachmentLinks.organizationId, organizationId),
+      inArray(settlementAttachmentLinks.settlementBatchId, batchIds),
+    )).orderBy(asc(settlementAttachmentLinks.attachmentId));
+    const effectRows = await transaction.select().from(settlementEffects).where(and(
+      eq(settlementEffects.organizationId, organizationId),
+      inArray(settlementEffects.settlementBatchId, batchIds),
+    )).orderBy(asc(settlementEffects.createdAt), asc(settlementEffects.id));
+    const reversalRows = await transaction.select({
+      batchId: settlementBatches.reversalOfBatchId,
+      id: settlementBatches.id,
+    }).from(settlementBatches).where(and(
+      eq(settlementBatches.organizationId, organizationId),
+      inArray(settlementBatches.reversalOfBatchId, batchIds),
+    ));
+    const allocations = grouped(allocationRows, ({ batchId }) => batchId);
+    const attachmentLinks = grouped(attachmentRows, ({ batchId }) => batchId);
+    const effects = grouped(effectRows, ({ settlementBatchId }) => settlementBatchId);
+    const reversals = new Map(reversalRows.map(({ batchId, id }) => [batchId!, id]));
+    const byId = new Map(rows.map((row) => [row.batch.id, row]));
+
+    return batchIds.map((batchId) => {
+      const row = byId.get(batchId);
+      if (!row || row.batch.state === 'REVERSAL') throw new Error('SEMANTIC_REFERENCE_MISSING');
+      const creator = actor.get(row.batch.creatorUserId);
+      if (!creator) throw new Error('SEMANTIC_REFERENCE_MISSING');
+      const currency = row.batch.currency;
+      return {
+        id: row.batch.id,
+        organizationId,
+        organization: { id: organizationId, label: row.organizationLabel },
+        businessNumber: row.batch.businessNumber,
+        destinationBankAccountId: row.batch.destinationBankAccountId,
+        destinationBankAccount: {
+          id: row.batch.destinationBankAccountId,
+          label: `${row.accountOwner} • ${row.accountNumber}`,
+        },
+        ...(row.batch.bankStatementLineId ? { bankStatementLineId: row.batch.bankStatementLineId } : {}),
+        ...(row.batch.providerReference ? { providerReference: row.batch.providerReference } : {}),
+        settlementDate: row.batch.settlementDate,
+        match: row.batch.matchKind === 'DETERMINISTIC'
+          ? { kind: SettlementMatchKind.DETERMINISTIC, ruleId: row.batch.matchRuleId!, ruleVersion: row.batch.matchRuleVersion! }
+          : { kind: SettlementMatchKind.MANUAL, reason: row.batch.manualMatchReason! },
+        gross: { amount: row.batch.grossAmount, currency },
+        fee: { amount: row.batch.feeAmount, currency },
+        deduction: { amount: row.batch.deductionAmount, currency },
+        expectedNet: { amount: row.batch.expectedNetAmount, currency },
+        actualNet: { amount: row.batch.actualNetAmount, currency },
+        discrepancy: { amount: row.batch.discrepancyAmount, currency },
+        discrepancyDisposition: row.batch.discrepancyDisposition as SettlementBatchView['discrepancyDisposition'],
+        ...(row.batch.discrepancyReason ? { discrepancyReason: row.batch.discrepancyReason } : {}),
+        ...(row.batch.replacementForBatchId ? { replacementForBatchId: row.batch.replacementForBatchId } : {}),
+        ...(reversals.get(batchId) ? { reversalBatchId: reversals.get(batchId)! } : {}),
+        allocations: (allocations.get(batchId) ?? []).map(({ allocation, providerReference, sourceLabel }) => ({
+          id: allocation.id,
+          collectionItemId: allocation.collectionItemId,
+          collectionItem: { id: allocation.collectionItemId, label: providerReference || sourceLabel },
+          collectionItemVersion: Number(allocation.collectionItemVersion),
+          amount: { amount: allocation.allocatedAmount, currency: allocation.currency },
+          state: allocation.state as SettlementBatchView['allocations'][number]['state'],
+        })),
+        attachments: (attachmentLinks.get(batchId) ?? []).map(({ id, contentDigest }) => ({
+          id, contentDigest, purpose: 'BANK_CREDIT_EVIDENCE' as const,
+        })),
+        creatorUserId: row.batch.creatorUserId,
+        creator,
+        ...(row.batch.confirmedBy && actor.get(row.batch.confirmedBy)
+          ? { confirmedByUserId: row.batch.confirmedBy, confirmedBy: actor.get(row.batch.confirmedBy)! }
+          : {}),
+        ...(row.batch.confirmedAt ? { confirmedAt: row.batch.confirmedAt.toISOString() } : {}),
+        ...(row.batch.reversedBy && actor.get(row.batch.reversedBy)
+          ? { reversedByUserId: row.batch.reversedBy, reversedBy: actor.get(row.batch.reversedBy)! }
+          : {}),
+        ...(row.batch.reversedAt ? { reversedAt: row.batch.reversedAt.toISOString() } : {}),
+        effects: (effects.get(batchId) ?? []).map(effectView),
+        state: row.batch.state as SettlementBatchView['state'],
+        version: Number(row.batch.version),
+        createdAt: row.batch.createdAt.toISOString(),
+        updatedAt: row.batch.updatedAt.toISOString(),
+      };
+    });
+  }
+
   async reversalView(
     transaction: DatabaseTransaction,
     organizationId: string,
@@ -631,6 +854,128 @@ export class SettlementRepository {
     };
   }
 
+  private oneGrantScope(
+    organizationId: string,
+    actorUserId: string,
+    authorizedGrantIds: string[],
+  ) {
+    const grantIds = sql.join(
+      authorizedGrantIds.map((grantId) => sql`${grantId}::uuid`),
+      sql`, `,
+    );
+    return sql<boolean>`EXISTS (
+      SELECT 1
+      FROM access_grants AS access_grant
+      JOIN roles AS role
+        ON role.id = access_grant.role_id
+       AND role.organization_id = access_grant.organization_id
+       AND role.state = 'ACTIVE'
+      JOIN role_permissions AS permission
+        ON permission.role_id = role.id
+       AND permission.permission = 'settlement.view'
+      WHERE access_grant.organization_id = ${organizationId}
+        AND access_grant.id IN (${grantIds})
+        AND access_grant.state = 'ACTIVE'
+        AND access_grant.valid_from <= now()
+        AND (access_grant.valid_to IS NULL OR access_grant.valid_to > now())
+        AND (
+          access_grant.user_ref_id = ${actorUserId}
+          OR EXISTS (
+            SELECT 1 FROM delegations AS delegation
+            WHERE delegation.organization_id = access_grant.organization_id
+              AND delegation.access_grant_id = access_grant.id
+              AND delegation.grantor_user_id = access_grant.user_ref_id
+              AND delegation.delegate_user_id = ${actorUserId}
+              AND delegation.revoked_at IS NULL
+              AND delegation.valid_from <= now()
+              AND delegation.valid_to > now()
+          )
+        )
+        AND (
+          access_grant.amount_ceiling IS NULL
+          OR (
+            access_grant.amount_ceiling_currency = ${settlementBatches.currency}
+            AND access_grant.amount_ceiling >= ${settlementBatches.grossAmount}
+          )
+        )
+        AND (
+          NOT EXISTS (
+            SELECT 1 FROM access_grant_bank_account_scopes AS scope
+            WHERE scope.access_grant_id = access_grant.id
+          )
+          OR EXISTS (
+            SELECT 1 FROM access_grant_bank_account_scopes AS scope
+            WHERE scope.access_grant_id = access_grant.id
+              AND scope.bank_account_id = ${settlementBatches.destinationBankAccountId}
+          )
+        )
+        AND (
+          NOT EXISTS (
+            SELECT 1 FROM access_grant_currency_scopes AS scope
+            WHERE scope.access_grant_id = access_grant.id
+          )
+          OR EXISTS (
+            SELECT 1 FROM access_grant_currency_scopes AS scope
+            WHERE scope.access_grant_id = access_grant.id
+              AND scope.currency = ${settlementBatches.currency}
+          )
+        )
+        AND (
+          NOT EXISTS (
+            SELECT 1 FROM access_grant_branch_scopes AS scope
+            WHERE scope.access_grant_id = access_grant.id
+          )
+          OR (
+            EXISTS (
+              SELECT 1
+              FROM settlement_allocations AS allocation
+              JOIN collection_items AS item
+                ON item.organization_id = allocation.organization_id
+               AND item.id = allocation.collection_item_id
+              WHERE allocation.organization_id = ${settlementBatches.organizationId}
+                AND allocation.settlement_batch_id = ${settlementBatches.id}
+                AND item.branch_id IS NOT NULL
+            )
+            AND NOT EXISTS (
+              SELECT 1
+              FROM settlement_allocations AS allocation
+              JOIN collection_items AS item
+                ON item.organization_id = allocation.organization_id
+               AND item.id = allocation.collection_item_id
+              WHERE allocation.organization_id = ${settlementBatches.organizationId}
+                AND allocation.settlement_batch_id = ${settlementBatches.id}
+                AND item.branch_id IS NOT NULL
+                AND NOT EXISTS (
+                  SELECT 1 FROM access_grant_branch_scopes AS scope
+                  WHERE scope.access_grant_id = access_grant.id
+                    AND scope.branch_id = item.branch_id
+                )
+            )
+          )
+        )
+        AND (
+          NOT EXISTS (
+            SELECT 1 FROM access_grant_treasury_unit_scopes AS scope
+            WHERE scope.access_grant_id = access_grant.id
+          )
+          OR NOT EXISTS (
+            SELECT 1
+            FROM settlement_allocations AS allocation
+            JOIN collection_items AS item
+              ON item.organization_id = allocation.organization_id
+             AND item.id = allocation.collection_item_id
+            WHERE allocation.organization_id = ${settlementBatches.organizationId}
+              AND allocation.settlement_batch_id = ${settlementBatches.id}
+              AND NOT EXISTS (
+                SELECT 1 FROM access_grant_treasury_unit_scopes AS scope
+                WHERE scope.access_grant_id = access_grant.id
+                  AND scope.treasury_unit_id = item.treasury_unit_id
+              )
+          )
+        )
+    )`;
+  }
+
   private async effectViews(
     transaction: DatabaseTransaction,
     organizationId: string,
@@ -640,17 +985,32 @@ export class SettlementRepository {
       eq(settlementEffects.organizationId, organizationId),
       eq(settlementEffects.settlementBatchId, batchId),
     )).orderBy(asc(settlementEffects.createdAt), asc(settlementEffects.id));
-    return rows.map((effect) => ({
-      id: effect.id,
-      effectKey: effect.effectKey,
-      effectType: effect.effectType as SettlementEffectType,
-      direction: effect.direction as 'SETTLEMENT' | 'REVERSAL',
-      money: { amount: effect.amount, currency: effect.currency },
-      businessDate: effect.businessDate,
-      sourceVersion: Number(effect.sourceVersion),
-      ...(effect.movementFactId ? { movementFactId: effect.movementFactId } : {}),
-      ...(effect.collectionItemId ? { collectionItemId: effect.collectionItemId } : {}),
-      ...(effect.reversalOfEffectId ? { reversalOfEffectId: effect.reversalOfEffectId } : {}),
-    }));
+    return rows.map(effectView);
   }
+}
+
+function grouped<T>(rows: T[], key: (row: T) => string): Map<string, T[]> {
+  const result = new Map<string, T[]>();
+  for (const row of rows) {
+    const group = key(row);
+    const bucket = result.get(group);
+    if (bucket) bucket.push(row);
+    else result.set(group, [row]);
+  }
+  return result;
+}
+
+function effectView(effect: EffectRow): SettlementEffectView {
+  return {
+    id: effect.id,
+    effectKey: effect.effectKey,
+    effectType: effect.effectType as SettlementEffectType,
+    direction: effect.direction as 'SETTLEMENT' | 'REVERSAL',
+    money: { amount: effect.amount, currency: effect.currency },
+    businessDate: effect.businessDate,
+    sourceVersion: Number(effect.sourceVersion),
+    ...(effect.movementFactId ? { movementFactId: effect.movementFactId } : {}),
+    ...(effect.collectionItemId ? { collectionItemId: effect.collectionItemId } : {}),
+    ...(effect.reversalOfEffectId ? { reversalOfEffectId: effect.reversalOfEffectId } : {}),
+  };
 }

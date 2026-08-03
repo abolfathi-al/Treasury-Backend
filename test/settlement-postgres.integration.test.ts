@@ -20,7 +20,7 @@ import { SettlementService } from '../src/collection-and-settlement/settlement.s
 
 const connectionString = process.env.TEST_DATABASE_URL;
 
-test('INC-4C preserves rollback, replay, stale, concurrency, credit, and reversal invariants', {
+test('INC-4D preserves lifecycle invariants and adds scoped semantic handoff reads', {
   skip: connectionString ? false : 'TEST_DATABASE_URL is not configured',
 }, async () => {
   process.env.DATABASE_URL = connectionString;
@@ -92,6 +92,53 @@ test('INC-4C preserves rollback, replay, stale, concurrency, credit, and reversa
       SELECT count(*) FROM movement_facts
       WHERE organization_id = $1 AND source_id = $2
     `, [seeded.organizationId, created.id]), 0);
+
+    const visibleOlderId = await cloneMatchedBatch(
+      database,
+      created.id,
+      new Date(new Date(created.createdAt).getTime() - 1_000),
+    );
+    const hiddenSeed = await seed(database);
+    const hiddenNewer = await service.create(
+      hiddenSeed.organizationId,
+      hiddenSeed.creatorId,
+      proposal(hiddenSeed),
+      `settlement-hidden-${hiddenSeed.suffix}`,
+      `settlement-hidden-${hiddenSeed.suffix}`,
+    );
+    const hiddenNewerId = hiddenNewer.id;
+    await addSplitViewGrants(
+      database,
+      seeded.organizationId,
+      seeded.confirmerId,
+      hiddenNewerId,
+      created.id,
+    );
+
+    const queue = await service.list(seeded.organizationId, seeded.confirmerId, { limit: '1' });
+    assert.equal(queue.items[0]?.businessNumber, created.businessNumber);
+    assert.equal(queue.items[0]?.destinationBankAccount.label, created.destinationBankAccount.label);
+    assert.equal(queue.page.hasMore, true);
+    assert.ok(queue.page.nextCursor);
+    const nextQueue = await service.list(seeded.organizationId, seeded.confirmerId, {
+      limit: '1',
+      cursor: queue.page.nextCursor,
+    });
+    assert.equal(nextQueue.items[0]?.id, visibleOlderId);
+    assert.equal(nextQueue.items.some(({ id }) => id === hiddenNewerId), false);
+    assert.equal((await service.get(
+      seeded.organizationId,
+      seeded.confirmerId,
+      created.id,
+    )).version, 0);
+    await assert.rejects(
+      service.get(seeded.organizationId, seeded.confirmerId, hiddenNewerId),
+      isProblem('TRS-GEN-004'),
+    );
+    await assert.rejects(
+      service.list(seeded.organizationId, seeded.deniedId, {}),
+      isProblem('TRS-GEN-003'),
+    );
 
     const staleKey = `settlement-confirm-stale-${seeded.suffix}`;
     await assert.rejects(service.confirm(command(
@@ -167,6 +214,10 @@ test('INC-4C preserves rollback, replay, stale, concurrency, credit, and reversa
     assert.equal(reversed.original.state, 'REVERSED');
     assert.equal(reversed.reversal.state, 'REVERSAL');
     assert.deepEqual(await service.reverse(reverseContext, reverseBody), reversed);
+    await assert.rejects(
+      service.get(seeded.organizationId, seeded.confirmerId, reversed.reversal.id),
+      isProblem('TRS-GEN-004'),
+    );
     assert.deepEqual(await balances(database, seeded.itemIds), [
       { allocated: '0.00000000', remaining: '60.00000000', state: 'REOPENED_AFTER_REVERSAL' },
       { allocated: '0.00000000', remaining: '40.00000000', state: 'REOPENED_AFTER_REVERSAL' },
@@ -333,6 +384,7 @@ async function seed(database: DatabaseService): Promise<Seeded> {
       [creatorId, 'settlement.create'],
       [confirmerId, 'settlement.confirm'],
       [reverserId, 'settlement.reverse'],
+      [confirmerId, 'settlement.view'],
     ]) {
       const roleId = randomUUID();
       const grantId = randomUUID();
@@ -465,6 +517,159 @@ function command(
     ifMatch,
     requestId: `request-${key}`,
   };
+}
+
+async function cloneMatchedBatch(
+  database: DatabaseService,
+  sourceBatchId: string,
+  createdAt: Date,
+): Promise<string> {
+  const batchId = randomUUID();
+  const numericSuffix = BigInt(Date.now()) * 1_000n + BigInt(Math.floor(Math.random() * 1_000));
+  const businessNumber = `SET-${numericSuffix}`;
+  const client = await database.pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query('SET CONSTRAINTS ALL DEFERRED');
+    const batch = await client.query(`
+      INSERT INTO settlement_batches (
+        id, organization_id, business_number, destination_bank_account_id,
+        provider_reference, settlement_date, match_kind, match_rule_id,
+        match_rule_version, manual_match_reason, currency, gross_amount,
+        fee_amount, deduction_amount, expected_net_amount, actual_net_amount,
+        discrepancy_amount, discrepancy_disposition, discrepancy_reason,
+        creator_user_id, state, version, created_at, updated_at
+      )
+      SELECT $1, organization_id, $2, destination_bank_account_id,
+             provider_reference, settlement_date, match_kind, match_rule_id,
+             match_rule_version, manual_match_reason, currency, gross_amount,
+             fee_amount, deduction_amount, expected_net_amount, actual_net_amount,
+             discrepancy_amount, discrepancy_disposition, discrepancy_reason,
+             creator_user_id, 'MATCHED', 0, $3, $3
+      FROM settlement_batches
+      WHERE id = $4 AND discrepancy_amount = 0
+      RETURNING organization_id
+    `, [batchId, businessNumber, createdAt, sourceBatchId]);
+    if (batch.rowCount !== 1) throw new Error('Settlement clone source is unavailable.');
+    await client.query(`
+      INSERT INTO settlement_allocations (
+        id, organization_id, settlement_batch_id, collection_item_id,
+        collection_item_version, allocated_amount, currency, state, version
+      )
+      SELECT gen_random_uuid(), allocation.organization_id, $1,
+             allocation.collection_item_id, item.version,
+             allocation.allocated_amount, allocation.currency, 'PROPOSED', 0
+      FROM settlement_allocations allocation
+      JOIN collection_items item
+        ON item.organization_id = allocation.organization_id
+       AND item.id = allocation.collection_item_id
+      WHERE allocation.settlement_batch_id = $2
+    `, [batchId, sourceBatchId]);
+    await client.query(`
+      INSERT INTO settlement_attachment_links (
+        organization_id, settlement_batch_id, attachment_id, content_digest, purpose
+      )
+      SELECT organization_id, $1, attachment_id, content_digest, purpose
+      FROM settlement_attachment_links
+      WHERE settlement_batch_id = $2
+    `, [batchId, sourceBatchId]);
+    await client.query('COMMIT');
+    return batchId;
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+async function addSplitViewGrants(
+  database: DatabaseService,
+  organizationId: string,
+  actorUserId: string,
+  hiddenBatchId: string,
+  visibleBatchId: string,
+): Promise<void> {
+  const resources = await database.pool.query<{
+    bankAccountId: string;
+    batchId: string;
+    branchIds: string[];
+    currency: string;
+    grossAmount: string;
+    treasuryUnitIds: string[];
+  }>(`
+    SELECT batch.id AS "batchId",
+           batch.destination_bank_account_id AS "bankAccountId",
+           batch.currency,
+           batch.gross_amount::text AS "grossAmount",
+           array_agg(DISTINCT item.branch_id::text)
+             FILTER (WHERE item.branch_id IS NOT NULL) AS "branchIds",
+           array_agg(DISTINCT item.treasury_unit_id::text) AS "treasuryUnitIds"
+    FROM settlement_batches batch
+    JOIN settlement_allocations allocation
+      ON allocation.organization_id = batch.organization_id
+     AND allocation.settlement_batch_id = batch.id
+    JOIN collection_items item
+      ON item.organization_id = allocation.organization_id
+     AND item.id = allocation.collection_item_id
+    WHERE batch.organization_id = $1 AND batch.id = ANY($2::uuid[])
+    GROUP BY batch.id
+  `, [organizationId, [hiddenBatchId, visibleBatchId]]);
+  const hidden = resources.rows.find(({ batchId }) => batchId === hiddenBatchId);
+  const visible = resources.rows.find(({ batchId }) => batchId === visibleBatchId);
+  if (!hidden || !visible || hidden.bankAccountId === visible.bankAccountId) {
+    throw new Error('Distinct hidden and visible Settlement scopes are required.');
+  }
+  const client = await database.pool.connect();
+  try {
+    await client.query('BEGIN');
+    for (const [bankAccountId, branchIds] of [
+      [hidden.bankAccountId, visible.branchIds],
+      [visible.bankAccountId, hidden.branchIds],
+    ] as const) {
+      const role = await client.query<{ id: string }>(`
+        INSERT INTO roles (organization_id, code, name)
+        VALUES ($1,$2,'Split Settlement read scope') RETURNING id
+      `, [organizationId, `SPLIT-${randomUUID()}`]);
+      await client.query(
+        "INSERT INTO role_permissions (role_id, permission) VALUES ($1,'settlement.view')",
+        [role.rows[0]!.id],
+      );
+      const grant = await client.query<{ id: string }>(`
+        INSERT INTO access_grants (
+          organization_id, user_ref_id, role_id, scope_type, scope_id,
+          organization_wide, amount_ceiling, amount_ceiling_currency
+        ) VALUES ($1,$2,$3,'ORGANIZATION',$1,false,$4,$5)
+        RETURNING id
+      `, [organizationId, actorUserId, role.rows[0]!.id, hidden.grossAmount, hidden.currency]);
+      for (const branchId of branchIds) {
+        await client.query(
+          'INSERT INTO access_grant_branch_scopes (access_grant_id, branch_id) VALUES ($1,$2)',
+          [grant.rows[0]!.id, branchId],
+        );
+      }
+      for (const treasuryUnitId of hidden.treasuryUnitIds) {
+        await client.query(
+          'INSERT INTO access_grant_treasury_unit_scopes (access_grant_id, treasury_unit_id) VALUES ($1,$2)',
+          [grant.rows[0]!.id, treasuryUnitId],
+        );
+      }
+      await client.query(
+        'INSERT INTO access_grant_bank_account_scopes (access_grant_id, bank_account_id) VALUES ($1,$2)',
+        [grant.rows[0]!.id, bankAccountId],
+      );
+      await client.query(`
+        INSERT INTO access_grant_currency_scopes (access_grant_id, organization_id, currency)
+        VALUES ($1,$2,$3)
+      `, [grant.rows[0]!.id, organizationId, hidden.currency]);
+    }
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
 }
 
 async function count(

@@ -1,22 +1,27 @@
 import { Inject, Injectable } from '@nestjs/common';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, timingSafeEqual } from 'node:crypto';
 
 import { AccessAuthorizationService } from '../access-control/access-authorization.service';
 import type { TreasuryRequest } from '../access-control/auth.guard';
-import { commandDigest, digest } from '../common/http';
+import { commandDigest, digest, stableJson } from '../common/http';
 import { TreasuryProblem } from '../common/problem';
 import { DatabaseService, type DatabaseTransaction } from '../database/database.service';
 import { FoundationEffectsService } from '../foundation-effects/foundation-effects.service';
 import {
   SettlementBatchView,
+  SettlementBatchPage,
+  SettlementBatchQuery,
+  SettlementActionState,
   SettlementCreateDto,
   SettlementDiscrepancyDisposition,
   SettlementEffectType,
   SettlementMatchKind,
   SettlementReversalResult,
   SettlementReverseDto,
+  SETTLEMENT_ACTION_STATES,
 } from './settlement.dto';
 import {
+  SettlementBatchKeyset,
   LockedSettlement,
   SettlementFacts,
   SettlementRepository,
@@ -24,6 +29,28 @@ import {
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 const SCALE = 100_000_000n;
+const INSTANT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/u;
+const SETTLEMENT_ORDER = 'createdAt:desc,id:desc';
+const CURSOR_TTL_MS = 15 * 60_000;
+
+interface SettlementCursorPayload {
+  version: 1;
+  organizationId: string;
+  actorUserId: string;
+  scopeFingerprint: string;
+  states: SettlementActionState[];
+  order: typeof SETTLEMENT_ORDER;
+  limit: number;
+  asOf: string;
+  after: SettlementBatchKeyset;
+  issuedAt: string;
+  expiresAt: string;
+}
+
+interface SignedSettlementCursor {
+  payload: SettlementCursorPayload;
+  signature: string;
+}
 
 interface SettlementCommandContext {
   organizationId: string;
@@ -46,6 +73,96 @@ export class SettlementService {
     @Inject(FoundationEffectsService)
     private readonly foundation: FoundationEffectsService,
   ) {}
+
+  list(
+    organizationId: string,
+    actorUserId: string,
+    query: SettlementBatchQuery,
+  ): Promise<SettlementBatchPage> {
+    return this.map(() => this.database.db.transaction(async (transaction) => {
+      const states = this.readStates(query.state);
+      const limit = this.readLimit(query.limit);
+      const cursorValue = this.scalar(query.cursor, 'cursor');
+      const scope = await this.authorization.settlementReadScope(
+        transaction,
+        organizationId,
+        actorUserId,
+      );
+      if (!scope) throw new Error('SCOPE_DENIED');
+      const cursor = cursorValue ? this.readCursor(cursorValue) : undefined;
+      if (cursor && stableJson({
+        organizationId: cursor.organizationId,
+        actorUserId: cursor.actorUserId,
+        scopeFingerprint: cursor.scopeFingerprint,
+        states: cursor.states,
+        order: cursor.order,
+        limit: cursor.limit,
+      }) !== stableJson({
+        organizationId,
+        actorUserId,
+        scopeFingerprint: scope.fingerprint,
+        states,
+        order: SETTLEMENT_ORDER,
+        limit,
+      })) this.validation('cursor does not match the current caller, scope, states, order, or limit.');
+      const asOf = cursor?.asOf ?? new Date().toISOString();
+      const result = await this.repository.list(transaction, {
+        organizationId,
+        actorUserId,
+        authorizedGrantIds: scope.grantIds,
+        states,
+        limit,
+        asOf,
+        after: cursor?.after,
+      });
+      const last = result.items.at(-1);
+      const issuedAt = Date.now();
+      const nextCursor = result.hasMore && last
+        ? this.encodeCursor({
+          version: 1,
+          organizationId,
+          actorUserId,
+          scopeFingerprint: scope.fingerprint,
+          states,
+          order: SETTLEMENT_ORDER,
+          limit,
+          asOf,
+          after: { createdAt: last.createdAt, id: last.id },
+          issuedAt: new Date(issuedAt).toISOString(),
+          expiresAt: new Date(issuedAt + CURSOR_TTL_MS).toISOString(),
+        })
+        : undefined;
+      return {
+        items: result.items,
+        page: { limit, hasMore: result.hasMore, asOf, ...(nextCursor ? { nextCursor } : {}) },
+      };
+    }, { isolationLevel: 'repeatable read', accessMode: 'read only' }));
+  }
+
+  get(
+    organizationId: string,
+    actorUserId: string,
+    batchId: string,
+  ): Promise<SettlementBatchView> {
+    return this.map(() => this.database.db.transaction(async (transaction) => {
+      if (!UUID.test(batchId)) this.validation('resourceId is malformed.');
+      const scope = await this.authorization.settlementReadScope(
+        transaction,
+        organizationId,
+        actorUserId,
+      );
+      if (!scope) throw new Error('SCOPE_DENIED');
+      const view = await this.repository.readView(
+        transaction,
+        organizationId,
+        actorUserId,
+        scope.grantIds,
+        batchId,
+      );
+      if (!view) throw new Error('RESOURCE_HIDDEN');
+      return view;
+    }, { isolationLevel: 'repeatable read', accessMode: 'read only' }));
+  }
 
   create(
     organizationId: string,
@@ -642,6 +759,78 @@ export class SettlementService {
       this.validation('Idempotency-Key must contain 8 through 128 characters.');
     }
     return value;
+  }
+
+  private readStates(raw?: string | string[]): SettlementActionState[] {
+    const values = raw === undefined ? [...SETTLEMENT_ACTION_STATES] : Array.isArray(raw) ? raw : [raw];
+    if (
+      values.length === 0
+      || values.some((value) => !SETTLEMENT_ACTION_STATES.includes(value as SettlementActionState))
+      || new Set(values).size !== values.length
+    ) this.validation('state must contain unique supported Settlement action states.');
+    return [...values].sort() as SettlementActionState[];
+  }
+
+  private readLimit(raw?: string): number {
+    const normalized = this.scalar(raw, 'limit');
+    if (!normalized) return 50;
+    const value = Number(normalized);
+    if (!Number.isInteger(value) || value < 1 || value > 500) {
+      this.validation('limit must be an integer from 1 through 500.');
+    }
+    return value;
+  }
+
+  private scalar(value: unknown, field: string): string | undefined {
+    if (value === undefined) return undefined;
+    if (typeof value !== 'string' || value.length === 0) {
+      this.validation(`${field} must be provided exactly once as a string.`);
+    }
+    return value;
+  }
+
+  private readCursor(value: string): SettlementCursorPayload {
+    try {
+      if (!/^[A-Za-z0-9_-]+$/u.test(value) || value.length > 16_384) throw new Error();
+      const decoded = JSON.parse(Buffer.from(value, 'base64url').toString('utf8')) as SignedSettlementCursor;
+      if (
+        !decoded || typeof decoded !== 'object' || !decoded.payload
+        || decoded.payload.version !== 1 || decoded.payload.order !== SETTLEMENT_ORDER
+        || !UUID.test(decoded.payload.organizationId) || !UUID.test(decoded.payload.actorUserId)
+        || !UUID.test(decoded.payload.after?.id ?? '')
+        || !INSTANT.test(decoded.payload.after?.createdAt ?? '') || !INSTANT.test(decoded.payload.asOf)
+        || !INSTANT.test(decoded.payload.issuedAt) || !INSTANT.test(decoded.payload.expiresAt)
+        || !Number.isInteger(decoded.payload.limit) || decoded.payload.limit < 1 || decoded.payload.limit > 500
+        || !Array.isArray(decoded.payload.states)
+        || decoded.payload.states.some((state) => !SETTLEMENT_ACTION_STATES.includes(state))
+        || new Set(decoded.payload.states).size !== decoded.payload.states.length
+        || typeof decoded.payload.scopeFingerprint !== 'string' || decoded.payload.scopeFingerprint.length !== 64
+        || typeof decoded.signature !== 'string' || decoded.signature.length !== 64
+      ) throw new Error();
+      const expected = commandDigest('listSettlementBatches.cursor', decoded.payload);
+      const suppliedBytes = Buffer.from(decoded.signature, 'hex');
+      const expectedBytes = Buffer.from(expected, 'hex');
+      if (suppliedBytes.length !== expectedBytes.length || !timingSafeEqual(suppliedBytes, expectedBytes)) {
+        throw new Error();
+      }
+      const now = Date.now();
+      const issuedAt = new Date(decoded.payload.issuedAt).getTime();
+      const expiresAt = new Date(decoded.payload.expiresAt).getTime();
+      if (
+        !Number.isFinite(issuedAt) || !Number.isFinite(expiresAt)
+        || issuedAt > now + 30_000 || expiresAt <= now || expiresAt - issuedAt !== CURSOR_TTL_MS
+      ) throw new Error();
+      return decoded.payload;
+    } catch {
+      this.validation('cursor is malformed, mismatched, or expired.');
+    }
+  }
+
+  private encodeCursor(payload: SettlementCursorPayload): string {
+    return Buffer.from(JSON.stringify({
+      payload,
+      signature: commandDigest('listSettlementBatches.cursor', payload),
+    } satisfies SignedSettlementCursor)).toString('base64url');
   }
 
   private requiredRequestId(value: string): void {
