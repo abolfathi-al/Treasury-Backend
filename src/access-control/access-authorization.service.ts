@@ -19,6 +19,14 @@ export interface TransferAuthorizationContext {
   amountCurrency: string;
 }
 
+export interface SettlementAuthorizationContext {
+  branchIds: string[];
+  treasuryUnitIds: string[];
+  bankAccountId: string;
+  currency: string;
+  amount: string;
+}
+
 @Injectable()
 export class AccessAuthorizationService {
   constructor(
@@ -266,6 +274,37 @@ export class AccessAuthorizationService {
     if (requiredAuthorityUserId) {
       grants = grants.filter(({ grantUserId }) => grantUserId === requiredAuthorityUserId);
     }
+    if (grants.some(({ delegatedFromUserId }) => delegatedFromUserId === null)) return {};
+    const grantors = [...new Set(grants.flatMap(({ delegatedFromUserId }) =>
+      delegatedFromUserId ? [delegatedFromUserId] : []))];
+    return grantors.length === 1 ? { delegatedFromUserId: grantors[0] } : null;
+  }
+
+  async resolveSettlementAuthority(
+    transaction: DatabaseTransaction,
+    organizationId: string,
+    actorUserId: string,
+    context: SettlementAuthorizationContext,
+    permission: 'settlement.create' | 'settlement.confirm' | 'settlement.reverse',
+  ): Promise<PaymentAuthority | null> {
+    const grants = (await this.repository.paymentGrants(
+      transaction,
+      organizationId,
+      actorUserId,
+      permission,
+    )).filter((grant) => (
+      covers(grant.branchIds, context.branchIds)
+      && covers(grant.treasuryUnitIds, context.treasuryUnitIds)
+      && covers(grant.bankAccountIds, [context.bankAccountId])
+      && covers(grant.currencies, [context.currency])
+      && (
+        grant.amountCeiling === null
+        || (
+          grant.amountCeilingCurrency === context.currency
+          && decimal(context.amount) <= decimal(grant.amountCeiling)
+        )
+      )
+    ));
     if (grants.some(({ delegatedFromUserId }) => delegatedFromUserId === null)) return {};
     const grantors = [...new Set(grants.flatMap(({ delegatedFromUserId }) =>
       delegatedFromUserId ? [delegatedFromUserId] : []))];

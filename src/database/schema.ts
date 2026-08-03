@@ -2136,6 +2136,289 @@ export const collectionItems = pgTable('collection_items', {
   ),
 ]);
 
+export const settlementBatches = pgTable('settlement_batches', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  organizationId: uuid('organization_id').notNull().references(() => organizations.id),
+  businessNumber: varchar('business_number', { length: 64 }).notNull(),
+  destinationBankAccountId: uuid('destination_bank_account_id').notNull(),
+  bankStatementLineId: uuid('bank_statement_line_id'),
+  providerReference: varchar('provider_reference', { length: 128 }),
+  settlementDate: date('settlement_date').notNull(),
+  matchKind: varchar('match_kind', { length: 16 }),
+  matchRuleId: varchar('match_rule_id', { length: 128 }),
+  matchRuleVersion: varchar('match_rule_version', { length: 64 }),
+  manualMatchReason: varchar('manual_match_reason', { length: 500 }),
+  currency: varchar('currency', { length: 8 }).notNull(),
+  grossAmount: numeric('gross_amount', { precision: 38, scale: 8 }).notNull(),
+  feeAmount: numeric('fee_amount', { precision: 38, scale: 8 }).notNull().default('0'),
+  deductionAmount: numeric('deduction_amount', { precision: 38, scale: 8 }).notNull().default('0'),
+  expectedNetAmount: numeric('expected_net_amount', { precision: 38, scale: 8 }).notNull(),
+  actualNetAmount: numeric('actual_net_amount', { precision: 38, scale: 8 }).notNull(),
+  discrepancyAmount: numeric('discrepancy_amount', { precision: 38, scale: 8 }).notNull(),
+  discrepancyDisposition: varchar('discrepancy_disposition', { length: 32 }).notNull(),
+  discrepancyReason: varchar('discrepancy_reason', { length: 500 }),
+  creatorUserId: uuid('creator_user_id').notNull(),
+  confirmedBy: uuid('confirmed_by'),
+  confirmedAt: timestamp('confirmed_at', { withTimezone: true }),
+  reversedBy: uuid('reversed_by'),
+  reversedAt: timestamp('reversed_at', { withTimezone: true }),
+  reversalOfBatchId: uuid('reversal_of_batch_id'),
+  replacementForBatchId: uuid('replacement_for_batch_id'),
+  reversalReason: varchar('reversal_reason', { length: 500 }),
+  state: varchar('state', { length: 32 }).notNull(),
+  version: bigint('version', { mode: 'number' }).notNull().default(0),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  unique().on(table.organizationId, table.id),
+  unique().on(table.organizationId, table.businessNumber),
+  unique().on(table.organizationId, table.reversalOfBatchId),
+  unique().on(table.organizationId, table.replacementForBatchId),
+  foreignKey({
+    columns: [table.organizationId, table.destinationBankAccountId],
+    foreignColumns: [bankAccounts.organizationId, bankAccounts.id],
+    name: 'settlement_batches_destination_account_fk',
+  }),
+  foreignKey({
+    columns: [table.organizationId, table.currency],
+    foreignColumns: [currencies.organizationId, currencies.code],
+    name: 'settlement_batches_currency_fk',
+  }),
+  foreignKey({
+    columns: [table.organizationId, table.creatorUserId],
+    foreignColumns: [userRefs.organizationId, userRefs.id],
+    name: 'settlement_batches_creator_fk',
+  }),
+  foreignKey({
+    columns: [table.organizationId, table.confirmedBy],
+    foreignColumns: [userRefs.organizationId, userRefs.id],
+    name: 'settlement_batches_confirmer_fk',
+  }),
+  foreignKey({
+    columns: [table.organizationId, table.reversedBy],
+    foreignColumns: [userRefs.organizationId, userRefs.id],
+    name: 'settlement_batches_reverser_fk',
+  }),
+  foreignKey({
+    columns: [table.organizationId, table.reversalOfBatchId],
+    foreignColumns: [table.organizationId, table.id],
+    name: 'settlement_batches_reversal_fk',
+  }),
+  foreignKey({
+    columns: [table.organizationId, table.replacementForBatchId],
+    foreignColumns: [table.organizationId, table.id],
+    name: 'settlement_batches_replacement_fk',
+  }),
+  check('settlement_batches_gross_positive', sql`${table.grossAmount} > 0`),
+  check('settlement_batches_fee_nonnegative', sql`${table.feeAmount} >= 0`),
+  check('settlement_batches_deduction_nonnegative', sql`${table.deductionAmount} >= 0`),
+  check('settlement_batches_net_positive', sql`${table.expectedNetAmount} > 0 AND ${table.actualNetAmount} > 0`),
+  check('settlement_batches_expected_net', sql`${table.expectedNetAmount} = ${table.grossAmount} - ${table.feeAmount} - ${table.deductionAmount}`),
+  check('settlement_batches_discrepancy', sql`${table.discrepancyAmount} = ${table.actualNetAmount} - ${table.expectedNetAmount}`),
+  check('settlement_batches_version_nonnegative', sql`${table.version} >= 0`),
+  check(
+    'settlement_batches_discrepancy_shape',
+    sql`(${table.discrepancyAmount} = 0
+      AND ${table.discrepancyDisposition} = 'NONE'
+      AND ${table.discrepancyReason} IS NULL)
+      OR (${table.discrepancyAmount} <> 0
+        AND ${table.discrepancyDisposition} IN ('OPEN', 'APPROVED_DIFFERENCE', 'CORRECTION_REQUIRED', 'RETURNED')
+        AND NULLIF(BTRIM(${table.discrepancyReason}), '') IS NOT NULL)`,
+  ),
+  check(
+    'settlement_batches_match_shape',
+    sql`(${table.state} = 'REVERSAL'
+      AND ${table.matchKind} IS NULL
+      AND ${table.matchRuleId} IS NULL
+      AND ${table.matchRuleVersion} IS NULL
+      AND ${table.manualMatchReason} IS NULL)
+      OR (${table.state} <> 'REVERSAL'
+        AND ${table.matchKind} = 'DETERMINISTIC'
+        AND NULLIF(BTRIM(${table.matchRuleId}), '') IS NOT NULL
+        AND NULLIF(BTRIM(${table.matchRuleVersion}), '') IS NOT NULL
+        AND ${table.manualMatchReason} IS NULL)
+      OR (${table.state} <> 'REVERSAL'
+        AND ${table.matchKind} = 'MANUAL'
+        AND ${table.matchRuleId} IS NULL
+        AND ${table.matchRuleVersion} IS NULL
+        AND NULLIF(BTRIM(${table.manualMatchReason}), '') IS NOT NULL)`,
+  ),
+  check(
+    'settlement_batches_custody_separation',
+    sql`(${table.confirmedBy} IS NULL OR ${table.confirmedBy} <> ${table.creatorUserId})
+      AND (${table.reversedBy} IS NULL
+        OR (${table.reversedBy} <> ${table.creatorUserId}
+          AND ${table.reversedBy} <> ${table.confirmedBy}))`,
+  ),
+  check(
+    'settlement_batches_state_shape',
+    sql`(${table.state} = 'MATCHED'
+      AND ${table.discrepancyAmount} = 0
+      AND ${table.confirmedBy} IS NULL AND ${table.confirmedAt} IS NULL
+      AND ${table.reversedBy} IS NULL AND ${table.reversedAt} IS NULL)
+      OR (${table.state} = 'DISCREPANCY'
+        AND ${table.discrepancyAmount} <> 0
+        AND ${table.confirmedBy} IS NULL AND ${table.confirmedAt} IS NULL
+        AND ${table.reversedBy} IS NULL AND ${table.reversedAt} IS NULL)
+      OR (${table.state} = 'CONFIRMED'
+        AND ${table.confirmedBy} IS NOT NULL AND ${table.confirmedAt} IS NOT NULL
+        AND ${table.reversedBy} IS NULL AND ${table.reversedAt} IS NULL
+        AND (${table.discrepancyAmount} = 0 OR ${table.discrepancyDisposition} = 'APPROVED_DIFFERENCE'))
+      OR (${table.state} = 'REVERSED'
+        AND ${table.confirmedBy} IS NOT NULL AND ${table.confirmedAt} IS NOT NULL
+        AND ${table.reversedBy} IS NOT NULL AND ${table.reversedAt} IS NOT NULL
+        AND (${table.discrepancyAmount} = 0 OR ${table.discrepancyDisposition} = 'APPROVED_DIFFERENCE'))
+      OR (${table.state} = 'REVERSAL'
+        AND ${table.reversalOfBatchId} IS NOT NULL
+        AND NULLIF(BTRIM(${table.reversalReason}), '') IS NOT NULL
+        AND ${table.confirmedBy} IS NULL AND ${table.confirmedAt} IS NULL
+        AND ${table.reversedBy} IS NULL AND ${table.reversedAt} IS NULL)`,
+  ),
+]);
+
+export const settlementAllocations = pgTable('settlement_allocations', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  organizationId: uuid('organization_id').notNull().references(() => organizations.id),
+  settlementBatchId: uuid('settlement_batch_id').notNull(),
+  collectionItemId: uuid('collection_item_id').notNull(),
+  collectionItemVersion: bigint('collection_item_version', { mode: 'number' }).notNull(),
+  allocatedAmount: numeric('allocated_amount', { precision: 38, scale: 8 }).notNull(),
+  currency: varchar('currency', { length: 8 }).notNull(),
+  state: varchar('state', { length: 16 }).notNull(),
+  version: bigint('version', { mode: 'number' }).notNull().default(0),
+}, (table) => [
+  unique().on(table.organizationId, table.id),
+  unique().on(table.organizationId, table.settlementBatchId, table.collectionItemId),
+  foreignKey({
+    columns: [table.organizationId, table.settlementBatchId],
+    foreignColumns: [settlementBatches.organizationId, settlementBatches.id],
+    name: 'settlement_allocations_batch_fk',
+  }),
+  foreignKey({
+    columns: [table.organizationId, table.collectionItemId],
+    foreignColumns: [collectionItems.organizationId, collectionItems.id],
+    name: 'settlement_allocations_item_fk',
+  }),
+  foreignKey({
+    columns: [table.organizationId, table.currency],
+    foreignColumns: [currencies.organizationId, currencies.code],
+    name: 'settlement_allocations_currency_fk',
+  }),
+  check('settlement_allocations_version_nonnegative', sql`${table.collectionItemVersion} >= 0 AND ${table.version} >= 0`),
+  check('settlement_allocations_amount_positive', sql`${table.allocatedAmount} > 0`),
+]);
+
+export const settlementAttachmentLinks = pgTable('settlement_attachment_links', {
+  organizationId: uuid('organization_id').notNull().references(() => organizations.id),
+  settlementBatchId: uuid('settlement_batch_id').notNull(),
+  attachmentId: uuid('attachment_id').notNull(),
+  contentDigest: char('content_digest', { length: 64 }).notNull(),
+  purpose: varchar('purpose', { length: 64 }).notNull(),
+  linkedAt: timestamp('linked_at', { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  primaryKey({ columns: [table.organizationId, table.settlementBatchId, table.attachmentId] }),
+  foreignKey({
+    columns: [table.organizationId, table.settlementBatchId],
+    foreignColumns: [settlementBatches.organizationId, settlementBatches.id],
+    name: 'settlement_attachment_links_batch_fk',
+  }),
+  foreignKey({
+    columns: [table.organizationId, table.attachmentId, table.contentDigest],
+    foreignColumns: [attachments.organizationId, attachments.id, attachments.contentDigest],
+    name: 'settlement_attachment_links_attachment_fk',
+  }),
+  check('settlement_attachment_links_purpose', sql`${table.purpose} = 'BANK_CREDIT_EVIDENCE'`),
+  check('settlement_attachment_links_digest', sql`${table.contentDigest} ~ '^[a-f0-9]{64}$'`),
+]);
+
+export const settlementEffects = pgTable('settlement_effects', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  organizationId: uuid('organization_id').notNull().references(() => organizations.id),
+  settlementBatchId: uuid('settlement_batch_id').notNull(),
+  effectKey: varchar('effect_key', { length: 64 }).notNull(),
+  effectType: varchar('effect_type', { length: 40 }).notNull(),
+  direction: varchar('direction', { length: 16 }).notNull(),
+  amount: numeric('amount', { precision: 38, scale: 8 }).notNull(),
+  currency: varchar('currency', { length: 8 }).notNull(),
+  businessDate: date('business_date').notNull(),
+  sourceVersion: bigint('source_version', { mode: 'number' }).notNull(),
+  movementFactId: uuid('movement_fact_id'),
+  collectionItemId: uuid('collection_item_id'),
+  reversalOfEffectId: uuid('reversal_of_effect_id'),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  unique().on(table.organizationId, table.id),
+  unique().on(
+    table.organizationId,
+    table.id,
+    table.effectType,
+    table.currency,
+    table.amount,
+  ),
+  unique().on(table.organizationId, table.settlementBatchId, table.effectKey, table.direction),
+  unique().on(table.organizationId, table.reversalOfEffectId),
+  unique().on(table.organizationId, table.movementFactId),
+  foreignKey({
+    columns: [table.organizationId, table.settlementBatchId],
+    foreignColumns: [settlementBatches.organizationId, settlementBatches.id],
+    name: 'settlement_effects_batch_fk',
+  }),
+  foreignKey({
+    columns: [table.organizationId, table.collectionItemId],
+    foreignColumns: [collectionItems.organizationId, collectionItems.id],
+    name: 'settlement_effects_collection_item_fk',
+  }),
+  foreignKey({
+    columns: [table.organizationId, table.currency],
+    foreignColumns: [currencies.organizationId, currencies.code],
+    name: 'settlement_effects_currency_fk',
+  }),
+  foreignKey({
+    columns: [table.organizationId, table.movementFactId],
+    foreignColumns: [movementFacts.organizationId, movementFacts.id],
+    name: 'settlement_effects_movement_fk',
+  }),
+  foreignKey({
+    columns: [
+      table.organizationId,
+      table.reversalOfEffectId,
+      table.effectType,
+      table.currency,
+      table.amount,
+    ],
+    foreignColumns: [
+      table.organizationId,
+      table.id,
+      table.effectType,
+      table.currency,
+      table.amount,
+    ],
+    name: 'settlement_effects_reversal_fk',
+  }),
+  check(
+    'settlement_effects_source_version',
+    sql`(${table.direction} = 'SETTLEMENT' AND ${table.sourceVersion} > 0)
+      OR (${table.direction} = 'REVERSAL' AND ${table.sourceVersion} = 0)`,
+  ),
+  check(
+    'settlement_effects_shape',
+    sql`(${table.effectType} = 'BANK_CREDIT'
+      AND ${table.movementFactId} IS NOT NULL
+      AND ${table.collectionItemId} IS NULL)
+      OR (${table.effectType} = 'ALLOCATION_CONSUMPTION'
+        AND ${table.movementFactId} IS NULL
+        AND ${table.collectionItemId} IS NOT NULL)
+      OR (${table.effectType} IN ('FEE_EVIDENCE', 'DEDUCTION_EVIDENCE', 'APPROVED_DISCREPANCY_EVIDENCE')
+        AND ${table.movementFactId} IS NULL
+        AND ${table.collectionItemId} IS NULL)`,
+  ),
+  check(
+    'settlement_effects_direction',
+    sql`(${table.direction} = 'SETTLEMENT' AND ${table.reversalOfEffectId} IS NULL)
+      OR (${table.direction} = 'REVERSAL' AND ${table.reversalOfEffectId} IS NOT NULL)`,
+  ),
+]);
+
 export const receiptExecutionEffects = pgTable('receipt_execution_effects', {
   id: uuid('id').primaryKey().defaultRandom(),
   organizationId: uuid('organization_id').notNull().references(() => organizations.id),

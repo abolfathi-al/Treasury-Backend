@@ -8,6 +8,7 @@ import { ProblemFilter } from './common/problem';
 import { NoStoreInterceptor } from './common/no-store.interceptor';
 import { CashboxModule } from './cashbox-and-custody/cashbox.module';
 import { ChequeModule } from './cheques/cheque.module';
+import { SettlementModule } from './collection-and-settlement/settlement.module';
 import { DatabaseModule } from './database/database.module';
 import { MasterDataModule } from './master-data/master-data.module';
 import { PaymentModule } from './payments/payment.module';
@@ -28,6 +29,7 @@ import { TransferModule } from './transfers/transfer.module';
     ReceiptModule,
     ReportingModule,
     TransferModule,
+    SettlementModule,
   ],
   providers: [
     { provide: APP_FILTER, useClass: ProblemFilter },
