@@ -51,6 +51,10 @@ const expectedOperations = [
   ['POST', 'v1/roles'],
   ['GET', 'v1/access-grants'],
   ['POST', 'v1/access-grants'],
+  ['GET', 'v1/approval-policies'],
+  ['POST', 'v1/approval-policies'],
+  ['GET', 'v1/delegations'],
+  ['POST', 'v1/delegations'],
   ['GET', 'v1/currencies'],
   ['POST', 'v1/currencies'],
   ['GET', 'v1/parties'],
@@ -155,6 +159,70 @@ test('INC-4D Settlement routes expose the authorized one-grant command and read 
     Reflect.getMetadata(STEP_UP_REQUIRED, SettlementController.prototype.reverse),
     'reverseSettlementBatch',
   );
+});
+
+test('INC-5A exposes only the authorized Approval Policy and Delegation surface', () => {
+  for (const [handler, permission, operationId, stepUp] of [
+    [AccessAdminController.prototype.listApprovalPolicies, 'access-control.view', 'listApprovalPolicies', undefined],
+    [AccessAdminController.prototype.createApprovalPolicy, 'approval-policy.manage', 'createApprovalPolicy', 'createApprovalPolicy'],
+    [AccessAdminController.prototype.listDelegations, 'access-control.view', 'listDelegations', undefined],
+    [AccessAdminController.prototype.createDelegation, 'delegation.manage', 'createDelegation', 'createDelegation'],
+  ] as const) {
+    assert.equal(Reflect.getMetadata(REQUIRED_PERMISSION, handler), permission);
+    assert.equal(Reflect.getMetadata(AUTHORIZATION_OPERATION, handler), operationId);
+    assert.equal(Reflect.getMetadata(PERMISSION_SCOPE_MODE, handler), 'ONE_GRANT_RESOURCE');
+    assert.equal(Reflect.getMetadata(STEP_UP_REQUIRED, handler), stepUp);
+  }
+});
+
+test('bootstrap keeps the exact Canon administrator permission set', async () => {
+  const bootstrap = await readFile('scripts/bootstrap.ts', 'utf8');
+  assert.doesNotMatch(bootstrap, /'approval-policy\.manage'/u);
+  assert.doesNotMatch(bootstrap, /'delegation\.manage'/u);
+  assert.doesNotMatch(bootstrap, /'cashbox\.handover'/u);
+  assert.doesNotMatch(bootstrap, /'cheque\.transition'/u);
+});
+
+test('INC-5A migration preserves immutable policies and narrowed delegation evidence', async () => {
+  const migration = await readFile('migrations/0025_approval_policy_delegation.sql', 'utf8');
+  const schema = await readFile('src/database/schema.ts', 'utf8');
+  for (const source of [migration, schema]) {
+    for (const invariant of [
+      'approval_policies',
+      'approval_steps',
+      'source_grant_version',
+      'source_scope_digest',
+      'delegations_scope_check',
+      'delegations_revocation_pair',
+    ]) assert.match(source, new RegExp(invariant, 'u'));
+  }
+  assert.match(migration, /approval_policy_rewrite_guard/u);
+  assert.match(migration, /approval_step_rewrite_guard/u);
+  assert.match(migration, /policy_version > 0/u);
+  assert.match(migration, /state = 'ACTIVE'/u);
+  assert.match(migration, /document_type = 'PAYMENT'/u);
+  assert.match(migration, /CREATE FUNCTION access_grant_scope_digest/u);
+  assert.match(migration, /CREATE FUNCTION delegation_is_current/u);
+  assert.match(migration, /d\.amount_ceiling <= ag\.amount_ceiling/u);
+  assert.match(migration, /INSERT INTO approval_policies[\s\S]*FROM payment_approval_policies/u);
+  assert.match(migration, /INSERT INTO approval_policies[\s\S]*FROM receipt_approval_policies/u);
+  assert.match(migration, /INSERT INTO approval_policies[\s\S]*FROM transfer_approval_policies/u);
+  for (const path of [
+    'src/payments/payment-approval.repository.ts',
+    'src/receipts/receipt-approval.repository.ts',
+    'src/transfers/transfer.repository.ts',
+  ]) {
+    const runtime = await readFile(path, 'utf8');
+    assert.match(runtime, /approval_policies/u);
+    assert.doesNotMatch(runtime, /(?:payment|receipt|transfer)_approval_policies/u);
+  }
+  for (const path of [
+    'src/access-control/access-authorization.repository.ts',
+    'src/collection-and-settlement/settlement.repository.ts',
+    'src/transfers/transfer.repository.ts',
+  ]) {
+    assert.match(await readFile(path, 'utf8'), /delegation_is_current/u);
+  }
 });
 
 test('INC-4C Settlement migration preserves immutable evidence and lifecycle constraints', async () => {
@@ -446,12 +514,6 @@ test('Cheque Foundation operations use exact scoped permissions without step-up'
     assert.equal(Reflect.getMetadata(PERMISSION_SCOPE_MODE, handler), 'ONE_GRANT_RESOURCE');
     assert.equal(Reflect.getMetadata(STEP_UP_REQUIRED, handler), undefined);
   }
-});
-
-test('the bootstrap administrator can execute both Cheque Foundation operations', async () => {
-  const bootstrap = await readFile('scripts/bootstrap.ts', 'utf8');
-  assert.match(bootstrap, /'cheque-book\.manage'/u);
-  assert.match(bootstrap, /'cheque\.transition'/u);
 });
 
 test('Print Template operations use exact scoped permissions and operation IDs', () => {
@@ -817,7 +879,6 @@ test('operator bootstrap is local-only, advisory-locked, and transactional', asy
   assert.match(bootstrap, /await client\.query\('ROLLBACK'\)/u);
   assert.match(bootstrap, /const secondCounter = await requireTotp/u);
   assert.match(bootstrap, /totp_last_counter/u);
-  assert.match(bootstrap, /'cashbox\.handover'/u);
   assert.match(bootstrap, /for \(const character of chunk\)/u);
   assert.match(bootstrap, /reject\(new Error\('Bootstrap cancelled\.'\)\);\s+return;/u);
   assert.match(bootstrap, /resolve\(value\);\s+return;/u);

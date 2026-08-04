@@ -9,12 +9,16 @@ import {
   PRIVILEGED_PERMISSIONS,
 } from '../src/access-control/access-admin.dto';
 import {
+  AccessAdminService,
   canonicalScope,
   grantContains,
+  prepareApprovalPolicy,
+  prepareDelegation,
   prepareGrant,
 } from '../src/access-control/access-admin.service';
+import type { AccessAdminRepository } from '../src/access-control/access-admin.repository';
 import { operationPermissionGranted } from '../src/access-control/auth.guard';
-import type { SessionContext } from '../src/access-control/auth.service';
+import type { AuthService, SessionContext } from '../src/access-control/auth.service';
 import { TreasuryProblem } from '../src/common/problem';
 
 const id = (suffix: number) => `00000000-0000-4000-8000-${String(suffix).padStart(12, '0')}`;
@@ -194,6 +198,85 @@ test('bank-account scope is admitted after the BankAccount owner table is author
   );
 });
 
+test('INC-5A policy preparation preserves explicit zero-step outcomes and rejects ambiguity', () => {
+  assert.deepEqual(prepareApprovalPolicy({
+    code: 'ZERO_STEP_PAYMENT',
+    documentType: 'PAYMENT',
+    organizationWide: true,
+    steps: [],
+  }).steps, []);
+  assert.throws(() => prepareApprovalPolicy({
+    code: 'BROKEN_ORDER',
+    documentType: 'PAYMENT',
+    organizationWide: true,
+    steps: [{ order: 2, roleId: id(1), approvalsRequired: 1 }],
+  }), shortValidation);
+  assert.throws(() => prepareApprovalPolicy({
+    code: 'TWO_SUBJECTS',
+    documentType: 'PAYMENT',
+    organizationWide: true,
+    steps: [{
+      order: 1,
+      roleId: id(1),
+      approverUserId: id(2),
+      approvalsRequired: 1,
+    }],
+  }), shortValidation);
+  assert.throws(() => prepareApprovalPolicy({
+    code: 'RECEIPT_AGGREGATION',
+    documentType: 'RECEIPT',
+    organizationWide: true,
+    steps: [],
+    paymentAggregation: {
+      windowKind: 'BUSINESS_DATE',
+      keys: ['BENEFICIARY'],
+      overrideRequiresSecondApproval: true,
+    },
+  }), shortValidation);
+  assert.throws(() => prepareApprovalPolicy({
+    code: 'UNREPRESENTABLE_AMOUNT',
+    documentType: 'PAYMENT',
+    organizationWide: false,
+    scope: { minimumBaseAmount: '1'.repeat(31) },
+    steps: [],
+  }), shortValidation);
+});
+
+test('INC-5A delegation preparation requires finite non-empty narrowing input', () => {
+  assert.throws(() => prepareDelegation({
+    accessGrantId: id(1),
+    delegateUserId: id(2),
+    scope: {},
+    reason: 'cover leave',
+    validFrom: '2027-01-01T00:00:00.000Z',
+    validTo: '2027-01-02T00:00:00.000Z',
+  }), shortValidation);
+  assert.throws(() => prepareDelegation({
+    accessGrantId: id(1),
+    delegateUserId: id(2),
+    scope: { currency: 'USD', amountCeiling: { amount: '10', currency: 'EUR' } },
+    reason: 'cover leave',
+    validFrom: '2027-01-01T00:00:00.000Z',
+    validTo: '2027-01-02T00:00:00.000Z',
+  }), shortValidation);
+  assert.throws(() => prepareDelegation({
+    accessGrantId: id(1),
+    delegateUserId: id(2),
+    scope: { branchId: id(3) },
+    reason: '   ',
+    validFrom: '2027-01-01T00:00:00.000Z',
+    validTo: '2027-01-02T00:00:00.000Z',
+  }), shortValidation);
+  assert.equal(prepareDelegation({
+    accessGrantId: id(1),
+    delegateUserId: id(2),
+    scope: { branchId: id(3) },
+    reason: '  cover leave  ',
+    validFrom: '2027-01-01T00:00:00.000Z',
+    validTo: '2027-01-02T00:00:00.000Z',
+  }).reason, 'cover leave');
+});
+
 function authorization(partial: Partial<CanonicalGrantScope>) {
   const scope = {
     branchIds: [],
@@ -219,3 +302,38 @@ function problem(error: unknown, code: string, status: number): boolean {
   if (!(error instanceof TreasuryProblem) || error.getStatus() !== status) return false;
   return (error.getResponse() as { code?: string }).code === code;
 }
+
+const shortValidation = (error: unknown) => problem(error, 'TRS-GEN-001', 422);
+
+test('INC-5A scoped cursors are signed and resource-bound', async () => {
+  process.env.COMMAND_DIGEST_HMAC_KEY_BASE64 = Buffer.alloc(32, 11).toString('base64');
+  const repository = {
+    listPermissionGrants: async () => [authorization({})],
+    organizationBaseCurrency: async () => 'USD',
+    findApprovalPolicies: async () => [
+      { id: id(10), documentType: 'PAYMENT', createdAt: new Date('2026-08-08T10:00:00Z') },
+      { id: id(11), documentType: 'PAYMENT', createdAt: new Date('2026-08-08T09:00:00Z') },
+    ],
+    findDelegations: async () => {
+      throw new Error('A policy cursor reached the delegation query.');
+    },
+  } as unknown as AccessAdminRepository;
+  const service = new AccessAdminService(repository, {} as AuthService);
+  const first = await service.listApprovalPolicies(id(1), id(2), '1');
+  const cursor = first.page.nextCursor!;
+
+  await assert.rejects(
+    service.listDelegations(id(1), id(2), '1', cursor),
+    shortValidation,
+  );
+
+  const signed = JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8')) as {
+    payload: { cutoff: string };
+  };
+  signed.payload.cutoff = '2027-01-01T00:00:00.000Z';
+  const tampered = Buffer.from(JSON.stringify(signed)).toString('base64url');
+  await assert.rejects(
+    service.listApprovalPolicies(id(1), id(2), '1', tampered),
+    shortValidation,
+  );
+});

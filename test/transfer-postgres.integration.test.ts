@@ -506,19 +506,21 @@ async function seed(database: DatabaseService) {
     `, [actorGrantId, approverGrantId, effectiveOrganizationId, crossCurrency, secondApproverGrantId,
       sourceCustodianGrantId, destinationCustodianGrantId]);
     await client.query(`
-      INSERT INTO transfer_approval_policies (
-        id, organization_id, code, name, branch_id, treasury_unit_id, currency,
-        amount_minimum, amount_maximum, version, state
+      INSERT INTO approval_policies (
+        id, organization_id, code, name, document_type, organization_wide,
+        branch_id, treasury_unit_id, currency, minimum_base_amount,
+        maximum_base_amount, policy_version, state
       ) VALUES
-        ($1,$2,$3,'INC-4A exact policy',$4,$5,$6,0,1000,1,'ACTIVE'),
-        ($7,$2,$8,'INC-4A zero-step policy',$4,$5,$6,1000.00000001,2000,1,'ACTIVE')
+        ($1,$2,$3,'INC-4A exact policy','TRANSFER',false,$4,$5,$6,0,1000,1,'ACTIVE'),
+        ($7,$2,$8,'INC-4A zero-step policy','TRANSFER',false,$4,$5,$6,1000.00000001,2000,1,'ACTIVE')
     `, [policyId, effectiveOrganizationId, `TRF-${suffix}`, branchId, treasuryUnitId, currency, zeroStepPolicyId, `ZERO-${suffix}`]);
     await client.query(`
-      INSERT INTO transfer_approval_policy_steps (
-        id, organization_id, policy_id, step_order, approver_user_id, approvals_required, separation_rules
+      INSERT INTO approval_steps (
+        id, organization_id, approval_policy_id, step_order, named_approver_id,
+        approvals_required, separation_rules
       ) VALUES
-        ($1,$2,$3,1,$4,1,ARRAY['CREATOR_NOT_APPROVER','SOURCE_CUSTODIAN_NOT_APPROVER']),
-        ($5,$2,$3,2,$6,1,ARRAY['CREATOR_NOT_APPROVER','SOURCE_CUSTODIAN_NOT_APPROVER'])
+        ($1,$2,$3,1,$4,1,'["CREATOR_NOT_APPROVER","SOURCE_CUSTODIAN_NOT_APPROVER"]'::jsonb),
+        ($5,$2,$3,2,$6,1,'["CREATOR_NOT_APPROVER","SOURCE_CUSTODIAN_NOT_APPROVER"]'::jsonb)
     `, [policyStepId, effectiveOrganizationId, policyId, approverId, policyStep2Id, secondApproverId]);
     await client.query('COMMIT');
     return {
@@ -562,8 +564,8 @@ async function cleanup(database: DatabaseService, seeded: Awaited<ReturnType<typ
     await client.query(`DELETE FROM transfer_approval_snapshot_steps WHERE organization_id = $1 AND approval_snapshot_id IN (${ownedSnapshots})`, [seeded.organizationId, seeded.actorId]);
     await client.query(`DELETE FROM transfer_approval_snapshots WHERE organization_id = $1 AND transfer_document_id IN (${ownedDocuments})`, [seeded.organizationId, seeded.actorId]);
     await client.query('DELETE FROM transfer_documents WHERE organization_id = $1 AND creator_user_id = $2', [seeded.organizationId, seeded.actorId]);
-    await client.query('DELETE FROM transfer_approval_policy_steps WHERE organization_id = $1 AND policy_id = $2', [seeded.organizationId, seeded.policyId]);
-    await client.query('DELETE FROM transfer_approval_policies WHERE organization_id = $1 AND id = ANY($2::uuid[])', [
+    await client.query('DELETE FROM approval_steps WHERE organization_id = $1 AND approval_policy_id = $2', [seeded.organizationId, seeded.policyId]);
+    await client.query('DELETE FROM approval_policies WHERE organization_id = $1 AND id = ANY($2::uuid[])', [
       seeded.organizationId, [seeded.policyId, seeded.zeroStepPolicyId],
     ]);
     await client.query(`

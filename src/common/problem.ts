@@ -27,6 +27,8 @@ const titles = {
   'TRS-AUT-009': 'CSRF verification failed',
   'TRS-AUT-010': 'Fresh step-up required',
   'TRS-AUT-012': 'Access-control identity conflict',
+  'TRS-AUT-013': 'Approval policy conflict',
+  'TRS-AUT-014': 'Delegation conflict',
   'TRS-MST-001': 'Inactive reference',
   'TRS-MST-002': 'Duplicate master identity',
   'TRS-MST-003': 'Exchange rate missing or ambiguous',

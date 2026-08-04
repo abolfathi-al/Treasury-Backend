@@ -3,12 +3,11 @@ import { and, asc, eq, inArray, sql } from 'drizzle-orm';
 
 import type { DatabaseTransaction } from '../database/database.service';
 import {
+  approvalSteps,
   methodDefinitions,
   paymentApprovalActions,
   paymentApprovalAggregationParticipants,
   paymentApprovalAggregations,
-  paymentApprovalPolicies,
-  paymentApprovalPolicySteps,
   paymentApprovalSnapshotContexts,
   paymentApprovalSnapshots,
   paymentApprovalSnapshotSteps,
@@ -211,36 +210,36 @@ export class PaymentApprovalRepository {
       SELECT id, code, name, branch_id AS "branchId",
              treasury_unit_id AS "treasuryUnitId", currency,
              method_category AS "methodCategory",
-             amount_minimum::text AS "amountMinimum",
-             amount_maximum::text AS "amountMaximum",
+             minimum_base_amount::text AS "amountMinimum",
+             maximum_base_amount::text AS "amountMaximum",
              aggregation_window_kind AS "aggregationWindowKind",
-             aggregation_keys AS "aggregationKeys", version
-      FROM payment_approval_policies
+             aggregation_keys AS "aggregationKeys", policy_version AS version
+      FROM approval_policies
       WHERE organization_id = ${organizationId}
         AND document_type = 'PAYMENT' AND state = 'ACTIVE'
         AND (branch_id IS NULL OR branch_id = ${payment.branchId})
         AND (treasury_unit_id IS NULL OR treasury_unit_id = ${payment.treasuryUnitId})
         AND (currency IS NULL OR currency = ${currency})
         AND (method_category IS NULL OR method_category = ${methodCategory})
-        AND (amount_minimum IS NULL OR amount_minimum <= ${amountBasis}::numeric)
-        AND (amount_maximum IS NULL OR amount_maximum >= ${amountBasis}::numeric)
+        AND (minimum_base_amount IS NULL OR minimum_base_amount <= ${amountBasis}::numeric)
+        AND (maximum_base_amount IS NULL OR maximum_base_amount >= ${amountBasis}::numeric)
       ORDER BY id, version
       FOR SHARE
     `);
     if (!policyResult.rows.length) return [];
     const policyIds = policyResult.rows.map(({ id }) => id);
     const stepRows = await transaction.select({
-      id: paymentApprovalPolicySteps.id,
-      policyId: paymentApprovalPolicySteps.policyId,
-      stepOrder: paymentApprovalPolicySteps.stepOrder,
-      roleId: paymentApprovalPolicySteps.roleId,
-      approverUserId: paymentApprovalPolicySteps.approverUserId,
-      approvalsRequired: paymentApprovalPolicySteps.approvalsRequired,
-      separationRules: paymentApprovalPolicySteps.separationRules,
-    }).from(paymentApprovalPolicySteps).where(and(
-      eq(paymentApprovalPolicySteps.organizationId, organizationId),
-      inArray(paymentApprovalPolicySteps.policyId, policyIds),
-    )).orderBy(asc(paymentApprovalPolicySteps.policyId), asc(paymentApprovalPolicySteps.stepOrder));
+      id: approvalSteps.id,
+      policyId: approvalSteps.approvalPolicyId,
+      stepOrder: approvalSteps.stepOrder,
+      roleId: approvalSteps.requiredRoleId,
+      approverUserId: approvalSteps.namedApproverId,
+      approvalsRequired: approvalSteps.approvalsRequired,
+      separationRules: approvalSteps.separationRules,
+    }).from(approvalSteps).where(and(
+      eq(approvalSteps.organizationId, organizationId),
+      inArray(approvalSteps.approvalPolicyId, policyIds),
+    )).orderBy(asc(approvalSteps.approvalPolicyId), asc(approvalSteps.stepOrder));
     const roleIds = stepRows.flatMap(({ roleId }) => roleId ? [roleId] : []);
     const approverIds = stepRows.flatMap(({ approverUserId }) => approverUserId ? [approverUserId] : []);
     const roleRows = roleIds.length ? await transaction.select({

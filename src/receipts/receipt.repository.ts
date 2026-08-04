@@ -1669,13 +1669,30 @@ export class ReceiptRepository {
   }
 }
 
-export function storedScopeSql(permission: string, grantPredicate = ''): string {
-  return `EXISTS (
-    SELECT 1
+export function storedAuthoritySql(
+  permission: string,
+  grantPredicate = '',
+  projection = '1',
+): string {
+  return `SELECT ${projection}
     FROM access_grants ag
     JOIN roles r ON r.id = ag.role_id AND r.state = 'ACTIVE'
     JOIN role_permissions rp ON rp.role_id = r.id AND rp.permission = '${permission}'
-    WHERE ag.organization_id = $1 AND ag.user_ref_id = $2
+    JOIN LATERAL (
+      SELECT NULL::uuid AS delegation_id, NULL::uuid AS branch_id,
+             NULL::uuid AS treasury_unit_id, NULL::varchar AS document_type,
+             NULL::varchar AS method_category, NULL::varchar AS currency,
+             NULL::numeric AS amount_ceiling, NULL::varchar AS amount_ceiling_currency
+      WHERE ag.user_ref_id = $2
+      UNION ALL
+      SELECT d.id, d.branch_id, d.treasury_unit_id, d.document_type,
+             d.method_category, d.currency, d.amount_ceiling, d.amount_ceiling_currency
+      FROM delegations d
+      WHERE d.organization_id = ag.organization_id
+        AND d.access_grant_id = ag.id
+        AND delegation_is_current(d.id, ag.id, $2)
+    ) authority ON true
+    WHERE ag.organization_id = $1
       ${grantPredicate}
       AND ag.state = 'ACTIVE' AND ag.valid_from <= now()
       AND (ag.valid_to IS NULL OR ag.valid_to > now())
@@ -1748,7 +1765,33 @@ export function storedScopeSql(permission: string, grantPredicate = ''): string 
           ))
         )
       )
-  )`;
+      AND (authority.branch_id IS NULL OR authority.branch_id = rd.branch_id)
+      AND (authority.treasury_unit_id IS NULL
+        OR authority.treasury_unit_id = rd.treasury_unit_id)
+      AND (authority.document_type IS NULL OR authority.document_type = 'RECEIPT')
+      AND (authority.method_category IS NULL OR NOT EXISTS (
+        SELECT 1 FROM receipt_lines rl
+        WHERE rl.organization_id = rd.organization_id
+          AND rl.receipt_document_id = rd.id
+          AND rl.method_category <> authority.method_category
+      ))
+      AND (authority.currency IS NULL OR (
+        authority.currency = rd.base_currency
+        AND NOT EXISTS (
+          SELECT 1 FROM receipt_lines rl
+          WHERE rl.organization_id = rd.organization_id
+            AND rl.receipt_document_id = rd.id
+            AND rl.currency <> authority.currency
+        )
+      ))
+      AND (authority.amount_ceiling IS NULL OR (
+        authority.amount_ceiling_currency = rd.base_currency
+        AND authority.amount_ceiling >= rd.total_base_amount
+      ))`;
+}
+
+export function storedScopeSql(permission: string, grantPredicate = ''): string {
+  return `EXISTS (${storedAuthoritySql(permission, grantPredicate)})`;
 }
 
 function identityRate(amount: string, currency: string, enteredAt: Date): ReceiptRateSnapshot {

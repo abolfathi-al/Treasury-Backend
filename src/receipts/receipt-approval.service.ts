@@ -155,6 +155,11 @@ export class ReceiptApprovalService {
     const permission = dto.action === ReceiptApprovalAction.APPROVE
       ? 'receipt.approve' as const
       : 'receipt.reject' as const;
+    const recordedAction = {
+      [ReceiptApprovalAction.APPROVE]: 'APPROVED',
+      [ReceiptApprovalAction.REJECT]: 'REJECTED',
+      [ReceiptApprovalAction.RETURN]: 'RETURNED',
+    } as const;
     const digest = commandDigest('actOnReceiptApproval', {
       actorUserId,
       receiptId,
@@ -170,9 +175,25 @@ export class ReceiptApprovalService {
         if (replay.requestDigest !== digest || !replay.response) {
           throw new Error('IDEMPOTENCY_CONFLICT');
         }
-        if (!await this.repository.scopeAllowed(
-          client, organizationId, actorUserId, receiptId, permission,
-        )) throw new Error('SCOPE_DENIED');
+        const recorded = [...(replay.response.approvalSnapshot?.actions ?? [])]
+          .reverse()
+          .find((action) => action.actorUserId === actorUserId
+            && action.action === recordedAction[dto.action]);
+        if (!recorded) throw new Error('IDEMPOTENCY_CONFLICT');
+        const recordedStep = replay.response.approvalSnapshot?.steps
+          .find(({ order }) => order === recorded.stepOrder);
+        const authority = await this.assertApprovalAuthority(
+          client,
+          organizationId,
+          actorUserId,
+          receiptId,
+          permission,
+          replay.response.creatorUserId,
+          recordedStep,
+        );
+        if ((recorded.delegatedFromUserId ?? null) !== authority.delegatedFromUserId) {
+          throw new Error('SCOPE_DENIED');
+        }
         return replay.response;
       }
       await this.repository.startIdempotency(
@@ -201,36 +222,23 @@ export class ReceiptApprovalService {
       if (dto.action !== ReceiptApprovalAction.RETURN && !current) {
         throw new Error('STATE_CONFLICT');
       }
-      if (step) {
-        const eligible = step.approverUserId
-          ? step.approverUserId === actorUserId
-          : Boolean(step.roleId) && await this.repository.roleEligible(
-            client,
-            organizationId,
-            actorUserId,
-            receiptId,
-            permission,
-            step.roleId!,
-          );
-        if (!eligible) throw new Error('SCOPE_DENIED');
-        if (
-          step.separationRules.some((rule) =>
-            rule === 'REQUESTER_NOT_APPROVER' || rule === 'CREATOR_NOT_APPROVER')
-          && receipt.creatorUserId === actorUserId
-        ) throw new Error('SCOPE_DENIED');
-      }
-      const action = {
-        [ReceiptApprovalAction.APPROVE]: 'APPROVED',
-        [ReceiptApprovalAction.REJECT]: 'REJECTED',
-        [ReceiptApprovalAction.RETURN]: 'RETURNED',
-      } as const;
+      const authority = await this.assertApprovalAuthority(
+        client,
+        organizationId,
+        actorUserId,
+        receiptId,
+        permission,
+        receipt.creatorUserId,
+        step,
+      );
       await this.repository.insertAction(
         client,
         organizationId,
         receipt.currentApprovalSnapshotId,
         step,
         actorUserId,
-        action[dto.action],
+        authority.delegatedFromUserId,
+        recordedAction[dto.action],
         dto.reason?.trim(),
       );
       let state: 'APPROVAL_PENDING' | 'APPROVED' | 'REJECTED' | 'DRAFT';
@@ -251,6 +259,37 @@ export class ReceiptApprovalService {
       );
       return response;
     }));
+  }
+
+  private async assertApprovalAuthority(
+    client: PoolClient,
+    organizationId: string,
+    actorUserId: string,
+    receiptId: string,
+    permission: 'receipt.approve' | 'receipt.reject',
+    creatorUserId: string,
+    step?: { roleId?: string | null; approverUserId?: string | null; separationRules: string[] },
+  ) {
+    const authority = await this.repository.approvalAuthority(
+      client,
+      organizationId,
+      actorUserId,
+      receiptId,
+      permission,
+      step?.roleId ?? undefined,
+      step?.approverUserId,
+    );
+    if (!authority || (step?.approverUserId && step.approverUserId !== authority.grantUserId)) {
+      throw new Error('SCOPE_DENIED');
+    }
+    const subjects = new Set([
+      actorUserId,
+      ...(authority.delegatedFromUserId ? [authority.delegatedFromUserId] : []),
+    ]);
+    if (step?.separationRules.some((rule) =>
+      rule === 'REQUESTER_NOT_APPROVER' || rule === 'CREATOR_NOT_APPROVER')
+      && subjects.has(creatorUserId)) throw new Error('SCOPE_DENIED');
+    return authority;
   }
 
   private action(dto: ReceiptApprovalActionDto): void {

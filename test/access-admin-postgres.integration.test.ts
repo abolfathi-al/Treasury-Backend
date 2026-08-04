@@ -5,6 +5,7 @@ import test from 'node:test';
 
 import { AccessAdminRepository } from '../src/access-control/access-admin.repository';
 import { AccessAdminService } from '../src/access-control/access-admin.service';
+import { AccessAuthorizationRepository } from '../src/access-control/access-authorization.repository';
 import {
   AccessGrantCreateDto,
   SessionRevokeScope,
@@ -71,6 +72,14 @@ test('INC-1B PostgreSQL commands are scoped, replay-safe, atomic, and session-ch
       ),
       true,
     );
+    for (const [operationId, permission] of [
+      ['listApprovalPolicies', 'access-control.view'],
+      ['createApprovalPolicy', 'approval-policy.manage'],
+      ['listDelegations', 'access-control.view'],
+      ['createDelegation', 'delegation.manage'],
+    ] as const) {
+      assert.equal(operationPermissionGranted(actor, operationId, permission, 'ONE_GRANT_RESOURCE'), true);
+    }
     assert.equal(
       operationPermissionGranted(
         scopedAuth,
@@ -385,7 +394,7 @@ test('INC-1B PostgreSQL commands are scoped, replay-safe, atomic, and session-ch
       organizationWide: true,
       validFrom: '2026-01-01T00:00:00.000Z',
     };
-    const ineligibleStep = await step(
+    const ineligibleGrantStep = await step(
       database,
       fixture.actorAccountId,
       fixture.actorSessionId,
@@ -401,7 +410,7 @@ test('INC-1B PostgreSQL commands are scoped, replay-safe, atomic, and session-ch
         'grant-ineligible',
         'grant-ineligible-request',
         actor,
-        ineligibleStep,
+        ineligibleGrantStep,
       ),
       (error) => problem(error, 'TRS-GEN-005', 409),
     );
@@ -415,7 +424,7 @@ test('INC-1B PostgreSQL commands are scoped, replay-safe, atomic, and session-ch
          WHERE idempotency_key = 'grant-ineligible')::text AS idempotency,
         p.consumed_at AS proof_consumed
       FROM auth_step_up_proofs p WHERE p.token_digest = $1
-    `, [digest(ineligibleStep.proofId)]);
+    `, [digest(ineligibleGrantStep.proofId)]);
     assert.equal(rollback.rows[0]!.idempotency, '0');
     assert.equal(rollback.rows[0]!.proof_consumed, null);
 
@@ -455,6 +464,393 @@ test('INC-1B PostgreSQL commands are scoped, replay-safe, atomic, and session-ch
     assert.equal(privilegedReplay.organizationWide, true);
     assert.equal(privilegedGrant.scope, undefined);
     assert.equal(await epoch(database, fixture.targetAccountId), 2);
+
+    const policyBody = {
+      code: 'RECEIPT_BASELINE',
+      documentType: 'RECEIPT',
+      organizationWide: true,
+      steps: [],
+      separationRules: ['CREATOR_NOT_EXECUTOR', 'APPROVER_NOT_EXECUTOR'],
+    };
+    const policyStep = await step(
+      database,
+      fixture.actorAccountId,
+      fixture.actorSessionId,
+      'createApprovalPolicy',
+      '/v1/approval-policies',
+      policyBody,
+      'policy-command',
+    );
+    const policy = await service.createApprovalPolicy(
+      fixture.organizationId,
+      policyBody,
+      'policy-command',
+      'policy-request',
+      actor,
+      policyStep,
+    ) as { id: string; steps: unknown[]; state: string };
+    const policyReplay = await service.createApprovalPolicy(
+      fixture.organizationId,
+      policyBody,
+      'policy-command',
+      'policy-replay',
+      actor,
+      policyStep,
+    ) as { id: string };
+    assert.equal(policyReplay.id, policy.id);
+    assert.deepEqual(policy.steps, []);
+    assert.equal(policy.state, 'ACTIVE');
+    const repeatedRolePolicyBody = {
+      code: 'CUSTOM_REVIEW',
+      documentType: 'CUSTOM_REVIEW',
+      organizationWide: true,
+      steps: [
+        { order: 1, roleId: fixture.adminRoleId, approvalsRequired: 1 },
+        { order: 2, roleId: fixture.adminRoleId, approvalsRequired: 1 },
+      ],
+      separationRules: [],
+    };
+    const repeatedRolePolicyStep = await step(
+      database,
+      fixture.actorAccountId,
+      fixture.actorSessionId,
+      'createApprovalPolicy',
+      '/v1/approval-policies',
+      repeatedRolePolicyBody,
+      'policy-repeated-role',
+    );
+    const repeatedRolePolicy = await service.createApprovalPolicy(
+      fixture.organizationId,
+      repeatedRolePolicyBody,
+      'policy-repeated-role',
+      'policy-repeated-role-request',
+      actor,
+      repeatedRolePolicyStep,
+    ) as { id: string; steps: unknown[] };
+    assert.equal(repeatedRolePolicy.steps.length, 2);
+    const policyPage = await service.listApprovalPolicies(
+      fixture.organizationId,
+      fixture.actorUserId,
+    );
+    assert.ok(policyPage.items.some((item) => item.id === policy.id));
+    assert.ok(policyPage.items.some((item) => item.id === repeatedRolePolicy.id));
+    const ambiguousPolicy = { ...policyBody, code: 'RECEIPT_DUPLICATE' };
+    const ambiguousPolicyStep = await step(
+      database,
+      fixture.actorAccountId,
+      fixture.actorSessionId,
+      'createApprovalPolicy',
+      '/v1/approval-policies',
+      ambiguousPolicy,
+      'policy-conflict',
+    );
+    await assert.rejects(service.createApprovalPolicy(
+      fixture.organizationId,
+      ambiguousPolicy,
+      'policy-conflict',
+      'policy-conflict-request',
+      actor,
+      ambiguousPolicyStep,
+    ), (error) => problem(error, 'TRS-AUT-013', 409));
+    const policyRollback = await database.pool.query<{
+      policies: number;
+      idempotency: number;
+      consumed_at: Date | null;
+    }>(`
+      SELECT
+        (SELECT count(*)::int FROM approval_policies WHERE organization_id = $1) AS policies,
+        (SELECT count(*)::int FROM idempotency_records
+         WHERE organization_id = $1 AND idempotency_key = 'policy-conflict') AS idempotency,
+        p.consumed_at
+      FROM auth_step_up_proofs p WHERE p.token_digest = $2
+    `, [fixture.organizationId, digest(ambiguousPolicyStep.proofId)]);
+    assert.deepEqual(policyRollback.rows[0], { policies: 2, idempotency: 0, consumed_at: null });
+
+    const insufficientNamedApprovers = {
+      code: 'PAYMENT_TWO_NAMED_APPROVERS',
+      documentType: 'PAYMENT',
+      organizationWide: true,
+      steps: [{
+        order: 1,
+        approverUserId: fixture.actorUserId,
+        approvalsRequired: 2,
+      }],
+      separationRules: ['CREATOR_NOT_EXECUTOR', 'APPROVER_NOT_EXECUTOR'],
+    };
+    const insufficientNamedApproversStep = await step(
+      database,
+      fixture.actorAccountId,
+      fixture.actorSessionId,
+      'createApprovalPolicy',
+      '/v1/approval-policies',
+      insufficientNamedApprovers,
+      'policy-insufficient-named-approvers',
+    );
+    await assert.rejects(service.createApprovalPolicy(
+      fixture.organizationId,
+      insufficientNamedApprovers,
+      'policy-insufficient-named-approvers',
+      'policy-insufficient-named-approvers-request',
+      actor,
+      insufficientNamedApproversStep,
+    ), (error) => problem(error, 'TRS-AUT-013', 409));
+
+    const ineligiblePolicy = {
+      code: 'PAYMENT_INELIGIBLE_SUBJECT',
+      documentType: 'PAYMENT',
+      organizationWide: true,
+      steps: [{ order: 1, roleId: fixture.privilegedRoleId, approvalsRequired: 1 }],
+      separationRules: ['CREATOR_NOT_EXECUTOR', 'APPROVER_NOT_EXECUTOR'],
+    };
+    const ineligiblePolicyStep = await step(
+      database,
+      fixture.actorAccountId,
+      fixture.actorSessionId,
+      'createApprovalPolicy',
+      '/v1/approval-policies',
+      ineligiblePolicy,
+      'policy-ineligible-subject',
+    );
+    await assert.rejects(service.createApprovalPolicy(
+      fixture.organizationId,
+      ineligiblePolicy,
+      'policy-ineligible-subject',
+      'policy-ineligible-subject-request',
+      actor,
+      ineligiblePolicyStep,
+    ), (error) => problem(error, 'TRS-AUT-013', 409));
+
+    const concurrentPolicies = ['PAYMENT_CONCURRENT_A', 'PAYMENT_CONCURRENT_B'].map((code) => ({
+      code,
+      documentType: 'PAYMENT',
+      organizationWide: true,
+      steps: [],
+      separationRules: ['CREATOR_NOT_EXECUTOR', 'APPROVER_NOT_EXECUTOR'],
+    }));
+    const concurrentSteps = await Promise.all(concurrentPolicies.map((body, index) => step(
+      database,
+      fixture.actorAccountId,
+      fixture.actorSessionId,
+      'createApprovalPolicy',
+      '/v1/approval-policies',
+      body,
+      `policy-concurrent-${index}`,
+    )));
+    const concurrentResults = await Promise.allSettled(concurrentPolicies.map((body, index) => (
+      service.createApprovalPolicy(
+        fixture.organizationId,
+        body,
+        `policy-concurrent-${index}`,
+        `policy-concurrent-request-${index}`,
+        actor,
+        concurrentSteps[index]!,
+      )
+    )));
+    assert.equal(concurrentResults.filter((result) => result.status === 'fulfilled').length, 1);
+    assert.equal(concurrentResults.filter((result) => (
+      result.status === 'rejected' && problem(result.reason, 'TRS-AUT-013', 409)
+    )).length, 1);
+
+    const validFrom = new Date(Date.now() + 60_000).toISOString();
+    const validTo = new Date(Date.now() + 3_600_000).toISOString();
+    const delegationBody = {
+      accessGrantId: fixture.adminGrantId,
+      delegateUserId: fixture.targetUserId,
+      scope: { branchId: fixture.branchId },
+      reason: 'Temporary branch approval coverage',
+      validFrom,
+      validTo,
+    };
+    const delegationStep = await step(
+      database,
+      fixture.actorAccountId,
+      fixture.actorSessionId,
+      'createDelegation',
+      '/v1/delegations',
+      delegationBody,
+      'delegation-command',
+    );
+    const delegation = await service.createDelegation(
+      fixture.organizationId,
+      delegationBody,
+      'delegation-command',
+      'delegation-request',
+      actor,
+      delegationStep,
+    ) as { id: string; state: string; sourceGrantVersion: number };
+    const delegationReplay = await service.createDelegation(
+      fixture.organizationId,
+      delegationBody,
+      'delegation-command',
+      'delegation-replay',
+      actor,
+      delegationStep,
+    ) as { id: string };
+    assert.equal(delegationReplay.id, delegation.id);
+    assert.equal(delegation.state, 'SCHEDULED');
+    assert.equal(delegation.sourceGrantVersion, 0);
+    const delegationPage = await service.listDelegations(
+      fixture.organizationId,
+      fixture.actorUserId,
+    );
+    assert.equal(delegationPage.items[0]!.id, delegation.id);
+
+    const scopedSourceBody = {
+      userId: fixture.actorUserId,
+      roleId: fixture.adminRoleId,
+      organizationWide: false,
+      scope: {
+        branchIds: [fixture.branchId],
+        documentTypes: ['PAYMENT', 'RECEIPT'],
+        amountCeiling: { amount: '100.00', currency: 'USD' },
+      },
+      validFrom: '2026-01-01T00:00:00.000Z',
+    };
+    const scopedSourceStep = await step(
+      database,
+      fixture.actorAccountId,
+      fixture.actorSessionId,
+      'createAccessGrant',
+      '/v1/access-grants',
+      scopedSourceBody,
+      'delegation-source-grant',
+    );
+    const scopedSource = await service.createAccessGrant(
+      fixture.organizationId,
+      scopedSourceBody,
+      'delegation-source-grant',
+      'delegation-source-grant-request',
+      actor,
+      scopedSourceStep,
+    ) as { id: string };
+    const nonNarrowingDelegation = {
+      ...delegationBody,
+      accessGrantId: scopedSource.id,
+    };
+    const nonNarrowingStep = await step(
+      database,
+      fixture.actorAccountId,
+      fixture.actorSessionId,
+      'createDelegation',
+      '/v1/delegations',
+      nonNarrowingDelegation,
+      'delegation-conflict',
+    );
+    await assert.rejects(service.createDelegation(
+      fixture.organizationId,
+      nonNarrowingDelegation,
+      'delegation-conflict',
+      'delegation-conflict-request',
+      actor,
+      nonNarrowingStep,
+    ), (error) => problem(error, 'TRS-AUT-014', 409));
+    assert.equal((await database.pool.query(`
+      SELECT count(*)::int AS count FROM idempotency_records
+      WHERE organization_id = $1 AND idempotency_key = 'delegation-conflict'
+    `, [fixture.organizationId])).rows[0]!.count, 0);
+
+    const activeDelegationBody = {
+      ...delegationBody,
+      accessGrantId: scopedSource.id,
+      scope: {
+        documentType: 'PAYMENT',
+        amountCeiling: { amount: '100.00', currency: 'USD' },
+      },
+      reason: 'Active narrowed coverage',
+      validFrom: new Date(Date.now() - 1_000).toISOString(),
+    };
+    const activeDelegationStep = await step(
+      database,
+      fixture.actorAccountId,
+      fixture.actorSessionId,
+      'createDelegation',
+      '/v1/delegations',
+      activeDelegationBody,
+      'delegation-active',
+    );
+    const activeDelegation = await service.createDelegation(
+      fixture.organizationId,
+      activeDelegationBody,
+      'delegation-active',
+      'delegation-active-request',
+      actor,
+      activeDelegationStep,
+    ) as { id: string };
+    const listedDelegation = (await repository.findDelegations(fixture.organizationId))
+      .find(({ view }) => view['accessGrantId'] === scopedSource.id);
+    assert.deepEqual(listedDelegation?.authorizationScope.branchIds, [fixture.branchId]);
+    assert.deepEqual(listedDelegation?.authorizationScope.currencies, ['USD']);
+    const publicDelegation = (await service.listDelegations(
+      fixture.organizationId,
+      fixture.actorUserId,
+    )).items.find((item) => item['accessGrantId'] === scopedSource.id);
+    assert.equal(publicDelegation && 'authorizationScope' in publicDelegation, false);
+    const authorization = new AccessAuthorizationRepository();
+    const delegated = await database.db.transaction((transaction) =>
+      authorization.paymentGrants(
+        transaction,
+        fixture.organizationId,
+        fixture.targetUserId,
+        'payment.approve',
+      ));
+    const effective = delegated.find((grant) =>
+      grant.id === scopedSource.id && grant.delegatedFromUserId === fixture.actorUserId);
+    assert.ok(effective);
+    assert.deepEqual(effective?.branchIds, [fixture.branchId]);
+    assert.deepEqual(effective?.documentTypes, ['PAYMENT']);
+    assert.deepEqual(effective?.currencies, []);
+    assert.equal(effective?.amountCeiling, '100.00000000');
+    assert.equal(effective?.amountCeilingCurrency, 'USD');
+    assert.equal((await database.pool.query<{ current: boolean }>(`
+      SELECT delegation_is_current($1,$2,$3) AS current
+    `, [activeDelegation.id, scopedSource.id, fixture.targetUserId])).rows[0]!.current, true);
+    assert.equal((await database.pool.query(`
+      SELECT source_scope_digest = access_grant_scope_digest(access_grant_id) AS matches
+      FROM delegations
+      WHERE access_grant_id = $1 AND delegate_user_id = $2
+      ORDER BY created_at DESC LIMIT 1
+    `, [scopedSource.id, fixture.targetUserId])).rows[0]!.matches, true);
+
+    const corruptionClient = await database.pool.connect();
+    try {
+      await corruptionClient.query('BEGIN');
+      await corruptionClient.query('SET LOCAL session_replication_role = replica');
+      await corruptionClient.query(`
+        UPDATE delegations
+        SET document_type = NULL, amount_ceiling = NULL,
+            amount_ceiling_currency = NULL, branch_id = $2
+        WHERE id = $1
+      `, [activeDelegation.id, fixture.branchId]);
+      await corruptionClient.query('COMMIT');
+    } catch (error) {
+      await corruptionClient.query('ROLLBACK');
+      throw error;
+    } finally {
+      corruptionClient.release();
+    }
+    const corruptedDelegation = await database.db.transaction((transaction) =>
+      authorization.paymentGrants(
+        transaction,
+        fixture.organizationId,
+        fixture.targetUserId,
+        'payment.approve',
+      ));
+    assert.equal(corruptedDelegation.some((grant) =>
+      grant.id === scopedSource.id && grant.delegatedFromUserId === fixture.actorUserId), false);
+
+    await database.pool.query(
+      'UPDATE access_grants SET version = version + 1 WHERE id = $1',
+      [scopedSource.id],
+    );
+    const staleDelegation = await database.db.transaction((transaction) =>
+      authorization.paymentGrants(
+        transaction,
+        fixture.organizationId,
+        fixture.targetUserId,
+        'payment.approve',
+      ));
+    assert.equal(staleDelegation.some((grant) =>
+      grant.id === scopedSource.id && grant.delegatedFromUserId === fixture.actorUserId), false);
 
     const rotated = await auth.authenticateSession(fixture.targetToken);
     assert.ok(rotated.rotatedSessionToken);
@@ -591,7 +987,10 @@ async function seed(database: DatabaseService) {
     for (const permission of [
       'access-control.view',
       'access-grant.manage',
+      'approval-policy.manage',
+      'delegation.manage',
       'identity-account.manage',
+      'payment.approve',
       'role.manage',
     ]) {
       await client.query(
@@ -599,11 +998,12 @@ async function seed(database: DatabaseService) {
         [adminRole.rows[0]!.id, permission],
       );
     }
-    await client.query(`
+    const adminGrant = await client.query<{ id: string }>(`
       INSERT INTO access_grants (
         organization_id, user_ref_id, role_id, scope_type, scope_id,
         organization_wide, valid_from
       ) VALUES ($1,$2,$3,'ORGANIZATION',$1,true,'2020-01-01T00:00:00.000Z')
+      RETURNING id
     `, [organizationId, actorUser.rows[0]!.id, adminRole.rows[0]!.id]);
     const privilegedRole = await client.query<{ id: string }>(`
       INSERT INTO roles (organization_id, code, name)
@@ -635,6 +1035,8 @@ async function seed(database: DatabaseService) {
     return {
       organizationId,
       branchId: branch.rows[0]!.id,
+      adminGrantId: adminGrant.rows[0]!.id,
+      adminRoleId: adminRole.rows[0]!.id,
       actorUserId: actorUser.rows[0]!.id,
       actorAccountId: actorAccount.rows[0]!.id,
       actorSessionId: actorSession.rows[0]!.id,
@@ -661,6 +1063,8 @@ function sessionContext(fixture: Awaited<ReturnType<typeof seed>>): SessionConte
     organizationPermissions: [
       'access-control.view',
       'access-grant.manage',
+      'approval-policy.manage',
+      'delegation.manage',
       'identity-account.manage',
       'role.manage',
     ],
@@ -678,6 +1082,8 @@ function sessionContext(fixture: Awaited<ReturnType<typeof seed>>): SessionConte
       effectivePermissions: [
         'access-control.view',
         'access-grant.manage',
+        'approval-policy.manage',
+        'delegation.manage',
         'identity-account.manage',
         'role.manage',
       ],
@@ -802,6 +1208,9 @@ async function cleanup(database: DatabaseService): Promise<void> {
   const client = await database.pool.connect();
   try {
     await client.query('BEGIN');
+    await client.query('ALTER TABLE delegations DISABLE TRIGGER USER');
+    await client.query('ALTER TABLE approval_steps DISABLE TRIGGER USER');
+    await client.query('ALTER TABLE approval_policies DISABLE TRIGGER USER');
     for (const table of [
       'auth_step_up_proofs',
       'auth_challenges',
@@ -810,6 +1219,9 @@ async function cleanup(database: DatabaseService): Promise<void> {
       'auth_password_attempt_reservations',
       'auth_throttle_buckets',
       'auth_recovery_attempts',
+      'delegations',
+      'approval_steps',
+      'approval_policies',
       'access_grant_currency_scopes',
       'access_grant_method_category_scopes',
       'access_grant_document_type_scopes',
@@ -836,6 +1248,9 @@ async function cleanup(database: DatabaseService): Promise<void> {
     ]) {
       await client.query(`DELETE FROM ${table}`);
     }
+    await client.query('ALTER TABLE delegations ENABLE TRIGGER USER');
+    await client.query('ALTER TABLE approval_steps ENABLE TRIGGER USER');
+    await client.query('ALTER TABLE approval_policies ENABLE TRIGGER USER');
     await client.query('COMMIT');
   } catch (error) {
     await client.query('ROLLBACK');

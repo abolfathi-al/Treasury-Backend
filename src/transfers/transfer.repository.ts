@@ -18,8 +18,6 @@ import {
   receivedCheques,
   roles,
   transferApprovalActions,
-  transferApprovalPolicies,
-  transferApprovalPolicySteps,
   transferApprovalSnapshots,
   transferApprovalSnapshotSteps,
   transferAssetItems,
@@ -333,11 +331,40 @@ export class TransferRepository {
                 SELECT 1 FROM delegations d
                 WHERE d.organization_id = ag.organization_id
                   AND d.access_grant_id = ag.id
-                  AND d.grantor_user_id = ag.user_ref_id
-                  AND d.delegate_user_id = ${actorUserId}
-                  AND d.revoked_at IS NULL
-                  AND d.valid_from <= now()
-                  AND d.valid_to > now()
+                  AND delegation_is_current(d.id, ag.id, ${actorUserId})
+                  AND (
+                    d.branch_id IS NULL
+                    OR (
+                      cardinality(td.endpoint_branch_ids) > 0
+                      AND NOT EXISTS (
+                        SELECT 1 FROM unnest(td.endpoint_branch_ids) endpoint(id)
+                        WHERE endpoint.id <> d.branch_id
+                      )
+                    )
+                  )
+                  AND (
+                    d.treasury_unit_id IS NULL
+                    OR (
+                      cardinality(td.endpoint_treasury_unit_ids) > 0
+                      AND NOT EXISTS (
+                        SELECT 1 FROM unnest(td.endpoint_treasury_unit_ids) endpoint(id)
+                        WHERE endpoint.id <> d.treasury_unit_id
+                      )
+                    )
+                  )
+                  AND (d.document_type IS NULL OR d.document_type = 'TRANSFER')
+                  AND d.method_category IS NULL
+                  AND (
+                    d.currency IS NULL
+                    OR (d.currency = td.source_currency AND d.currency = td.destination_currency)
+                  )
+                  AND (
+                    d.amount_ceiling IS NULL
+                    OR (
+                      d.amount_ceiling_currency = td.source_currency
+                      AND td.source_amount <= d.amount_ceiling
+                    )
+                  )
               )
             )
             AND ag.state = 'ACTIVE' AND ag.valid_from <= now() AND (ag.valid_to IS NULL OR ag.valid_to > now())
@@ -596,20 +623,20 @@ export class TransferRepository {
       roleId: string | null; roleName: string | null; roleState: string | null; approverUserId: string | null;
       approverName: string | null; approverState: string | null; approvalsRequired: number | null; separationRules: string[] | null;
     }>(sql`
-      SELECT p.id, p.code, p.name, p.branch_id AS "branchId", p.treasury_unit_id AS "treasuryUnitId", p.currency, p.amount_minimum AS "amountMinimum", p.amount_maximum AS "amountMaximum", p.version,
-        s.id AS "stepId", s.step_order AS "stepOrder", s.role_id AS "roleId", r.name AS "roleName", r.state AS "roleState",
-        s.approver_user_id AS "approverUserId", u.display_name AS "approverName", u.state AS "approverState",
+      SELECT p.id, p.code, p.name, p.branch_id AS "branchId", p.treasury_unit_id AS "treasuryUnitId", p.currency, p.minimum_base_amount AS "amountMinimum", p.maximum_base_amount AS "amountMaximum", p.policy_version AS version,
+        s.id AS "stepId", s.step_order AS "stepOrder", s.required_role_id AS "roleId", r.name AS "roleName", r.state AS "roleState",
+        s.named_approver_id AS "approverUserId", u.display_name AS "approverName", u.state AS "approverState",
         s.approvals_required AS "approvalsRequired", s.separation_rules AS "separationRules"
-      FROM transfer_approval_policies p
-      LEFT JOIN transfer_approval_policy_steps s ON s.organization_id = p.organization_id AND s.policy_id = p.id
-      LEFT JOIN roles r ON r.organization_id = s.organization_id AND r.id = s.role_id
-      LEFT JOIN user_refs u ON u.organization_id = s.organization_id AND u.id = s.approver_user_id
-      WHERE p.organization_id = ${organizationId} AND p.state = 'ACTIVE'
+      FROM approval_policies p
+      LEFT JOIN approval_steps s ON s.organization_id = p.organization_id AND s.approval_policy_id = p.id
+      LEFT JOIN roles r ON r.organization_id = s.organization_id AND r.id = s.required_role_id
+      LEFT JOIN user_refs u ON u.organization_id = s.organization_id AND u.id = s.named_approver_id
+      WHERE p.organization_id = ${organizationId} AND p.document_type = 'TRANSFER' AND p.state = 'ACTIVE'
         AND (p.branch_id IS NULL OR p.branch_id = ${branchId})
         AND (p.treasury_unit_id IS NULL OR p.treasury_unit_id = ${treasuryUnitId})
         AND (p.currency IS NULL OR p.currency = ${currency})
-        AND (p.amount_minimum IS NULL OR p.amount_minimum <= ${amount})
-        AND (p.amount_maximum IS NULL OR p.amount_maximum >= ${amount})
+        AND (p.minimum_base_amount IS NULL OR p.minimum_base_amount <= ${amount})
+        AND (p.maximum_base_amount IS NULL OR p.maximum_base_amount >= ${amount})
       ORDER BY p.id, s.step_order
     `);
     const policies = new Map<string, TransferPolicy>();

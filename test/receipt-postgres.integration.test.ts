@@ -43,6 +43,24 @@ import {
   FoundationEffectsRepository,
   FoundationEffectsService,
 } from '../src/foundation-effects/foundation-effects.service';
+
+async function deleteApprovalPolicyForTest(
+  database: DatabaseService,
+  policyId: string,
+): Promise<void> {
+  const client = await database.pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query('SET LOCAL session_replication_role = replica');
+    await client.query('DELETE FROM approval_policies WHERE id = $1', [policyId]);
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
+}
 import { ReceiptExecutionRepository } from '../src/receipts/receipt-execution.repository';
 import { ReceiptExecutionService } from '../src/receipts/receipt-execution.service';
 
@@ -632,10 +650,10 @@ test('Receipt draft create/read/replace is semantic, idempotent, versioned, and 
     );
     const ambiguousPolicyId = randomUUID();
     await database.pool.query(`
-      INSERT INTO receipt_approval_policies (
-        id, organization_id, code, name, document_type,
-        currency, method_category, version, state
-      ) VALUES ($1,$2,$3,'Ambiguous cash approval','RECEIPT',$4,'CASH',1,'ACTIVE')
+      INSERT INTO approval_policies (
+        id, organization_id, code, name, document_type, organization_wide,
+        currency, method_category, policy_version, state
+      ) VALUES ($1,$2,$3,'Ambiguous cash approval','RECEIPT',false,$4,'CASH',1,'ACTIVE')
     `, [
       ambiguousPolicyId,
       seeded.organizationId,
@@ -657,10 +675,7 @@ test('Receipt draft create/read/replace is semantic, idempotent, versioned, and 
       (await service.get(seeded.organizationId, seeded.actorId, replaced.id)).version,
       1,
     );
-    await database.pool.query(
-      'DELETE FROM receipt_approval_policies WHERE id = $1',
-      [ambiguousPolicyId],
-    );
+    await deleteApprovalPolicyForTest(database, ambiguousPolicyId);
 
     const submitted = await approvalService.submit(
       seeded.organizationId,
@@ -698,10 +713,137 @@ test('Receipt draft create/read/replace is semantic, idempotent, versioned, and 
       ),
       isProblemCode('TRS-GEN-007'),
     );
+    const secondGrantorId = randomUUID();
+    const secondGrantorAccountId = randomUUID();
+    const secondGrantorGrantId = randomUUID();
+    const secondGrantorDelegationId = randomUUID();
+    const ambiguousAuthorityClient = await database.pool.connect();
+    try {
+      await ambiguousAuthorityClient.query('BEGIN');
+      await ambiguousAuthorityClient.query(`
+        INSERT INTO user_refs (id, organization_id, subject_key, display_name)
+        VALUES ($1,$2,$3,'Second receipt grantor')
+      `, [
+        secondGrantorId,
+        seeded.organizationId,
+        `receipt-second-grantor-${secondGrantorId}`,
+      ]);
+      await ambiguousAuthorityClient.query(`
+        INSERT INTO identity_accounts (
+          id, user_ref_id, normalized_login, password_hash
+        ) VALUES ($1,$2,$3,'hash')
+      `, [
+        secondGrantorAccountId,
+        secondGrantorId,
+        `receipt-second-grantor-${secondGrantorId}`,
+      ]);
+      await ambiguousAuthorityClient.query(`
+        INSERT INTO access_grants (
+          id, organization_id, user_ref_id, role_id, scope_type, scope_id,
+          organization_wide
+        ) VALUES ($1,$2,$3,$4,'ORGANIZATION',$2,false)
+      `, [
+        secondGrantorGrantId,
+        seeded.organizationId,
+        secondGrantorId,
+        seeded.roleId,
+      ]);
+      await ambiguousAuthorityClient.query(`
+        INSERT INTO access_grant_treasury_unit_scopes (access_grant_id, treasury_unit_id)
+        VALUES ($1,$2)
+      `, [secondGrantorGrantId, seeded.treasuryUnitId]);
+      await ambiguousAuthorityClient.query(`
+        INSERT INTO delegations (
+          id, organization_id, access_grant_id, source_grant_version,
+          source_scope_digest, grantor_user_id, delegate_user_id,
+          document_type, reason, valid_from, valid_to
+        )
+        SELECT $1,$2,ag.id,ag.version,access_grant_scope_digest(ag.id),$3,$4,
+               'RECEIPT','Ambiguous receipt authority',now() - interval '1 minute',
+               now() + interval '1 hour'
+        FROM access_grants ag WHERE ag.id = $5
+      `, [
+        secondGrantorDelegationId,
+        seeded.organizationId,
+        secondGrantorId,
+        seeded.delegateId,
+        secondGrantorGrantId,
+      ]);
+      await ambiguousAuthorityClient.query('COMMIT');
+    } catch (error) {
+      await ambiguousAuthorityClient.query('ROLLBACK');
+      throw error;
+    } finally {
+      ambiguousAuthorityClient.release();
+    }
+    await assert.rejects(approvalService.act(
+      seeded.organizationId,
+      seeded.delegateId,
+      replaced.id,
+      { action: ReceiptApprovalAction.APPROVE },
+      'receipt-approve-ambiguous-authority',
+      '"2"',
+      'receipt-approve-ambiguous-authority-request',
+    ), isProblemCode('TRS-GEN-003'));
+    assert.equal((await service.get(
+      seeded.organizationId, seeded.actorId, replaced.id,
+    )).version, 2);
+    const ambiguousAuthorityCleanup = await database.pool.connect();
+    try {
+      await ambiguousAuthorityCleanup.query('BEGIN');
+      await ambiguousAuthorityCleanup.query('SET LOCAL session_replication_role = replica');
+      await ambiguousAuthorityCleanup.query('DELETE FROM delegations WHERE id = $1', [
+        secondGrantorDelegationId,
+      ]);
+      await ambiguousAuthorityCleanup.query(`
+        DELETE FROM access_grant_treasury_unit_scopes WHERE access_grant_id = $1
+      `, [secondGrantorGrantId]);
+      await ambiguousAuthorityCleanup.query('DELETE FROM access_grants WHERE id = $1', [
+        secondGrantorGrantId,
+      ]);
+      await ambiguousAuthorityCleanup.query('DELETE FROM identity_accounts WHERE id = $1', [
+        secondGrantorAccountId,
+      ]);
+      await ambiguousAuthorityCleanup.query('DELETE FROM user_refs WHERE id = $1', [
+        secondGrantorId,
+      ]);
+      await ambiguousAuthorityCleanup.query('COMMIT');
+    } catch (error) {
+      await ambiguousAuthorityCleanup.query('ROLLBACK');
+      throw error;
+    } finally {
+      ambiguousAuthorityCleanup.release();
+    }
+    const unrelatedDirectGrantId = randomUUID();
+    const directGrantClient = await database.pool.connect();
+    try {
+      await directGrantClient.query('BEGIN');
+      await directGrantClient.query(`
+        INSERT INTO access_grants (
+          id, organization_id, user_ref_id, role_id, scope_type, scope_id,
+          organization_wide
+        ) VALUES ($1,$2,$3,$4,'ORGANIZATION',$2,false)
+      `, [
+        unrelatedDirectGrantId,
+        seeded.organizationId,
+        seeded.delegateId,
+        seeded.roleId,
+      ]);
+      await directGrantClient.query(`
+        INSERT INTO access_grant_treasury_unit_scopes (access_grant_id, treasury_unit_id)
+        VALUES ($1,$2)
+      `, [unrelatedDirectGrantId, seeded.treasuryUnitId]);
+      await directGrantClient.query('COMMIT');
+    } catch (error) {
+      await directGrantClient.query('ROLLBACK');
+      throw error;
+    } finally {
+      directGrantClient.release();
+    }
     const approvalAttempts = await Promise.allSettled([
       approvalService.act(
         seeded.organizationId,
-        seeded.actorId,
+        seeded.delegateId,
         replaced.id,
         { action: ReceiptApprovalAction.APPROVE },
         'receipt-approve-a',
@@ -710,7 +852,7 @@ test('Receipt draft create/read/replace is semantic, idempotent, versioned, and 
       ),
       approvalService.act(
         seeded.organizationId,
-        seeded.actorId,
+        seeded.delegateId,
         replaced.id,
         { action: ReceiptApprovalAction.APPROVE },
         'receipt-approve-b',
@@ -737,7 +879,7 @@ test('Receipt draft create/read/replace is semantic, idempotent, versioned, and 
     assert.equal(afterFirstApproval.approvalSnapshot?.steps[1]?.state, 'CURRENT');
     const approved = await approvalService.act(
       seeded.organizationId,
-      seeded.actorId,
+      seeded.delegateId,
       replaced.id,
       { action: ReceiptApprovalAction.APPROVE },
       'receipt-approve-second',
@@ -749,6 +891,27 @@ test('Receipt draft create/read/replace is semantic, idempotent, versioned, and 
     assert.equal(approved.approvalSnapshot?.documentVersion, 2);
     assert.equal(approved.approvalSnapshot?.steps[1]?.state, 'APPROVED');
     assert.equal(approved.approvalSnapshot?.actions[0]?.action, 'APPROVED');
+    assert.equal(approved.approvalSnapshot?.actions[0]?.delegatedFromUserId, undefined);
+    assert.equal(approved.approvalSnapshot?.actions[1]?.delegatedFromUserId, seeded.actorId);
+    const directGrantCleanupClient = await database.pool.connect();
+    try {
+      await directGrantCleanupClient.query('BEGIN');
+      await directGrantCleanupClient.query('SET LOCAL session_replication_role = replica');
+      await directGrantCleanupClient.query(
+        'DELETE FROM access_grant_treasury_unit_scopes WHERE access_grant_id = $1',
+        [unrelatedDirectGrantId],
+      );
+      await directGrantCleanupClient.query(
+        'DELETE FROM access_grants WHERE id = $1',
+        [unrelatedDirectGrantId],
+      );
+      await directGrantCleanupClient.query('COMMIT');
+    } catch (error) {
+      await directGrantCleanupClient.query('ROLLBACK');
+      throw error;
+    } finally {
+      directGrantCleanupClient.release();
+    }
     await assert.rejects(
       database.pool.query(
         `DELETE FROM receipt_approval_actions WHERE id = $1`,
@@ -1935,6 +2098,9 @@ async function seedReceiptFoundation(database: DatabaseService) {
   `, [organizationId, receiptBusinessDate]);
   const initialReceiptCounter = initialCounter.rows[0]?.nextValue ?? null;
   const actorId = randomUUID();
+  const actorAccountId = randomUUID();
+  const delegateId = randomUUID();
+  const delegateAccountId = randomUUID();
   const treasuryUnitId = randomUUID();
   const branchId = randomUUID();
   const partyId = randomUUID();
@@ -1986,6 +2152,21 @@ async function seedReceiptFoundation(database: DatabaseService) {
       INSERT INTO user_refs (id, organization_id, subject_key, display_name)
       VALUES ($1,$2,$3,'کاربر ثبت دریافت')
     `, [actorId, organizationId, `actor-${suffix}`]);
+    await client.query(`
+      INSERT INTO user_refs (id, organization_id, subject_key, display_name)
+      VALUES ($1,$2,$3,'جانشین تأیید دریافت')
+    `, [delegateId, organizationId, `delegate-${suffix}`]);
+    await client.query(`
+      INSERT INTO identity_accounts (id, user_ref_id, normalized_login, password_hash)
+      VALUES ($1,$2,$3,'hash'),($4,$5,$6,'hash')
+    `, [
+      actorAccountId,
+      actorId,
+      `receipt-actor-${suffix.toLowerCase()}`,
+      delegateAccountId,
+      delegateId,
+      `receipt-delegate-${suffix.toLowerCase()}`,
+    ]);
     await client.query(`
       INSERT INTO bank_types (id, organization_id, code, display_name)
       VALUES ($1,$2,$3,'نوع بانک آزمون دریافت')
@@ -2077,12 +2258,12 @@ async function seedReceiptFoundation(database: DatabaseService) {
       VALUES ($1,$2,$3,'ثبت‌کننده دریافت')
     `, [roleId, organizationId, `RCP-ROLE-${suffix}`]);
     await client.query(`
-      INSERT INTO receipt_approval_policies (
-        id, organization_id, code, name, document_type,
-        currency, method_category, version, state
+      INSERT INTO approval_policies (
+        id, organization_id, code, name, document_type, organization_wide,
+        currency, method_category, policy_version, state
       ) VALUES
-        ($1,$2,$3,'Cash approval','RECEIPT',$5,'CASH',1,'ACTIVE'),
-        ($4,$2,$6,'Offset no approval','RECEIPT',$5,'OFFSET',1,'ACTIVE')
+        ($1,$2,$3,'Cash approval','RECEIPT',false,$5,'CASH',1,'ACTIVE'),
+        ($4,$2,$6,'Offset no approval','RECEIPT',false,$5,'OFFSET',1,'ACTIVE')
     `, [
       cashApprovalPolicyId,
       organizationId,
@@ -2092,12 +2273,12 @@ async function seedReceiptFoundation(database: DatabaseService) {
       `RCP-OFFSET-${suffix}`,
     ]);
     await client.query(`
-      INSERT INTO receipt_approval_policy_steps (
-        organization_id, policy_id, step_order, role_id,
-        approver_user_id, approvals_required, separation_rules
+      INSERT INTO approval_steps (
+        organization_id, approval_policy_id, step_order, required_role_id,
+        named_approver_id, approvals_required, separation_rules
       ) VALUES
-        ($1,$2,1,$3,NULL,1,'{}'),
-        ($1,$2,2,NULL,$4,1,'{}')
+        ($1,$2,1,$3,NULL,1,'[]'::jsonb),
+        ($1,$2,2,NULL,$4,1,'[]'::jsonb)
     `, [organizationId, cashApprovalPolicyId, roleId, actorId]);
     await client.query(`
       INSERT INTO role_permissions (role_id, permission)
@@ -2115,10 +2296,22 @@ async function seedReceiptFoundation(database: DatabaseService) {
       INSERT INTO access_grant_treasury_unit_scopes (access_grant_id, treasury_unit_id)
       VALUES ($1,$2)
     `, [grantId, treasuryUnitId]);
+    await client.query(`
+      INSERT INTO delegations (
+        organization_id, access_grant_id, source_grant_version, source_scope_digest,
+        grantor_user_id, delegate_user_id, document_type, reason, valid_from, valid_to
+      )
+      SELECT $1,$2,ag.version,access_grant_scope_digest(ag.id),$3,$4,'RECEIPT',
+             'Receipt approval coverage',now() - interval '1 minute',now() + interval '1 hour'
+      FROM access_grants ag WHERE ag.id = $2
+    `, [organizationId, grantId, actorId, delegateId]);
     await client.query('COMMIT');
     return {
       organizationId,
       actorId,
+      actorAccountId,
+      delegateId,
+      delegateAccountId,
       treasuryUnitId,
       branchId,
       partyId,
@@ -2153,6 +2346,9 @@ async function cleanupReceiptFoundation(
   seeded: {
     organizationId: string;
     actorId: string;
+    actorAccountId: string;
+    delegateId: string;
+    delegateAccountId: string;
     treasuryUnitId: string;
     branchId: string;
     partyId: string;
@@ -2317,7 +2513,8 @@ async function cleanupReceiptFoundation(
           scope = $2
           OR scope LIKE $3
           OR scope LIKE $4
-          OR scope LIKE $5
+      OR scope LIKE $5
+          OR scope LIKE $7
           OR (
             (
               scope LIKE 'executeReceipt:%'
@@ -2336,6 +2533,7 @@ async function cleanupReceiptFoundation(
       `submitReceipt:${seeded.actorId}:%`,
       `actOnReceiptApproval:${seeded.actorId}:%`,
       seeded.actorId,
+      `actOnReceiptApproval:${seeded.delegateId}:%`,
     ]);
     await client.query(`
       DELETE FROM receipt_documents
@@ -2355,13 +2553,14 @@ async function cleanupReceiptFoundation(
     ]) {
       await client.query(`DELETE FROM ${table} WHERE access_grant_id = $1`, [seeded.grantId]);
     }
+    await client.query('DELETE FROM delegations WHERE access_grant_id = $1', [seeded.grantId]);
     await client.query('DELETE FROM access_grants WHERE id = $1', [seeded.grantId]);
     await client.query(
-      'DELETE FROM receipt_approval_policy_steps WHERE policy_id = ANY($1::uuid[])',
+      'DELETE FROM approval_steps WHERE approval_policy_id = ANY($1::uuid[])',
       [[seeded.cashApprovalPolicyId, seeded.zeroStepPolicyId]],
     );
     await client.query(
-      'DELETE FROM receipt_approval_policies WHERE id = ANY($1::uuid[])',
+      'DELETE FROM approval_policies WHERE id = ANY($1::uuid[])',
       [[seeded.cashApprovalPolicyId, seeded.zeroStepPolicyId]],
     );
     await client.query('DELETE FROM role_permissions WHERE role_id = $1', [seeded.roleId]);
@@ -2437,8 +2636,16 @@ async function cleanupReceiptFoundation(
       [seeded.organizationId, seeded.branchId],
     );
     await client.query(
+      'DELETE FROM identity_accounts WHERE id = ANY($1::uuid[])',
+      [[seeded.actorAccountId, seeded.delegateAccountId]],
+    );
+    await client.query(
       'DELETE FROM user_refs WHERE organization_id = $1 AND id = $2',
       [seeded.organizationId, seeded.actorId],
+    );
+    await client.query(
+      'DELETE FROM user_refs WHERE organization_id = $1 AND id = $2',
+      [seeded.organizationId, seeded.delegateId],
     );
     await client.query(
       'DELETE FROM currencies WHERE organization_id = $1 AND code = $2',

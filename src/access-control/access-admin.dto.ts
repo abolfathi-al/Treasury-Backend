@@ -6,12 +6,14 @@ import {
   IsBoolean,
   IsDefined,
   IsIn,
+  IsInt,
   IsISO8601,
   IsOptional,
   IsString,
   IsUUID,
   Matches,
   MaxLength,
+  Min,
   MinLength,
   ValidateNested,
 } from 'class-validator';
@@ -123,6 +125,18 @@ export const METHOD_CATEGORIES = [
   'OTHER_CONTROLLED',
 ] as const;
 
+export const APPROVAL_SEPARATION_RULES = [
+  'REQUESTER_NOT_APPROVER',
+  'CREATOR_NOT_APPROVER',
+  'CREATOR_NOT_EXECUTOR',
+  'APPROVER_NOT_EXECUTOR',
+  'SOURCE_CUSTODIAN_NOT_APPROVER',
+  'CUSTODIAN_NOT_RECONCILER',
+  'EXECUTOR_NOT_ACCOUNTING_EXPORTER',
+] as const;
+
+export const APPROVAL_AGGREGATION_KEYS = ['BENEFICIARY', 'EXTERNAL_OBLIGATION'] as const;
+
 export class RoleCreateDto {
   @IsString() @Matches(/^[A-Z][A-Z0-9_-]{1,63}$/u) code!: string;
   @IsString() @MinLength(1) @MaxLength(160) name!: string;
@@ -185,6 +199,64 @@ export class AccessGrantCreateDto {
   @IsOptional() @IsISO8601({ strict: true }) validFrom?: string;
   @IsOptional() @IsISO8601({ strict: true }) validTo?: string;
   @IsOptional() @IsString() @MinLength(1) @MaxLength(500) reason?: string;
+}
+
+export class ApprovalPolicyScopeDto {
+  @IsOptional() @IsUUID() branchId?: string;
+  @IsOptional() @IsUUID() treasuryUnitId?: string;
+  @IsOptional() @Matches(/^[A-Z0-9]{3,8}$/u) currency?: string;
+  @IsOptional() @IsIn(METHOD_CATEGORIES as readonly string[]) methodCategory?: string;
+  @IsOptional() @Matches(/^(0|[1-9][0-9]{0,29})(\.[0-9]{1,8})?$/u) minimumBaseAmount?: string;
+  @IsOptional() @Matches(/^(0|[1-9][0-9]{0,29})(\.[0-9]{1,8})?$/u) maximumBaseAmount?: string;
+}
+
+export class ApprovalPolicyStepDto {
+  @IsInt() @Min(1) order!: number;
+  @IsOptional() @IsUUID() roleId?: string;
+  @IsOptional() @IsUUID() approverUserId?: string;
+  @IsInt() @Min(1) approvalsRequired!: number;
+}
+
+export class ApprovalPaymentAggregationDto {
+  @IsIn(['BUSINESS_DATE']) windowKind!: 'BUSINESS_DATE';
+  @IsArray() @ArrayMinSize(1) @ArrayUnique()
+  @IsIn(APPROVAL_AGGREGATION_KEYS as readonly string[], { each: true })
+  keys!: string[];
+  @IsDefined() @IsBoolean() overrideRequiresSecondApproval!: boolean;
+}
+
+export class ApprovalPolicyCreateDto {
+  @IsString() @Matches(/^[A-Z][A-Z0-9_-]{1,63}$/u) code!: string;
+  @IsString() @MinLength(1) @MaxLength(64) documentType!: string;
+  @IsDefined() @IsBoolean() organizationWide!: boolean;
+  @IsOptional() @ValidateNested() @Type(() => ApprovalPolicyScopeDto)
+  scope?: ApprovalPolicyScopeDto;
+  @IsArray() @ArrayUnique((step: ApprovalPolicyStepDto) => step.order)
+  @ValidateNested({ each: true }) @Type(() => ApprovalPolicyStepDto)
+  steps!: ApprovalPolicyStepDto[];
+  @IsOptional() @IsArray() @ArrayUnique()
+  @IsIn(APPROVAL_SEPARATION_RULES as readonly string[], { each: true })
+  separationRules?: string[];
+  @IsOptional() @ValidateNested() @Type(() => ApprovalPaymentAggregationDto)
+  paymentAggregation?: ApprovalPaymentAggregationDto;
+}
+
+export class DelegationScopeDto {
+  @IsOptional() @IsUUID() branchId?: string;
+  @IsOptional() @IsUUID() treasuryUnitId?: string;
+  @IsOptional() @IsString() @MinLength(1) @MaxLength(64) documentType?: string;
+  @IsOptional() @IsIn(METHOD_CATEGORIES as readonly string[]) methodCategory?: string;
+  @IsOptional() @Matches(/^[A-Z0-9]{3,8}$/u) currency?: string;
+  @IsOptional() @ValidateNested() @Type(() => GrantMoneyDto) amountCeiling?: GrantMoneyDto;
+}
+
+export class DelegationCreateDto {
+  @IsUUID() accessGrantId!: string;
+  @IsUUID() delegateUserId!: string;
+  @IsDefined() @ValidateNested() @Type(() => DelegationScopeDto) scope!: DelegationScopeDto;
+  @IsString() @MinLength(1) @MaxLength(500) reason!: string;
+  @IsISO8601({ strict: true }) validFrom!: string;
+  @IsISO8601({ strict: true }) validTo!: string;
 }
 
 export enum SessionRevokeScope {
