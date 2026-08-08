@@ -14,8 +14,18 @@ import { IdentityRepository } from '../src/access-control/identity.repository';
 import { IdentityService } from '../src/access-control/identity.service';
 import { CashboxRepository } from '../src/cashbox-and-custody/cashbox.repository';
 import { CashboxService } from '../src/cashbox-and-custody/cashbox.service';
+import {
+  CashboxDayApprovalCommand,
+} from '../src/cashbox-and-custody/cashbox-operations.dto';
+import { CashboxOperationsRepository } from '../src/cashbox-and-custody/cashbox-operations.repository';
+import { CashboxOperationsService } from '../src/cashbox-and-custody/cashbox-operations.service';
+import { digest } from '../src/common/http';
 import { TreasuryProblem } from '../src/common/problem';
 import { DatabaseService } from '../src/database/database.service';
+import {
+  FoundationEffectsRepository,
+  FoundationEffectsService,
+} from '../src/foundation-effects/foundation-effects.service';
 import { MasterDataRepository } from '../src/master-data/master-data.repository';
 import { MasterDataService } from '../src/master-data/master-data.service';
 
@@ -37,6 +47,12 @@ test('INC-1D PostgreSQL create/list/handover are scoped, replay-safe, atomic, an
       {} as AuthService,
     ),
     new MasterDataService(new MasterDataRepository(database)),
+  );
+  const operations = new CashboxOperationsService(
+    database,
+    new CashboxOperationsRepository(),
+    new AccessAuthorizationService(new AccessAuthorizationRepository()),
+    new FoundationEffectsService(new FoundationEffectsRepository()),
   );
   try {
     const fixture = await seed(database);
@@ -337,6 +353,172 @@ test('INC-1D PostgreSQL create/list/handover are scoped, replay-safe, atomic, an
         AND state NOT IN ('COMPLETED', 'REJECTED', 'CANCELLED')
     `, [second.id]);
     assert.equal(open.rows[0]!.count, 1);
+
+    const closeCashbox = await service.create(
+      fixture.organizationId,
+      fixture.primaryUserId,
+      createDto(fixture, 'CLOSE'),
+      'cashbox-close',
+      'request-create-close',
+    );
+    const closeContext = {
+      organizationId: fixture.organizationId,
+      actorUserId: fixture.primaryUserId,
+      key: 'close-rollback',
+      requestId: 'request-close-rollback',
+    };
+    await assert.rejects(
+      operations.closeDay({
+        ...closeContext,
+        actorUserId: fixture.otherUserId,
+        key: 'close-wrong-custodian',
+      }, closeCashbox.id, '2026-08-08', {
+        counts: [{ currency: 'USD', countedAmount: '0' }],
+        observedInstrumentIds: [],
+      }),
+      (error) => problem(error, 'TRS-CSH-002', 409),
+    );
+    await assert.rejects(
+      operations.closeDay(closeContext, closeCashbox.id, '2026-08-08', {
+        counts: [{ currency: 'USD', countedAmount: '0' }],
+        observedInstrumentIds: ['00000000-0000-4000-8000-999999999999'],
+      }),
+      (error) => problem(error, 'TRS-GEN-001', 422),
+    );
+    const closed = await operations.closeDay(closeContext, closeCashbox.id, '2026-08-08', {
+      counts: [{ currency: 'USD', countedAmount: '0' }],
+      observedInstrumentIds: [],
+    });
+    assert.equal(closed.state, 'CLOSED');
+    assert.equal((await operations.closeDay(
+      closeContext,
+      closeCashbox.id,
+      '2026-08-08',
+      { counts: [{ currency: 'USD', countedAmount: '0' }], observedInstrumentIds: [] },
+    )).id, closed.id);
+
+    const approvalCashbox = await service.create(
+      fixture.organizationId,
+      fixture.primaryUserId,
+      createDto(fixture, 'APPROVAL'),
+      'cashbox-approval',
+      'request-create-approval',
+    );
+    const approval = await operations.requestCloseApproval({
+      organizationId: fixture.organizationId,
+      actorUserId: fixture.primaryUserId,
+      key: 'request-close-approval',
+      requestId: 'request-close-approval',
+    }, approvalCashbox.id, '2026-08-08', {
+      counts: [{ currency: 'USD', countedAmount: '1', varianceReason: 'Count variance' }],
+      observedInstrumentIds: [],
+    });
+    const actionContext = {
+      organizationId: fixture.organizationId,
+      actorUserId: fixture.otherUserId,
+      physicalSessionId: '00000000-0000-4000-8000-000000000099',
+      key: 'approval-stale',
+      requestId: 'request-approval-stale',
+      ifMatch: '"2"',
+      stepUp: {
+        proofId: '00000000-0000-4000-8000-000000000098',
+        command: {
+          operationId: 'actOnCashboxDayApproval',
+          method: 'POST',
+          path: `/v1/cashbox-day-approval-requests/${approval.id}/actions`,
+          bodyDigest: 'stale-before-proof-consumption',
+          idempotencyKey: 'approval-stale',
+        },
+      },
+    };
+    await assert.rejects(
+      operations.actOnApproval(actionContext, approval.id, {
+        action: CashboxDayApprovalCommand.APPROVE,
+      }),
+      (error) => problem(error, 'TRS-GEN-006', 409),
+    );
+
+    const proof = await createStepUpProof(database, fixture.otherUserId, {
+      method: 'POST',
+      path: `/v1/cashbox-day-approval-requests/${approval.id}/actions`,
+      bodyDigest: 'approval-replay-body',
+      idempotencyKey: 'approval-replay',
+    });
+    const replayContext = {
+      organizationId: fixture.organizationId,
+      actorUserId: fixture.otherUserId,
+      physicalSessionId: proof.sessionId,
+      key: 'approval-replay',
+      requestId: 'request-approval-replay',
+      ifMatch: '"1"',
+      stepUp: {
+        proofId: proof.proofId,
+        command: {
+          operationId: 'actOnCashboxDayApproval',
+          method: 'POST',
+          path: `/v1/cashbox-day-approval-requests/${approval.id}/actions`,
+          bodyDigest: 'approval-replay-body',
+          idempotencyKey: 'approval-replay',
+        },
+      },
+    };
+    const approved = await operations.actOnApproval(replayContext, approval.id, {
+      action: CashboxDayApprovalCommand.APPROVE,
+    });
+    assert.equal(approved.state, 'APPROVED');
+    assert.deepEqual(
+      await operations.actOnApproval(replayContext, approval.id, {
+        action: CashboxDayApprovalCommand.APPROVE,
+      }),
+      approved,
+    );
+    const consumed = await database.pool.query<{ consumed_at: Date | null }>(`
+      SELECT consumed_at FROM auth_step_up_proofs WHERE token_digest = $1
+    `, [digest(proof.proofId)]);
+    assert.ok(consumed.rows[0]!.consumed_at);
+    const varianceClosed = await operations.closeDay({
+      organizationId: fixture.organizationId,
+      actorUserId: fixture.primaryUserId,
+      key: 'close-approved-variance',
+      requestId: 'request-close-approved-variance',
+    }, approvalCashbox.id, '2026-08-08', {
+      counts: [{ currency: 'USD', countedAmount: '1', varianceReason: 'Count variance' }],
+      observedInstrumentIds: [],
+      approvalActionId: approved.action!.id,
+    });
+    assert.equal(varianceClosed.state, 'CLOSED');
+
+    const concurrentCashbox = await service.create(
+      fixture.organizationId,
+      fixture.primaryUserId,
+      createDto(fixture, 'CONCURRENT_CLOSE'),
+      'cashbox-concurrent-close',
+      'request-create-concurrent-close',
+    );
+    const concurrentClose = await Promise.allSettled([
+      operations.closeDay({
+        organizationId: fixture.organizationId,
+        actorUserId: fixture.primaryUserId,
+        key: 'concurrent-close-one',
+        requestId: 'request-concurrent-close-one',
+      }, concurrentCashbox.id, '2026-08-08', {
+        counts: [{ currency: 'USD', countedAmount: '0' }],
+        observedInstrumentIds: [],
+      }),
+      operations.closeDay({
+        organizationId: fixture.organizationId,
+        actorUserId: fixture.primaryUserId,
+        key: 'concurrent-close-two',
+        requestId: 'request-concurrent-close-two',
+      }, concurrentCashbox.id, '2026-08-08', {
+        counts: [{ currency: 'USD', countedAmount: '0' }],
+        observedInstrumentIds: [],
+      }),
+    ]);
+    assert.equal(concurrentClose.filter(({ status }) => status === 'fulfilled').length, 1);
+    const closeRejected = concurrentClose.find(({ status }) => status === 'rejected');
+    assert.ok(closeRejected?.status === 'rejected');
+    assert.ok(problem(closeRejected.reason, 'TRS-CSH-004', 409));
   } finally {
     await cleanup(database);
     await database.onModuleDestroy();
@@ -412,7 +594,16 @@ async function seed(database: DatabaseService) {
     `, [organizationId]);
     await client.query(`
       INSERT INTO role_permissions (role_id, permission)
-      VALUES ($1, 'cashbox.view'), ($1, 'cashbox.manage'), ($1, 'cashbox.handover')
+      VALUES
+        ($1, 'cashbox.view'),
+        ($1, 'cashbox.manage'),
+        ($1, 'cashbox.handover'),
+        ($1, 'cashbox.close'),
+        ($1, 'cashbox.reopen'),
+        ($1, 'cashbox.approve'),
+        ($1, 'cashbox.reject'),
+        ($1, 'petty-cash.create'),
+        ($1, 'petty-cash.view')
     `, [role.rows[0]!.id]);
     let primaryGrantId = '';
     for (const subject of ['primary', 'other']) {
@@ -462,7 +653,20 @@ async function cleanup(database: DatabaseService): Promise<void> {
   const client = await database.pool.connect();
   try {
     await client.query('BEGIN');
+    await client.query(`
+      TRUNCATE
+        cashbox_days,
+        movement_facts,
+        audit_events,
+        outbox_events,
+        petty_cash_profiles
+      CASCADE
+    `);
     for (const table of [
+      'outbox_events',
+      'audit_events',
+      'movement_facts',
+      'petty_cash_profiles',
       'cashbox_handover_instruments',
       'cashbox_handover_money',
       'cashbox_handovers',
@@ -509,6 +713,51 @@ async function cleanup(database: DatabaseService): Promise<void> {
   } finally {
     client.release();
   }
+}
+
+async function createStepUpProof(
+  database: DatabaseService,
+  userId: string,
+  command: {
+    method: string;
+    path: string;
+    bodyDigest: string;
+    idempotencyKey: string;
+  },
+): Promise<{ proofId: string; sessionId: string }> {
+  const account = await database.pool.query<{ id: string }>(`
+    INSERT INTO identity_accounts (user_ref_id, normalized_login, password_hash, privileged)
+    VALUES ($1, $2, 'test-only', true)
+    RETURNING id
+  `, [userId, `cashbox-approver-${userId}`]);
+  const session = await database.pool.query<{ id: string }>(`
+    INSERT INTO auth_sessions (
+      identity_account_id, token_digest, xsrf_digest, authenticated_at, last_rotated_at,
+      idle_expires_at, absolute_expires_at, assurance
+    ) VALUES ($1,$2,$3,now(),now(),now() + interval '15 minutes',now() + interval '8 hours','PASSWORD_TOTP')
+    RETURNING id
+  `, [account.rows[0]!.id, digest(`session:${userId}`), digest(`xsrf:${userId}`)]);
+  const proofId = `proof:${userId}`;
+  const challenge = await database.pool.query<{ id: string }>(`
+    INSERT INTO auth_challenges (
+      identity_account_id, session_id, token_digest, kind, http_method, http_path,
+      request_body_digest, idempotency_key, expires_at
+    ) VALUES ($1,$2,$3,'STEP_UP',$4,$5,$6,$7,now() + interval '5 minutes')
+    RETURNING id
+  `, [
+    account.rows[0]!.id,
+    session.rows[0]!.id,
+    digest(`challenge:${userId}`),
+    command.method,
+    command.path,
+    command.bodyDigest,
+    command.idempotencyKey,
+  ]);
+  await database.pool.query(`
+    INSERT INTO auth_step_up_proofs (challenge_id, token_digest, expires_at)
+    VALUES ($1,$2,now() + interval '5 minutes')
+  `, [challenge.rows[0]!.id, digest(proofId)]);
+  return { proofId, sessionId: session.rows[0]!.id };
 }
 
 function problem(error: unknown, code: string, status: number): boolean {

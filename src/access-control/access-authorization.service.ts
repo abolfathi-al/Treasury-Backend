@@ -32,6 +32,16 @@ export interface SettlementReadScope {
   fingerprint: string;
 }
 
+export interface CashboxAuthorizationContext {
+  branchId: string | null;
+  treasuryUnitId: string;
+  cashboxIds: string[];
+  bankAccountIds: string[];
+  currencies: string[];
+  amount?: string;
+  amountCurrency?: string;
+}
+
 @Injectable()
 export class AccessAuthorizationService {
   constructor(
@@ -92,6 +102,39 @@ export class AccessAuthorizationService {
       actorUserId,
       context,
     );
+  }
+
+  async canOperateCashbox(
+    transaction: DatabaseTransaction,
+    organizationId: string,
+    actorUserId: string,
+    context: CashboxAuthorizationContext,
+    permission: 'cashbox.close' | 'cashbox.reopen' | 'cashbox.approve'
+      | 'cashbox.reject' | 'petty-cash.create' | 'petty-cash.view',
+  ): Promise<boolean> {
+    const grants = await this.repository.paymentGrants(
+      transaction,
+      organizationId,
+      actorUserId,
+      permission,
+    );
+    return grants.some((grant) => (
+      covers(grant.branchIds, context.branchId ? [context.branchId] : [])
+      && covers(grant.treasuryUnitIds, [context.treasuryUnitId])
+      && covers(grant.cashboxIds, context.cashboxIds)
+      && covers(grant.bankAccountIds, context.bankAccountIds)
+      && covers(grant.currencies, context.currencies)
+      && grant.documentTypes.length === 0
+      && grant.methodCategories.length === 0
+      && (
+        grant.amountCeiling === null
+        || (
+          context.amount !== undefined
+          && context.amountCurrency === grant.amountCeilingCurrency
+          && decimal(context.amount) <= decimal(grant.amountCeiling)
+        )
+      )
+    ));
   }
 
   async canCreatePaymentRequest(

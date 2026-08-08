@@ -1474,9 +1474,16 @@ test('Receipt execution is atomic, actor-idempotent, versioned and race-safe', {
     );
     await database.pool.query(`
       INSERT INTO cashbox_days (
-        organization_id, cashbox_id, business_date, close_cycle, state
-      ) VALUES ($1,$2,$3,1,'CLOSED')
-    `, [seeded.organizationId, seeded.cashboxId, receiptBusinessDate]);
+        organization_id, cashbox_id, business_date, close_cycle, state,
+        business_number, closed_by_user_id, closed_at
+      ) VALUES ($1,$2,$3,1,'CLOSED',$4,$5,now())
+    `, [
+      seeded.organizationId,
+      seeded.cashboxId,
+      receiptBusinessDate,
+      `TEST-CLOSE-${suffix}`,
+      executorId,
+    ]);
     const rollbackKey = `execute-rollback-${suffix}`;
     await assert.rejects(
       execution.execute({ ...command, key: rollbackKey }),
@@ -1500,11 +1507,7 @@ test('Receipt execution is atomic, actor-idempotent, versioned and race-safe', {
       rollbackKey,
     ]);
     assert.equal(rolledBack.rows[0]!.count, '0');
-    await database.pool.query(`
-      UPDATE cashbox_days
-      SET state = 'OPEN', version = version + 1
-      WHERE organization_id = $1 AND cashbox_id = $2 AND business_date = $3
-    `, [seeded.organizationId, seeded.cashboxId, receiptBusinessDate]);
+    await database.pool.query('TRUNCATE cashbox_days CASCADE');
 
     const competing = [
       { ...command, key: `execute-a-${suffix}` },
@@ -1892,19 +1895,22 @@ test('Receipt execution is atomic, actor-idempotent, versioned and race-safe', {
       WHERE organization_id = $1 AND id = $2
     `, [seeded.organizationId, draft.id]);
     await database.pool.query(`
-      UPDATE cashbox_days
-      SET state = 'CLOSED', version = version + 1
-      WHERE organization_id = $1 AND cashbox_id = $2 AND business_date = $3
-    `, [seeded.organizationId, seeded.cashboxId, receiptBusinessDate]);
+      INSERT INTO cashbox_days (
+        organization_id, cashbox_id, business_date, close_cycle, state,
+        business_number, closed_by_user_id, closed_at
+      ) VALUES ($1,$2,$3,1,'CLOSED',$4,$5,now())
+    `, [
+      seeded.organizationId,
+      seeded.cashboxId,
+      receiptBusinessDate,
+      `TEST-REVERSE-CLOSE-${suffix}`,
+      executorId,
+    ]);
     await assert.rejects(
       execution.reverse(reverseCommand, reverseBody),
       isProblemCode('TRS-GEN-009'),
     );
-    await database.pool.query(`
-      UPDATE cashbox_days
-      SET state = 'OPEN', version = version + 1
-      WHERE organization_id = $1 AND cashbox_id = $2 AND business_date = $3
-    `, [seeded.organizationId, seeded.cashboxId, receiptBusinessDate]);
+    await database.pool.query('TRUNCATE cashbox_days CASCADE');
     const reversed = await execution.reverse(reverseCommand, reverseBody);
     reversalReceiptId = reversed.reversalReceipt.id;
     assert.equal(reversed.originalReceipt.state, 'REVERSED');

@@ -10,8 +10,9 @@ import {
 
 export interface MovementFactCommand {
   organizationId: string;
-  owner?: 'domain.receipts' | 'domain.payments' | 'domain.transfers' | 'domain.collection-and-settlement';
-  sourceType?: 'RECEIPT' | 'Payment' | 'Transfer' | 'SettlementBatch';
+  owner?: 'domain.receipts' | 'domain.payments' | 'domain.transfers'
+    | 'domain.collection-and-settlement' | 'domain.cashbox-and-custody';
+  sourceType?: 'RECEIPT' | 'Payment' | 'Transfer' | 'SettlementBatch' | 'CashboxDay';
   sourceId: string;
   sourceLineId?: string;
   effectKey: string;
@@ -58,7 +59,8 @@ export class FoundationEffectsRepository {
       organizationId: string;
       requestId: string;
       actorUserId: string;
-      entityType?: 'Receipt' | 'Payment' | 'Transfer' | 'BankInstruction' | 'AccountingExport' | 'SettlementBatch';
+      entityType?: 'Receipt' | 'Payment' | 'Transfer' | 'BankInstruction'
+        | 'AccountingExport' | 'SettlementBatch' | 'CashboxDay' | 'PettyCashProfile';
       entityId: string;
       action: string;
       reason?: string;
@@ -81,7 +83,8 @@ export class FoundationEffectsRepository {
     transaction: DatabaseTransaction,
     input: {
       organizationId: string;
-      aggregateType?: 'Receipt' | 'Payment' | 'Transfer' | 'BankInstruction' | 'AccountingExport' | 'SettlementBatch';
+      aggregateType?: 'Receipt' | 'Payment' | 'Transfer' | 'BankInstruction'
+        | 'AccountingExport' | 'SettlementBatch' | 'CashboxDay';
       aggregateId: string;
       aggregateVersion: number;
       eventType: string;
