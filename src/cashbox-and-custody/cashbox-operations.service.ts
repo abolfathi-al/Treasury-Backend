@@ -6,6 +6,7 @@ import { commandDigest, digest, stableJson } from '../common/http';
 import { TreasuryProblem } from '../common/problem';
 import { DatabaseService, type DatabaseTransaction } from '../database/database.service';
 import { FoundationEffectsService } from '../foundation-effects/foundation-effects.service';
+import { MasterDataService } from '../master-data/master-data.service';
 import {
   CashboxDayApprovalActionDto,
   CashboxDayApprovalCommand,
@@ -58,6 +59,8 @@ export class CashboxOperationsService {
     private readonly authorization: AccessAuthorizationService,
     @Inject(FoundationEffectsService)
     private readonly effects: FoundationEffectsService,
+    @Inject(MasterDataService)
+    private readonly masterData: MasterDataService,
   ) {}
 
   createPettyCashFund(
@@ -102,6 +105,15 @@ export class CashboxOperationsService {
         || (dto.evidenceThreshold && dto.evidenceThreshold.currency !== cashbox.mainCurrency)
         || (dto.evidenceThreshold
           && decimal(dto.evidenceThreshold.amount) > decimal(dto.ceiling.amount))) {
+        throw new Error('VALIDATION');
+      }
+      const currency = (await this.masterData.findCurrencyDecimalPlaces(
+        transaction, context.organizationId, [cashbox.mainCurrency],
+      ))[0];
+      if (!currency
+        || fractionalDigits(dto.ceiling.amount) > currency.decimalPlaces
+        || (dto.evidenceThreshold
+          && fractionalDigits(dto.evidenceThreshold.amount) > currency.decimalPlaces)) {
         throw new Error('VALIDATION');
       }
       const mainControl = cashbox.currencies.find(({ currency }) => currency === cashbox.mainCurrency);
@@ -212,15 +224,18 @@ export class CashboxOperationsService {
   ): Promise<CashboxDayApprovalRequestView> {
     this.path(cashboxId, businessDate);
     this.commandContext(context);
-    const normalized = normalizeClose(dto);
     const scope = `requestCashboxDayCloseApproval:${cashboxId}:${businessDate}`;
-    const requestDigest = commandDigest('requestCashboxDayCloseApproval', {
-      actorUserId: context.actorUserId,
-      cashboxId,
-      businessDate,
-      body: normalized,
-    });
     return this.map(() => this.database.db.transaction(async (transaction) => {
+      await this.assertSubmittedCountPrecision(
+        transaction, context.organizationId, dto.counts,
+      );
+      const normalized = normalizeClose(dto);
+      const requestDigest = commandDigest('requestCashboxDayCloseApproval', {
+        actorUserId: context.actorUserId,
+        cashboxId,
+        businessDate,
+        body: normalized,
+      });
       const replay = await this.idempotency<CashboxDayApprovalRequestView>(
         transaction, context, scope, requestDigest,
       );
@@ -233,7 +248,9 @@ export class CashboxOperationsService {
       );
       if (latest?.state === 'CLOSED') throw new Error('DAY_ALREADY_CLOSED');
       this.assertCustodian(cashbox, context.actorUserId);
-      const counts = this.counts(cashbox, normalized.counts, true);
+      const counts = await this.counts(
+        transaction, context.organizationId, cashbox, dto.counts, true,
+      );
       if (!counts.some(({ varianceAmount }) => !isZero(varianceAmount))) {
         throw new Error('VALIDATION');
       }
@@ -451,65 +468,106 @@ export class CashboxOperationsService {
   ): Promise<CashboxDayView> {
     this.path(cashboxId, businessDate);
     this.commandContext(context);
-    const normalized = normalizeClose(dto);
     const scope = `closeCashboxDay:${cashboxId}:${businessDate}`;
-    const requestDigest = commandDigest('closeCashboxDay', {
-      actorUserId: context.actorUserId,
-      cashboxId,
-      businessDate,
-      body: { ...normalized, approvalActionId: dto.approvalActionId ?? null },
-    });
-    return this.map(() => this.database.db.transaction(async (transaction) => {
-      const replay = await this.idempotency<CashboxDayView>(
-        transaction, context, scope, requestDigest,
-      );
-      if (replay) return replay;
-      const cashbox = await this.requiredCashbox(
-        transaction, context.organizationId, cashboxId, businessDate,
-      );
-      const latest = await this.repository.latestDay(
-        transaction, context.organizationId, cashboxId, businessDate, 'update',
-      );
-      if (latest?.state === 'CLOSED') throw new Error('DAY_ALREADY_CLOSED');
-      this.assertCustodian(cashbox, context.actorUserId);
-      await this.assertCashboxScope(transaction, context, cashbox, 'cashbox.close');
-      const counts = this.counts(cashbox, normalized.counts, false);
-      this.assertObserved(cashbox, normalized.observedInstrumentIds);
-      const variances = counts.filter(({ varianceAmount }) => !isZero(varianceAmount));
-      const source = sourceVersion(latest);
-      if (variances.length) {
-        if (!dto.approvalActionId) throw new Error('APPROVAL_REQUIRED');
-        const approved = await this.repository.approvedAction(
-          transaction, context.organizationId, dto.approvalActionId,
+    return this.map(async () => {
+      const reserved = await this.database.db.transaction(async (transaction) => {
+        await this.assertSubmittedCountPrecision(
+          transaction, context.organizationId, dto.counts,
         );
-        const expectedDigest = closeSubjectDigest(cashboxId, businessDate, source, normalized);
-        if (!approved || approved.action !== 'APPROVED'
-          || approved.requestedByUserId !== context.actorUserId
-          || approved.commandKind !== CashboxDayApprovalCommandKind.CLOSE
-          || approved.cashboxId !== cashboxId
-          || approved.businessDate !== businessDate
-          || approved.commandDigest !== expectedDigest
-          || (approved.sourceDayId ?? undefined) !== source.id
-          || Number(approved.sourceDayVersion) !== source.version) {
-          throw new Error('VALID_APPROVAL_MISSING');
-        }
-        const request = await this.repository.lockApprovalRequest(
-          transaction, context.organizationId, approved.requestId,
+        const normalized = normalizeClose(dto);
+        const requestDigest = commandDigest('closeCashboxDay', {
+          actorUserId: context.actorUserId,
+          cashboxId,
+          businessDate,
+          body: { ...normalized, approvalActionId: dto.approvalActionId ?? null },
+        });
+        await this.repository.acquireIdempotencyLock(
+          transaction, context.organizationId, scope, context.key,
         );
-        const payload = request?.commandBody as unknown as ApprovalBody | undefined;
-        if (!payload?.snapshotDigest || payload.snapshotDigest !== snapshotDigest(cashbox, counts)) {
-          throw new Error('VALID_APPROVAL_MISSING');
+        const existingResult = await this.repository.findIdempotency<CashboxDayView>(
+          transaction, context.organizationId, scope, context.key,
+        );
+        if (existingResult) {
+          if (existingResult.requestDigest !== requestDigest || !existingResult.response) {
+            throw new Error('IDEMPOTENCY_CONFLICT');
+          }
+          return { response: existingResult.response } as const;
         }
-      } else if (dto.approvalActionId) {
-        throw new Error('VALIDATION');
-      }
-      const businessNumber = await this.repository.reserveBusinessNumber(transaction, businessDate);
+        const existing = await this.repository.findBusinessNumberReservation(
+          transaction, context.organizationId, scope, context.key,
+        );
+        if (existing) {
+          if (existing.commandDigest !== requestDigest) throw new Error('IDEMPOTENCY_CONFLICT');
+          return { reservation: existing, normalized, requestDigest } as const;
+        }
+        const { cashbox, latest } = await this.prepareClose(
+          transaction, context, cashboxId, businessDate, normalized, dto,
+        );
+        const number = await this.masterData.reserveCashboxDayNumber(
+          transaction,
+          context.organizationId,
+          cashbox.branchId,
+          cashbox.treasuryUnitId,
+          businessDate,
+        );
+        return {
+          normalized,
+          requestDigest,
+          reservation: await this.repository.insertBusinessNumberReservation(transaction, {
+            organizationId: context.organizationId,
+            numberingRuleId: number.id,
+            numberingRuleVersion: number.version,
+            operation: number.operation,
+            branchId: number.branchId,
+            treasuryUnitId: number.treasuryUnitId,
+            fiscalYear: number.fiscalYear,
+            fiscalYearStartsOn: number.fiscalYearStartsOn,
+            fiscalYearEndsOn: number.fiscalYearEndsOn,
+            prefix: number.prefix,
+            numberWidth: number.numberWidth,
+            sequenceValue: number.sequenceValue,
+            businessNumber: number.businessNumber,
+            cashboxId,
+            businessDate,
+            closeCycle: latest?.closeCycle ?? 1,
+            reservedByUserId: context.actorUserId,
+            commandDigest: requestDigest,
+            reservationScope: scope,
+            idempotencyKey: context.key,
+          }),
+        } as const;
+      });
+      if ('response' in reserved) return reserved.response!;
+
+      const { normalized, requestDigest } = reserved;
+
+      return this.database.db.transaction(async (transaction) => {
+        const finalReplay = await this.idempotency<CashboxDayView>(
+          transaction, context, scope, requestDigest,
+        );
+        if (finalReplay) return finalReplay;
+        const { cashbox, latest, counts, variances } = await this.prepareClose(
+          transaction, context, cashboxId, businessDate, normalized, dto,
+        );
+        const reservation = reserved.reservation;
+        if (reservation.state !== 'RESERVED'
+          || reservation.operation !== 'CASHBOX_DAY_CLOSE'
+          || reservation.cashboxId !== cashboxId
+          || reservation.businessDate !== businessDate
+          || reservation.closeCycle !== (latest?.closeCycle ?? 1)
+          || reservation.branchId !== cashbox.branchId
+          || reservation.treasuryUnitId !== cashbox.treasuryUnitId
+          || businessDate < reservation.fiscalYearStartsOn
+          || businessDate > reservation.fiscalYearEndsOn
+          || reservation.businessNumber !== `${reservation.prefix}${reservation.fiscalYear}-${String(reservation.sequenceValue).padStart(reservation.numberWidth, '0')}`) {
+          throw new Error('STATE_CONFLICT');
+        }
       const dayId = await this.repository.closeDay(transaction, {
         organizationId: context.organizationId,
         cashboxId,
         businessDate,
         actorUserId: context.actorUserId,
-        businessNumber,
+        businessNumber: reservation.businessNumber,
         bookSnapshotDigest: snapshotDigest(cashbox, counts),
         heldInstrumentSnapshot: cashbox.heldInstruments,
         observedInstrumentIds: normalized.observedInstrumentIds,
@@ -517,6 +575,9 @@ export class CashboxOperationsService {
         latest,
         counts,
       });
+      if (!await this.repository.consumeBusinessNumberReservation(
+        transaction, context.organizationId, reservation.id, dayId,
+      )) throw new Error('STATE_CONFLICT');
       const movementFactIds: string[] = [];
       for (const variance of variances) {
         movementFactIds.push(await this.effects.appendMovement(transaction, {
@@ -569,7 +630,8 @@ export class CashboxOperationsService {
         transaction, context.organizationId, scope, context.key, response, 200,
       );
       return response;
-    }));
+      });
+    });
   }
 
   reopenDay(
@@ -659,6 +721,58 @@ export class CashboxOperationsService {
     if (!cashbox) throw new Error('RESOURCE_HIDDEN');
     if (cashbox.state !== 'ACTIVE') throw new Error('STATE_CONFLICT');
     return cashbox;
+  }
+
+  private async prepareClose(
+    transaction: DatabaseTransaction,
+    context: CommandContext,
+    cashboxId: string,
+    businessDate: string,
+    normalized: CashboxDayCloseApprovalRequestDto,
+    dto: CloseDayDto,
+  ) {
+    const cashbox = await this.requiredCashbox(
+      transaction, context.organizationId, cashboxId, businessDate,
+    );
+    const latest = await this.repository.latestDay(
+      transaction, context.organizationId, cashboxId, businessDate, 'update',
+    );
+    if (latest?.state === 'CLOSED') throw new Error('DAY_ALREADY_CLOSED');
+    this.assertCustodian(cashbox, context.actorUserId);
+    await this.assertCashboxScope(transaction, context, cashbox, 'cashbox.close');
+    const counts = await this.counts(
+      transaction, context.organizationId, cashbox, dto.counts, false,
+    );
+    this.assertObserved(cashbox, normalized.observedInstrumentIds);
+    const variances = counts.filter(({ varianceAmount }) => !isZero(varianceAmount));
+    const source = sourceVersion(latest);
+    if (variances.length) {
+      if (!dto.approvalActionId) throw new Error('APPROVAL_REQUIRED');
+      const approved = await this.repository.approvedAction(
+        transaction, context.organizationId, dto.approvalActionId,
+      );
+      const expectedDigest = closeSubjectDigest(cashboxId, businessDate, source, normalized);
+      if (!approved || approved.action !== 'APPROVED'
+        || approved.requestedByUserId !== context.actorUserId
+        || approved.commandKind !== CashboxDayApprovalCommandKind.CLOSE
+        || approved.cashboxId !== cashboxId
+        || approved.businessDate !== businessDate
+        || approved.commandDigest !== expectedDigest
+        || (approved.sourceDayId ?? undefined) !== source.id
+        || Number(approved.sourceDayVersion) !== source.version) {
+        throw new Error('VALID_APPROVAL_MISSING');
+      }
+      const request = await this.repository.lockApprovalRequest(
+        transaction, context.organizationId, approved.requestId,
+      );
+      const payload = request?.commandBody as unknown as ApprovalBody | undefined;
+      if (!payload?.snapshotDigest || payload.snapshotDigest !== snapshotDigest(cashbox, counts)) {
+        throw new Error('VALID_APPROVAL_MISSING');
+      }
+    } else if (dto.approvalActionId) {
+      throw new Error('VALIDATION');
+    }
+    return { cashbox, latest, counts, variances };
   }
 
   private async idempotency<T>(
@@ -756,7 +870,9 @@ export class CashboxOperationsService {
       if (permission === 'cashbox.reopen') return false;
       const command = view.closeCommand;
       if (!command) return false;
-      const counts = this.counts(cashbox, normalizeClose(command).counts, true);
+      const counts = await this.counts(
+        transaction, organizationId, cashbox, normalizeClose(command).counts, true,
+      );
       return this.closeScopeAllowed(transaction, organizationId, actorUserId, cashbox, counts, permission);
     }
     return this.authorization.canOperateCashbox(
@@ -840,17 +956,28 @@ export class CashboxOperationsService {
     )) throw new Error('SCOPE_DENIED');
   }
 
-  private counts(
+  private async counts(
+    transaction: DatabaseTransaction,
+    organizationId: string,
     cashbox: CashboxOperationFacts,
     submitted: CashboxDayCloseApprovalRequestDto['counts'],
     approvalRequest: boolean,
-  ): CashboxDayCountView[] {
+  ): Promise<CashboxDayCountView[]> {
     if (new Set(submitted.map(({ currency }) => currency)).size !== submitted.length) {
       throw new Error('VALIDATION');
     }
     const sorted = [...submitted].sort((left, right) => left.currency.localeCompare(right.currency));
     if (stableJson(sorted.map(({ currency }) => currency))
       !== stableJson(cashbox.currencies.map(({ currency }) => currency))) {
+      throw new Error('VALIDATION');
+    }
+    const decimalPlaces = new Map((await this.masterData.findCurrencyDecimalPlaces(
+      transaction, organizationId, sorted.map(({ currency }) => currency),
+    )).map((currency) => [currency.currency, currency.decimalPlaces]));
+    if (decimalPlaces.size !== sorted.length
+      || sorted.some((count) => fractionalDigits(count.countedAmount) > decimalPlaces.get(count.currency)!)
+      || cashbox.currencies.some(({ currency, bookAmount }) =>
+        fractionalDigits(normalizeDecimal(bookAmount)) > (decimalPlaces.get(currency) ?? -1))) {
       throw new Error('VALIDATION');
     }
     const counts = sorted.map((count) => {
@@ -869,6 +996,23 @@ export class CashboxOperationsService {
       };
     });
     return counts;
+  }
+
+  private async assertSubmittedCountPrecision(
+    transaction: DatabaseTransaction,
+    organizationId: string,
+    submitted: CashboxDayCloseApprovalRequestDto['counts'],
+  ): Promise<void> {
+    const currencyCodes = submitted.map(({ currency }) => currency);
+    if (new Set(currencyCodes).size !== submitted.length) throw new Error('VALIDATION');
+    const decimalPlaces = new Map((await this.masterData.findCurrencyDecimalPlaces(
+      transaction, organizationId, currencyCodes,
+    )).map((currency) => [currency.currency, currency.decimalPlaces]));
+    if (decimalPlaces.size !== submitted.length
+      || submitted.some((count) =>
+        fractionalDigits(count.countedAmount) > decimalPlaces.get(count.currency)!)) {
+      throw new Error('VALIDATION');
+    }
   }
 
   private assertObserved(cashbox: CashboxOperationFacts, observed: string[]): void {
@@ -1103,16 +1247,20 @@ function uniqueDefined(values: Array<string | null>): string[] {
 function decimal(value: string): bigint {
   const negative = value.startsWith('-');
   const [whole, fraction = ''] = (negative ? value.slice(1) : value).split('.');
-  const scaled = BigInt(whole) * 1_000_000_000_000n + BigInt(fraction.padEnd(12, '0'));
+  const scaled = BigInt(whole) * 100_000_000n + BigInt(fraction.padEnd(8, '0'));
   return negative ? -scaled : scaled;
 }
 
 function decimalString(value: bigint): string {
   const negative = value < 0n;
   const absolute = negative ? -value : value;
-  const whole = absolute / 1_000_000_000_000n;
-  const fraction = (absolute % 1_000_000_000_000n).toString().padStart(12, '0').replace(/0+$/u, '');
+  const whole = absolute / 100_000_000n;
+  const fraction = (absolute % 100_000_000n).toString().padStart(8, '0').replace(/0+$/u, '');
   return `${negative ? '-' : ''}${whole}${fraction ? `.${fraction}` : ''}`;
+}
+
+function fractionalDigits(value: string): number {
+  return value.split('.')[1]?.length ?? 0;
 }
 
 function normalizeDecimal(value: string): string {

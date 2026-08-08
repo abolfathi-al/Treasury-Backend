@@ -10,6 +10,7 @@ import {
   cashboxDayApprovalActions,
   cashboxDayApprovalRequests,
   cashboxDayCounts,
+  cashboxDayNumberReservations,
   cashboxDays,
   cashboxes,
   idempotencyRecords,
@@ -424,11 +425,11 @@ export class CashboxOperationsRepository {
       currency: row.currency,
       custodianUserId: row.custodianUserId,
       custodian: { id: row.custodianUserId, label: row.custodianLabel },
-      ceiling: { amount: row.ceiling, currency: row.currency },
+      ceiling: { amount: normalizeDatabaseDecimal(row.ceiling), currency: row.currency },
       expenseCategoryCodes: row.expenseCategoryCodes,
       evidenceThreshold: row.evidenceThreshold === null
         ? undefined
-        : { amount: row.evidenceThreshold, currency: row.currency },
+        : { amount: normalizeDatabaseDecimal(row.evidenceThreshold), currency: row.currency },
       settlementDays: row.settlementDays,
       replenishmentSource: {
         type: sourceType,
@@ -702,14 +703,51 @@ export class CashboxOperationsRepository {
     return rows[0];
   }
 
-  async reserveBusinessNumber(
+  async findBusinessNumberReservation(
     transaction: DatabaseTransaction,
-    businessDate: string,
-  ): Promise<string> {
-    const result = await transaction.execute<{ value: string }>(sql`
-      SELECT nextval('cashbox_day_close_business_number_seq')::text AS value
-    `);
-    return `CBD-${businessDate.slice(0, 4)}-${result.rows[0]!.value.padStart(10, '0')}`;
+    organizationId: string,
+    reservationScope: string,
+    idempotencyKey: string,
+  ) {
+    const rows = await transaction
+      .select()
+      .from(cashboxDayNumberReservations)
+      .where(and(
+        eq(cashboxDayNumberReservations.organizationId, organizationId),
+        eq(cashboxDayNumberReservations.reservationScope, reservationScope),
+        eq(cashboxDayNumberReservations.idempotencyKey, idempotencyKey),
+      ))
+      .limit(1);
+    return rows[0];
+  }
+
+  async insertBusinessNumberReservation(
+    transaction: DatabaseTransaction,
+    values: typeof cashboxDayNumberReservations.$inferInsert,
+  ) {
+    const rows = await transaction
+      .insert(cashboxDayNumberReservations)
+      .values(values)
+      .returning();
+    return rows[0]!;
+  }
+
+  async consumeBusinessNumberReservation(
+    transaction: DatabaseTransaction,
+    organizationId: string,
+    reservationId: string,
+    cashboxDayId: string,
+  ): Promise<boolean> {
+    const rows = await transaction
+      .update(cashboxDayNumberReservations)
+      .set({ state: 'CONSUMED', cashboxDayId, consumedAt: sql`clock_timestamp()` })
+      .where(and(
+        eq(cashboxDayNumberReservations.organizationId, organizationId),
+        eq(cashboxDayNumberReservations.id, reservationId),
+        eq(cashboxDayNumberReservations.state, 'RESERVED'),
+      ))
+      .returning({ id: cashboxDayNumberReservations.id });
+    return rows.length === 1;
   }
 
   async closeDay(
@@ -890,6 +928,9 @@ export class CashboxOperationsRepository {
       state: row.day.state as 'CLOSED' | 'REOPENED',
       counts: counts.map((count) => compact({
         ...count,
+        bookAmount: normalizeDatabaseDecimal(count.bookAmount),
+        countedAmount: normalizeDatabaseDecimal(count.countedAmount),
+        varianceAmount: normalizeDatabaseDecimal(count.varianceAmount),
         varianceReason: count.varianceReason ?? undefined,
       })),
       heldInstrumentSnapshot: row.day.heldInstrumentSnapshot,
@@ -919,4 +960,8 @@ function compact<T extends object>(value: T): T {
   return Object.fromEntries(
     Object.entries(value).filter(([, child]) => child !== undefined && child !== null),
   ) as T;
+}
+
+function normalizeDatabaseDecimal(value: string): string {
+  return value.includes('.') ? value.replace(/0+$/u, '').replace(/\.$/u, '') : value;
 }

@@ -1,11 +1,12 @@
 {
   "repository": "Treasury-Canon",
-  "revision": "4c11fea8bd34070b8fb68a91ca14ad02e9323029",
+  "revision": "7f062f7d6cdd136f8a92c327472dc61cac4eacad",
   "canon_root": "canon-v4",
   "authorized_delivery_slice": "SLICE-5-OPERATIONS",
   "authorized_increment": "INC-5B-PETTY-CASH-CASHBOX-CLOSE",
   "requirements": [
     "REQ-ACC-009",
+    "REQ-MST-002",
     "REQ-MST-008",
     "REQ-CSH-006",
     "REQ-CSH-007",

@@ -1472,18 +1472,14 @@ test('Receipt execution is atomic, actor-idempotent, versioned and race-safe', {
       }),
       isProblemCode('TRS-GEN-003'),
     );
-    await database.pool.query(`
-      INSERT INTO cashbox_days (
-        organization_id, cashbox_id, business_date, close_cycle, state,
-        business_number, closed_by_user_id, closed_at
-      ) VALUES ($1,$2,$3,1,'CLOSED',$4,$5,now())
-    `, [
-      seeded.organizationId,
-      seeded.cashboxId,
-      receiptBusinessDate,
-      `TEST-CLOSE-${suffix}`,
-      executorId,
-    ]);
+    await closeCashboxDayFixture(database, {
+      organizationId: seeded.organizationId,
+      cashboxId: seeded.cashboxId,
+      treasuryUnitId: seeded.treasuryUnitId,
+      businessDate: receiptBusinessDate,
+      actorUserId: executorId,
+      prefix: `T${suffix}`,
+    });
     const rollbackKey = `execute-rollback-${suffix}`;
     await assert.rejects(
       execution.execute({ ...command, key: rollbackKey }),
@@ -1894,18 +1890,14 @@ test('Receipt execution is atomic, actor-idempotent, versioned and race-safe', {
       SET state = 'ACCOUNTING_READY', accounting_state = 'READY'
       WHERE organization_id = $1 AND id = $2
     `, [seeded.organizationId, draft.id]);
-    await database.pool.query(`
-      INSERT INTO cashbox_days (
-        organization_id, cashbox_id, business_date, close_cycle, state,
-        business_number, closed_by_user_id, closed_at
-      ) VALUES ($1,$2,$3,1,'CLOSED',$4,$5,now())
-    `, [
-      seeded.organizationId,
-      seeded.cashboxId,
-      receiptBusinessDate,
-      `TEST-REVERSE-CLOSE-${suffix}`,
-      executorId,
-    ]);
+    await closeCashboxDayFixture(database, {
+      organizationId: seeded.organizationId,
+      cashboxId: seeded.cashboxId,
+      treasuryUnitId: seeded.treasuryUnitId,
+      businessDate: receiptBusinessDate,
+      actorUserId: executorId,
+      prefix: `T${suffix}`,
+    });
     await assert.rejects(
       execution.reverse(reverseCommand, reverseBody),
       isProblemCode('TRS-GEN-009'),
@@ -1998,6 +1990,93 @@ test('Receipt execution is atomic, actor-idempotent, versioned and race-safe', {
     await database.onModuleDestroy();
   }
 });
+
+async function closeCashboxDayFixture(
+  database: DatabaseService,
+  input: {
+    organizationId: string;
+    cashboxId: string;
+    treasuryUnitId: string;
+    businessDate: string;
+    actorUserId: string;
+    prefix: string;
+  },
+): Promise<void> {
+  const client = await database.pool.connect();
+  const fiscalYear = input.businessDate.slice(0, 4);
+  const businessNumber = `${input.prefix}${fiscalYear}-000001`;
+  try {
+    await client.query('BEGIN');
+    const rule = await client.query<{ id: string; version: string }>(`
+      INSERT INTO numbering_rules (
+        organization_id, operation, treasury_unit_id, fiscal_year,
+        fiscal_year_starts_on, fiscal_year_ends_on, prefix, number_width
+      ) VALUES ($1,'CASHBOX_DAY_CLOSE',$2,$3,$4,$5,$6,6)
+      ON CONFLICT ON CONSTRAINT numbering_rules_cashbox_day_scope_unique
+      DO UPDATE SET updated_at = EXCLUDED.updated_at
+      RETURNING id, version::text
+    `, [
+      input.organizationId,
+      input.treasuryUnitId,
+      fiscalYear,
+      `${fiscalYear}-01-01`,
+      `${fiscalYear}-12-31`,
+      input.prefix,
+    ]);
+    const reservation = await client.query<{ id: string }>(`
+      INSERT INTO cashbox_day_number_reservations (
+        organization_id, numbering_rule_id, numbering_rule_version, operation,
+        treasury_unit_id, fiscal_year, fiscal_year_starts_on, fiscal_year_ends_on,
+        prefix, number_width, sequence_value, business_number, cashbox_id,
+        business_date, close_cycle, reserved_by_user_id, command_digest,
+        reservation_scope, idempotency_key
+      ) VALUES (
+        $1,$2,$3,'CASHBOX_DAY_CLOSE',$4,$5,$6,$7,$8,6,1,$9,$10,$11,1,$12,$13,$14,$15
+      )
+      RETURNING id
+    `, [
+      input.organizationId,
+      rule.rows[0]!.id,
+      rule.rows[0]!.version,
+      input.treasuryUnitId,
+      fiscalYear,
+      `${fiscalYear}-01-01`,
+      `${fiscalYear}-12-31`,
+      input.prefix,
+      businessNumber,
+      input.cashboxId,
+      input.businessDate,
+      input.actorUserId,
+      digest(`cashbox-day-fixture:${businessNumber}`),
+      `cashbox-day-fixture:${input.cashboxId}`,
+      `close-${input.businessDate}`,
+    ]);
+    const day = await client.query<{ id: string }>(`
+      INSERT INTO cashbox_days (
+        organization_id, cashbox_id, business_date, close_cycle, state,
+        business_number, closed_by_user_id, closed_at
+      ) VALUES ($1,$2,$3,1,'CLOSED',$4,$5,now())
+      RETURNING id
+    `, [
+      input.organizationId,
+      input.cashboxId,
+      input.businessDate,
+      businessNumber,
+      input.actorUserId,
+    ]);
+    await client.query(`
+      UPDATE cashbox_day_number_reservations
+      SET state = 'CONSUMED', cashbox_day_id = $2, consumed_at = now()
+      WHERE organization_id = $1 AND id = $3
+    `, [input.organizationId, day.rows[0]!.id, reservation.rows[0]!.id]);
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
+}
 
 async function receiptStep(
   database: DatabaseService,
@@ -2580,8 +2659,16 @@ async function cleanupReceiptFoundation(
       [seeded.organizationId, seeded.cashboxId],
     );
     await client.query(
+      'DELETE FROM cashbox_day_number_reservations WHERE organization_id = $1 AND cashbox_id = $2',
+      [seeded.organizationId, seeded.cashboxId],
+    );
+    await client.query(
       'DELETE FROM cashbox_days WHERE organization_id = $1 AND cashbox_id = $2',
       [seeded.organizationId, seeded.cashboxId],
+    );
+    await client.query(
+      'DELETE FROM numbering_rules WHERE organization_id = $1 AND treasury_unit_id = $2',
+      [seeded.organizationId, seeded.treasuryUnitId],
     );
     await client.query(
       'DELETE FROM cashboxes WHERE organization_id = $1 AND id = $2',
@@ -2703,6 +2790,10 @@ async function cleanupReceiptFoundation(
         + (SELECT count(*) FROM branches WHERE id = $9)
         + (SELECT count(*) FROM receipt_documents WHERE creator_user_id = $1)
         + (SELECT count(*) FROM exchange_rates WHERE recorded_by = $1 OR approved_by = $1)
+        + (SELECT count(*) FROM cashbox_day_number_reservations
+            WHERE organization_id = $15 AND cashbox_id = $3)
+        + (SELECT count(*) FROM numbering_rules
+            WHERE organization_id = $15 AND treasury_unit_id = $2)
       )::int AS count
     `, [
       seeded.actorId,
@@ -2719,6 +2810,7 @@ async function cleanupReceiptFoundation(
       seeded.bankId,
       seeded.bankTypeId,
       seeded.bankBranchId,
+      seeded.organizationId,
     ]);
     assert.equal(leftovers.rows[0]!.count, 0);
     const restoredCounter = await database.pool.query<{ nextValue: string }>(`

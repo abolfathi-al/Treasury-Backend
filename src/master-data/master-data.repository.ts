@@ -1,12 +1,12 @@
 import { Inject, Injectable } from '@nestjs/common';
-import { and, eq, inArray } from 'drizzle-orm';
+import { and, eq, inArray, isNull, sql } from 'drizzle-orm';
 import type { PoolClient } from 'pg';
 
 import {
   DatabaseService,
   type DatabaseTransaction,
 } from '../database/database.service';
-import { currencies } from '../database/schema';
+import { currencies, numberingRules } from '../database/schema';
 import {
   BranchCreateDto,
   CurrencyCreateDto,
@@ -16,6 +16,8 @@ import {
   PartyView,
   TreasuryUnitCreateDto,
 } from './master-data.dto';
+
+const POSTGRES_BIGINT_MAX = 9223372036854775807n;
 
 export interface Page<T> {
   items: T[];
@@ -41,8 +43,64 @@ export class MasterDataRepository {
       .where(and(
         eq(currencies.organizationId, organizationId),
         inArray(currencies.code, currencyCodes),
+        eq(currencies.state, 'ACTIVE'),
       ))
       .orderBy(currencies.code);
+  }
+
+  async reserveCashboxDayNumber(
+    transaction: DatabaseTransaction,
+    organizationId: string,
+    branchId: string | null,
+    treasuryUnitId: string,
+    businessDate: string,
+  ) {
+    const rows = await transaction
+      .select({
+        id: numberingRules.id,
+        version: numberingRules.version,
+        branchId: numberingRules.branchId,
+        treasuryUnitId: numberingRules.treasuryUnitId,
+        fiscalYear: numberingRules.fiscalYear,
+        fiscalYearStartsOn: numberingRules.fiscalYearStartsOn,
+        fiscalYearEndsOn: numberingRules.fiscalYearEndsOn,
+        prefix: numberingRules.prefix,
+        numberWidth: numberingRules.numberWidth,
+        nextValue: numberingRules.nextValue,
+      })
+      .from(numberingRules)
+      .where(and(
+        eq(numberingRules.organizationId, organizationId),
+        eq(numberingRules.operation, 'CASHBOX_DAY_CLOSE'),
+        branchId === null ? isNull(numberingRules.branchId) : eq(numberingRules.branchId, branchId),
+        eq(numberingRules.treasuryUnitId, treasuryUnitId),
+        eq(numberingRules.state, 'ACTIVE'),
+        sql`${businessDate}::date BETWEEN ${numberingRules.fiscalYearStartsOn} AND ${numberingRules.fiscalYearEndsOn}`,
+      ))
+      .orderBy(numberingRules.id)
+      .for('update')
+      .limit(2);
+    if (rows.length !== 1
+      || String(rows[0]!.nextValue).length > rows[0]!.numberWidth
+      || rows[0]!.nextValue === POSTGRES_BIGINT_MAX) {
+      return undefined;
+    }
+    const rule = rows[0]!;
+    const updated = await transaction
+      .update(numberingRules)
+      .set({
+        nextValue: sql`${numberingRules.nextValue} + 1`,
+        version: sql`${numberingRules.version} + 1`,
+        updatedAt: sql`clock_timestamp()`,
+      })
+      .where(and(
+        eq(numberingRules.organizationId, organizationId),
+        eq(numberingRules.id, rule.id),
+        eq(numberingRules.nextValue, rule.nextValue),
+        eq(numberingRules.state, 'ACTIVE'),
+      ))
+      .returning({ id: numberingRules.id });
+    return updated.length === 1 ? { ...rule, sequenceValue: rule.nextValue } : undefined;
   }
 
   async organization(organizationId: string): Promise<Record<string, unknown> | null> {

@@ -2007,6 +2007,54 @@ export const receiptLineAttachmentLinks = pgTable('receipt_line_attachment_links
   ),
 ]);
 
+export const numberingRules = pgTable('numbering_rules', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  organizationId: uuid('organization_id').notNull().references(() => organizations.id),
+  operation: varchar('operation', { length: 32 }).notNull(),
+  branchId: uuid('branch_id'),
+  treasuryUnitId: uuid('treasury_unit_id').notNull(),
+  fiscalYear: varchar('fiscal_year', { length: 16 }).notNull(),
+  fiscalYearStartsOn: date('fiscal_year_starts_on').notNull(),
+  fiscalYearEndsOn: date('fiscal_year_ends_on').notNull(),
+  prefix: varchar('prefix', { length: 32 }).notNull(),
+  numberWidth: integer('number_width').notNull(),
+  nextValue: bigint('next_value', { mode: 'bigint' }).notNull().default(1n),
+  state: varchar('state', { length: 16 }).notNull().default('ACTIVE'),
+  version: bigint('version', { mode: 'bigint' }).notNull().default(1n),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  unique().on(table.organizationId, table.id),
+  foreignKey({
+    columns: [table.organizationId, table.branchId],
+    foreignColumns: [branches.organizationId, branches.id],
+    name: 'numbering_rules_branch_fk',
+  }),
+  foreignKey({
+    columns: [table.organizationId, table.treasuryUnitId],
+    foreignColumns: [treasuryUnits.organizationId, treasuryUnits.id],
+    name: 'numbering_rules_treasury_unit_fk',
+  }),
+  uniqueIndex('numbering_rules_cashbox_day_namespace_unique')
+    .on(table.organizationId, sql`(${table.prefix} || ${table.fiscalYear})`)
+    .where(sql`${table.operation} = 'CASHBOX_DAY_CLOSE'`),
+  unique('numbering_rules_cashbox_day_scope_unique')
+    .on(
+      table.organizationId,
+      table.operation,
+      table.branchId,
+      table.treasuryUnitId,
+      table.fiscalYear,
+    )
+    .nullsNotDistinct(),
+  check('numbering_rules_operation', sql`${table.operation} = 'CASHBOX_DAY_CLOSE'`),
+  check('numbering_rules_interval', sql`${table.fiscalYearEndsOn} >= ${table.fiscalYearStartsOn}`),
+  check('numbering_rules_width', sql`${table.numberWidth} BETWEEN 1 AND 32`),
+  check('numbering_rules_next_value', sql`${table.nextValue} > 0`),
+  check('numbering_rules_state', sql`${table.state} IN ('ACTIVE', 'CLOSED')`),
+  check('numbering_rules_version', sql`${table.version} > 0`),
+]);
+
 export const pettyCashProfiles = pgTable('petty_cash_profiles', {
   id: uuid('id').primaryKey().defaultRandom(),
   organizationId: uuid('organization_id').notNull().references(() => organizations.id),
@@ -2211,11 +2259,86 @@ export const cashboxDayCounts = pgTable('cashbox_day_counts', {
   check('cashbox_day_counts_reason', sql`(${table.varianceAmount} = 0 AND ${table.varianceReason} IS NULL) OR (${table.varianceAmount} <> 0 AND NULLIF(BTRIM(${table.varianceReason}), '') IS NOT NULL)`),
 ]);
 
+export const cashboxDayNumberReservations = pgTable('cashbox_day_number_reservations', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  organizationId: uuid('organization_id').notNull().references(() => organizations.id),
+  numberingRuleId: uuid('numbering_rule_id').notNull(),
+  numberingRuleVersion: bigint('numbering_rule_version', { mode: 'bigint' }).notNull(),
+  operation: varchar('operation', { length: 32 }).notNull(),
+  branchId: uuid('branch_id'),
+  treasuryUnitId: uuid('treasury_unit_id').notNull(),
+  fiscalYear: varchar('fiscal_year', { length: 16 }).notNull(),
+  fiscalYearStartsOn: date('fiscal_year_starts_on').notNull(),
+  fiscalYearEndsOn: date('fiscal_year_ends_on').notNull(),
+  prefix: varchar('prefix', { length: 32 }).notNull(),
+  numberWidth: integer('number_width').notNull(),
+  sequenceValue: bigint('sequence_value', { mode: 'bigint' }).notNull(),
+  businessNumber: varchar('business_number', { length: 128 }).notNull(),
+  cashboxId: uuid('cashbox_id').notNull(),
+  businessDate: date('business_date').notNull(),
+  closeCycle: integer('close_cycle').notNull(),
+  reservedByUserId: uuid('reserved_by_user_id').notNull(),
+  commandDigest: char('command_digest', { length: 64 }).notNull(),
+  reservationScope: varchar('reservation_scope', { length: 160 }).notNull(),
+  idempotencyKey: varchar('idempotency_key', { length: 128 }).notNull(),
+  state: varchar('state', { length: 16 }).notNull().default('RESERVED'),
+  cashboxDayId: uuid('cashbox_day_id'),
+  reservedAt: timestamp('reserved_at', { withTimezone: true }).notNull().defaultNow(),
+  consumedAt: timestamp('consumed_at', { withTimezone: true }),
+  abandonedAt: timestamp('abandoned_at', { withTimezone: true }),
+  abandonedReason: varchar('abandoned_reason', { length: 500 }),
+}, (table) => [
+  unique().on(table.organizationId, table.id),
+  unique().on(table.organizationId, table.numberingRuleId, table.sequenceValue),
+  unique().on(table.organizationId, table.businessNumber),
+  unique().on(table.organizationId, table.reservationScope, table.idempotencyKey),
+  uniqueIndex('cashbox_day_number_reservations_consumed_day_unique')
+    .on(table.organizationId, table.cashboxId, table.businessDate, table.closeCycle)
+    .where(sql`${table.state} = 'CONSUMED'`),
+  foreignKey({
+    columns: [table.organizationId, table.numberingRuleId],
+    foreignColumns: [numberingRules.organizationId, numberingRules.id],
+    name: 'cashbox_day_number_reservations_rule_fk',
+  }),
+  foreignKey({
+    columns: [table.organizationId, table.cashboxId],
+    foreignColumns: [cashboxes.organizationId, cashboxes.id],
+    name: 'cashbox_day_number_reservations_cashbox_fk',
+  }),
+  foreignKey({
+    columns: [table.organizationId, table.cashboxId, table.cashboxDayId],
+    foreignColumns: [cashboxDays.organizationId, cashboxDays.cashboxId, cashboxDays.id],
+    name: 'cashbox_day_number_reservations_day_fk',
+  }),
+  foreignKey({
+    columns: [table.organizationId, table.reservedByUserId],
+    foreignColumns: [userRefs.organizationId, userRefs.id],
+    name: 'cashbox_day_number_reservations_actor_fk',
+  }),
+  check('cashbox_day_number_reservations_operation', sql`${table.operation} = 'CASHBOX_DAY_CLOSE'`),
+  check('cashbox_day_number_reservations_interval', sql`${table.fiscalYearEndsOn} >= ${table.fiscalYearStartsOn}`),
+  check('cashbox_day_number_reservations_width', sql`${table.numberWidth} BETWEEN 1 AND 32`),
+  check('cashbox_day_number_reservations_rule_version', sql`${table.numberingRuleVersion} > 0`),
+  check('cashbox_day_number_reservations_sequence', sql`${table.sequenceValue} > 0`),
+  check('cashbox_day_number_reservations_business_number', sql`
+    LENGTH(${table.sequenceValue}::text) <= ${table.numberWidth}
+    AND ${table.businessNumber} = ${table.prefix} || ${table.fiscalYear} || '-' || LPAD(${table.sequenceValue}::text, ${table.numberWidth}, '0')
+  `),
+  check('cashbox_day_number_reservations_cycle', sql`${table.closeCycle} > 0`),
+  check('cashbox_day_number_reservations_digest', sql`${table.commandDigest} ~ '^[a-f0-9]{64}$'`),
+  check('cashbox_day_number_reservations_state', sql`
+    (${table.state} = 'RESERVED' AND ${table.cashboxDayId} IS NULL AND ${table.consumedAt} IS NULL AND ${table.abandonedAt} IS NULL AND ${table.abandonedReason} IS NULL)
+    OR (${table.state} = 'CONSUMED' AND ${table.cashboxDayId} IS NOT NULL AND ${table.consumedAt} IS NOT NULL AND ${table.abandonedAt} IS NULL AND ${table.abandonedReason} IS NULL)
+    OR (${table.state} = 'ABANDONED' AND ${table.cashboxDayId} IS NULL AND ${table.consumedAt} IS NULL AND ${table.abandonedAt} IS NOT NULL AND NULLIF(BTRIM(${table.abandonedReason}), '') IS NOT NULL)
+  `),
+]);
+
 export type PettyCashProfileRow = InferSelectModel<typeof pettyCashProfiles>;
 export type NewPettyCashProfileRow = InferInsertModel<typeof pettyCashProfiles>;
 export type CashboxDayApprovalRequestRow = InferSelectModel<typeof cashboxDayApprovalRequests>;
 export type CashboxDayApprovalActionRow = InferSelectModel<typeof cashboxDayApprovalActions>;
 export type CashboxDayRow = InferSelectModel<typeof cashboxDays>;
+export type CashboxDayNumberReservationRow = InferSelectModel<typeof cashboxDayNumberReservations>;
 
 export const movementFacts = pgTable('movement_facts', {
   id: uuid('id').primaryKey().defaultRandom(),

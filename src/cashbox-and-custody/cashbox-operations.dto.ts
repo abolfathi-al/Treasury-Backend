@@ -17,8 +17,8 @@ import {
 } from 'class-validator';
 
 const CURRENCY = /^[A-Z0-9]{3,8}$/u;
-const NONNEGATIVE_DECIMAL = /^(?:0|[1-9][0-9]*)(?:\.[0-9]{1,12})?$/u;
-const POSITIVE_DECIMAL = /^(?:0\.(?:0*[1-9][0-9]*)|[1-9][0-9]*(?:\.[0-9]+)?)$/u;
+const NONNEGATIVE_DECIMAL = /^(?:0|[1-9][0-9]*)(?:\.[0-9]{1,8})?$/u;
+const POSITIVE_DECIMAL = /^(?!0(?:\.0{1,8})?$)(?:0|[1-9][0-9]*)(?:\.[0-9]{1,8})?$/u;
 
 export interface SemanticRef {
   id: string;

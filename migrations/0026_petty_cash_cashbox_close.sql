@@ -2,6 +2,37 @@ INSERT INTO operation_permissions (permission)
 VALUES ('cashbox.approve'), ('cashbox.reject')
 ON CONFLICT DO NOTHING;
 
+CREATE TABLE numbering_rules (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  organization_id uuid NOT NULL REFERENCES organizations(id) ON DELETE RESTRICT,
+  operation varchar(32) NOT NULL CHECK (operation = 'CASHBOX_DAY_CLOSE'),
+  branch_id uuid,
+  treasury_unit_id uuid NOT NULL,
+  fiscal_year varchar(16) NOT NULL,
+  fiscal_year_starts_on date NOT NULL,
+  fiscal_year_ends_on date NOT NULL,
+  prefix varchar(32) NOT NULL,
+  number_width integer NOT NULL CHECK (number_width BETWEEN 1 AND 32),
+  next_value bigint NOT NULL DEFAULT 1 CHECK (next_value > 0),
+  state varchar(16) NOT NULL DEFAULT 'ACTIVE' CHECK (state IN ('ACTIVE', 'CLOSED')),
+  version bigint NOT NULL DEFAULT 1 CHECK (version > 0),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (organization_id, id),
+  CONSTRAINT numbering_rules_cashbox_day_scope_unique UNIQUE NULLS NOT DISTINCT (
+    organization_id, operation, branch_id, treasury_unit_id, fiscal_year
+  ),
+  FOREIGN KEY (organization_id, branch_id)
+    REFERENCES branches(organization_id, id) ON DELETE RESTRICT,
+  FOREIGN KEY (organization_id, treasury_unit_id)
+    REFERENCES treasury_units(organization_id, id) ON DELETE RESTRICT,
+  CHECK (fiscal_year_ends_on >= fiscal_year_starts_on)
+);
+
+CREATE UNIQUE INDEX numbering_rules_cashbox_day_namespace_unique
+  ON numbering_rules (organization_id, (prefix || fiscal_year))
+  WHERE operation = 'CASHBOX_DAY_CLOSE';
+
 CREATE TABLE petty_cash_profiles (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   organization_id uuid NOT NULL REFERENCES organizations(id) ON DELETE RESTRICT,
@@ -164,7 +195,161 @@ CREATE TABLE cashbox_day_counts (
   )
 );
 
-CREATE SEQUENCE cashbox_day_close_business_number_seq;
+CREATE TABLE cashbox_day_number_reservations (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  organization_id uuid NOT NULL REFERENCES organizations(id) ON DELETE RESTRICT,
+  numbering_rule_id uuid NOT NULL,
+  numbering_rule_version bigint NOT NULL CHECK (numbering_rule_version > 0),
+  operation varchar(32) NOT NULL CHECK (operation = 'CASHBOX_DAY_CLOSE'),
+  branch_id uuid,
+  treasury_unit_id uuid NOT NULL,
+  fiscal_year varchar(16) NOT NULL,
+  fiscal_year_starts_on date NOT NULL,
+  fiscal_year_ends_on date NOT NULL,
+  prefix varchar(32) NOT NULL,
+  number_width integer NOT NULL CHECK (number_width BETWEEN 1 AND 32),
+  sequence_value bigint NOT NULL CHECK (sequence_value > 0),
+  business_number varchar(128) NOT NULL,
+  cashbox_id uuid NOT NULL,
+  business_date date NOT NULL,
+  close_cycle integer NOT NULL CHECK (close_cycle > 0),
+  reserved_by_user_id uuid NOT NULL,
+  command_digest char(64) NOT NULL CHECK (command_digest ~ '^[a-f0-9]{64}$'),
+  reservation_scope varchar(160) NOT NULL,
+  idempotency_key varchar(128) NOT NULL,
+  state varchar(16) NOT NULL DEFAULT 'RESERVED',
+  cashbox_day_id uuid,
+  reserved_at timestamptz NOT NULL DEFAULT now(),
+  consumed_at timestamptz,
+  abandoned_at timestamptz,
+  abandoned_reason varchar(500),
+  UNIQUE (organization_id, id),
+  UNIQUE (organization_id, numbering_rule_id, sequence_value),
+  UNIQUE (organization_id, business_number),
+  UNIQUE (organization_id, reservation_scope, idempotency_key),
+  FOREIGN KEY (organization_id, numbering_rule_id)
+    REFERENCES numbering_rules(organization_id, id) ON DELETE RESTRICT,
+  FOREIGN KEY (organization_id, cashbox_id)
+    REFERENCES cashboxes(organization_id, id) ON DELETE RESTRICT,
+  FOREIGN KEY (organization_id, cashbox_id, cashbox_day_id)
+    REFERENCES cashbox_days(organization_id, cashbox_id, id) ON DELETE RESTRICT,
+  FOREIGN KEY (organization_id, reserved_by_user_id)
+    REFERENCES user_refs(organization_id, id) ON DELETE RESTRICT,
+  CHECK (fiscal_year_ends_on >= fiscal_year_starts_on),
+  CHECK (
+    length(sequence_value::text) <= number_width
+    AND business_number = prefix || fiscal_year || '-' || lpad(sequence_value::text, number_width, '0')
+  ),
+  CHECK (
+    (state = 'RESERVED' AND cashbox_day_id IS NULL AND consumed_at IS NULL
+      AND abandoned_at IS NULL AND abandoned_reason IS NULL)
+    OR (state = 'CONSUMED' AND cashbox_day_id IS NOT NULL AND consumed_at IS NOT NULL
+      AND abandoned_at IS NULL AND abandoned_reason IS NULL)
+    OR (state = 'ABANDONED' AND cashbox_day_id IS NULL AND consumed_at IS NULL
+      AND abandoned_at IS NOT NULL AND NULLIF(BTRIM(abandoned_reason), '') IS NOT NULL)
+  )
+);
+
+CREATE UNIQUE INDEX cashbox_day_number_reservations_consumed_day_unique
+  ON cashbox_day_number_reservations (organization_id, cashbox_id, business_date, close_cycle)
+  WHERE state = 'CONSUMED';
+
+CREATE FUNCTION enforce_cashbox_day_number_reservation_transition()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  IF TG_OP = 'INSERT' THEN
+    IF NEW.state <> 'RESERVED' THEN
+      RAISE EXCEPTION 'Cashbox Day number reservations begin RESERVED';
+    END IF;
+    RETURN NEW;
+  END IF;
+  IF TG_OP = 'DELETE' THEN
+    RAISE EXCEPTION 'Cashbox Day number reservations are immutable';
+  END IF;
+  IF OLD.state <> 'RESERVED'
+     OR NEW.state NOT IN ('CONSUMED', 'ABANDONED')
+     OR (to_jsonb(NEW) - ARRAY['state', 'cashbox_day_id', 'consumed_at', 'abandoned_at', 'abandoned_reason'])
+        IS DISTINCT FROM
+        (to_jsonb(OLD) - ARRAY['state', 'cashbox_day_id', 'consumed_at', 'abandoned_at', 'abandoned_reason']) THEN
+    RAISE EXCEPTION 'invalid Cashbox Day number reservation transition';
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER cashbox_day_number_reservations_terminal_transition
+BEFORE INSERT OR UPDATE OR DELETE ON cashbox_day_number_reservations
+FOR EACH ROW EXECUTE FUNCTION enforce_cashbox_day_number_reservation_transition();
+
+CREATE FUNCTION enforce_cashbox_day_number_parity()
+RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE
+  target_organization_id uuid;
+  target_day_id uuid;
+BEGIN
+  IF TG_TABLE_NAME = 'cashbox_days' THEN
+    target_organization_id := COALESCE(NEW.organization_id, OLD.organization_id);
+    target_day_id := COALESCE(NEW.id, OLD.id);
+  ELSE
+    target_organization_id := COALESCE(NEW.organization_id, OLD.organization_id);
+    target_day_id := COALESCE(NEW.cashbox_day_id, OLD.cashbox_day_id);
+  END IF;
+  IF target_day_id IS NULL THEN RETURN COALESCE(NEW, OLD); END IF;
+
+  IF EXISTS (
+    SELECT 1 FROM cashbox_days d
+    WHERE d.organization_id = target_organization_id
+      AND d.id = target_day_id
+      AND d.state = 'CLOSED'
+  ) AND NOT EXISTS (
+    SELECT 1
+    FROM cashbox_days d
+    JOIN cashbox_day_number_reservations r
+      ON r.organization_id = d.organization_id
+     AND r.cashbox_day_id = d.id
+     AND r.cashbox_id = d.cashbox_id
+     AND r.business_date = d.business_date
+     AND r.close_cycle = d.close_cycle
+     AND r.business_number = d.business_number
+     AND r.state = 'CONSUMED'
+    WHERE d.organization_id = target_organization_id
+      AND d.id = target_day_id
+      AND d.state = 'CLOSED'
+  ) THEN
+    RAISE EXCEPTION 'closed Cashbox Day requires one matching consumed number reservation';
+  END IF;
+  IF TG_TABLE_NAME = 'cashbox_day_number_reservations'
+     AND COALESCE(NEW.state, OLD.state) = 'CONSUMED'
+     AND NOT EXISTS (
+       SELECT 1
+       FROM cashbox_day_number_reservations r
+       JOIN cashbox_days d
+         ON d.organization_id = r.organization_id
+        AND d.id = r.cashbox_day_id
+        AND d.cashbox_id = r.cashbox_id
+        AND d.business_date = r.business_date
+        AND d.close_cycle = r.close_cycle
+        AND d.business_number = r.business_number
+        AND d.state = 'CLOSED'
+       WHERE r.organization_id = target_organization_id
+         AND r.cashbox_day_id = target_day_id
+         AND r.state = 'CONSUMED'
+     ) THEN
+    RAISE EXCEPTION 'consumed number reservation requires one matching closed Cashbox Day';
+  END IF;
+  RETURN COALESCE(NEW, OLD);
+END;
+$$;
+
+CREATE CONSTRAINT TRIGGER cashbox_days_number_parity
+AFTER INSERT OR UPDATE ON cashbox_days
+DEFERRABLE INITIALLY DEFERRED
+FOR EACH ROW EXECUTE FUNCTION enforce_cashbox_day_number_parity();
+
+CREATE CONSTRAINT TRIGGER cashbox_day_number_reservations_parity
+AFTER INSERT OR UPDATE OR DELETE ON cashbox_day_number_reservations
+DEFERRABLE INITIALLY DEFERRED
+FOR EACH ROW EXECUTE FUNCTION enforce_cashbox_day_number_parity();
 
 CREATE FUNCTION prevent_cashbox_day_history_rewrite()
 RETURNS trigger LANGUAGE plpgsql AS $$

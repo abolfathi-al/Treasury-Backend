@@ -34,6 +34,7 @@ const titles = {
   'TRS-MST-003': 'Exchange rate missing or ambiguous',
   'TRS-MST-004': 'Method configuration invalid',
   'TRS-MST-005': 'Base currency locked',
+  'TRS-MST-006': 'Numbering rule unavailable',
   'TRS-BNK-001': 'Bank account unavailable',
   'TRS-CHQ-001': 'Cheque leaf unavailable',
   'TRS-CHQ-002': 'Cheque-book range overlap',

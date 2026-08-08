@@ -606,6 +606,8 @@ test('INC-5B migration and Drizzle schema preserve cashbox close evidence', asyn
       'cashbox_day_approval_requests',
       'cashbox_day_approval_actions',
       'cashbox_day_counts',
+      'numbering_rules',
+      'cashbox_day_number_reservations',
       'source_day_version',
       'book_snapshot_digest',
       'held_instrument_snapshot',
@@ -613,6 +615,8 @@ test('INC-5B migration and Drizzle schema preserve cashbox close evidence', asyn
   }
   assert.match(migration, /cashbox_day_approval_actions_immutable/u);
   assert.match(migration, /cashbox_day_approval_requests_terminal_transition/u);
+  assert.match(migration, /cashbox_day_number_reservations_terminal_transition/u);
+  assert.match(migration, /DEFERRABLE INITIALLY DEFERRED/u);
   assert.match(migration, /cashbox_days_closed_shape/u);
   assert.match(migration, /cashbox_days_reopened_shape/u);
   assert.match(migration, /UNIQUE \(organization_id, cashbox_id, business_date, close_cycle\)/u);

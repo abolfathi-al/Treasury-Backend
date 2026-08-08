@@ -32,6 +32,24 @@ export class MasterDataService {
     );
   }
 
+  async reserveCashboxDayNumber(
+    transaction: DatabaseTransaction,
+    organizationId: string,
+    branchId: string | null,
+    treasuryUnitId: string,
+    businessDate: string,
+  ) {
+    const reservation = await this.repository.reserveCashboxDayNumber(
+      transaction, organizationId, branchId, treasuryUnitId, businessDate,
+    );
+    if (!reservation) throw new TreasuryProblem('TRS-MST-006', 422);
+    return {
+      ...reservation,
+      operation: 'CASHBOX_DAY_CLOSE' as const,
+      businessNumber: `${reservation.prefix}${reservation.fiscalYear}-${String(reservation.sequenceValue).padStart(reservation.numberWidth, '0')}`,
+    };
+  }
+
   async organization(organizationId: string): Promise<Record<string, unknown>> {
     const organization = await this.repository.organization(organizationId);
     if (!organization) throw new TreasuryProblem('TRS-GEN-004', 404);

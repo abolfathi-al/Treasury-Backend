@@ -54,14 +54,39 @@ test('INC-1D PostgreSQL create/list/handover are scoped, replay-safe, atomic, an
     new MasterDataService(new MasterDataRepository(database)),
   );
   const effects = new FoundationEffectsService(new FoundationEffectsRepository());
+  const masterData = new MasterDataService(new MasterDataRepository(database));
   const operations = new CashboxOperationsService(
     database,
     new CashboxOperationsRepository(),
     new AccessAuthorizationService(new AccessAuthorizationRepository()),
     effects,
+    masterData,
   );
   try {
     const fixture = await seed(database);
+    const branchlessUnit = await database.pool.query<{ id: string }>(`
+      INSERT INTO treasury_units (
+        organization_id, branch_id, code, name, default_currency
+      ) VALUES ($1, NULL, 'DIRECT', 'Direct Treasury', 'USD')
+      RETURNING id
+    `, [fixture.organizationId]);
+    await database.pool.query(`
+      INSERT INTO numbering_rules (
+        organization_id, operation, branch_id, treasury_unit_id,
+        fiscal_year, fiscal_year_starts_on, fiscal_year_ends_on,
+        prefix, number_width, next_value
+      ) VALUES ($1, 'CASHBOX_DAY_CLOSE', NULL, $2,
+        '2026', '2026-01-01', '2026-12-31', 'DIRECT-', 4, 1)
+    `, [fixture.organizationId, branchlessUnit.rows[0]!.id]);
+    const branchlessNumber = await database.db.transaction((transaction) =>
+      masterData.reserveCashboxDayNumber(
+        transaction,
+        fixture.organizationId,
+        null,
+        branchlessUnit.rows[0]!.id,
+        '2026-08-08',
+      ));
+    assert.equal(branchlessNumber.businessNumber, 'DIRECT-2026-0001');
     const missingCashboxId = '00000000-0000-4000-8000-999999999999';
     await assert.rejects(
       service.createHandover(
@@ -403,17 +428,105 @@ test('INC-1D PostgreSQL create/list/handover are scoped, replay-safe, atomic, an
       }),
       (error) => problem(error, 'TRS-GEN-001', 422),
     );
+    await assert.rejects(
+      operations.closeDay({ ...closeContext, key: 'close-overprecision' }, closeCashbox.id, '2026-08-08', {
+        counts: [{ currency: 'USD', countedAmount: '0.001' }],
+        observedInstrumentIds: [],
+      }),
+      (error) => problem(error, 'TRS-GEN-001', 422),
+    );
+    await assert.rejects(
+      operations.closeDay({ ...closeContext, key: 'close-padded-overprecision' }, closeCashbox.id, '2026-08-08', {
+        counts: [{ currency: 'USD', countedAmount: '1.000' }],
+        observedInstrumentIds: [],
+      }),
+      (error) => problem(error, 'TRS-GEN-001', 422),
+    );
+    await database.pool.query(
+      `UPDATE numbering_rules SET state = 'CLOSED' WHERE organization_id = $1`,
+      [fixture.organizationId],
+    );
+    await assert.rejects(
+      operations.closeDay({ ...closeContext, key: 'close-no-rule' }, closeCashbox.id, '2026-08-08', {
+        counts: [{ currency: 'USD', countedAmount: '0' }],
+        observedInstrumentIds: [],
+      }),
+      (error) => problem(error, 'TRS-MST-006', 422),
+    );
+    await database.pool.query(
+      `UPDATE numbering_rules SET state = 'ACTIVE' WHERE organization_id = $1`,
+      [fixture.organizationId],
+    );
+    await database.pool.query(
+      `UPDATE numbering_rules SET number_width = 19, next_value = 9223372036854775807
+       WHERE organization_id = $1`,
+      [fixture.organizationId],
+    );
+    await assert.rejects(
+      operations.closeDay({ ...closeContext, key: 'close-exhausted-rule' }, closeCashbox.id, '2026-08-08', {
+        counts: [{ currency: 'USD', countedAmount: '0' }],
+        observedInstrumentIds: [],
+      }),
+      (error) => problem(error, 'TRS-MST-006', 422),
+    );
+    await database.pool.query(
+      `UPDATE numbering_rules SET number_width = 10, next_value = 1 WHERE organization_id = $1`,
+      [fixture.organizationId],
+    );
+    await database.db.transaction((transaction) => effects.appendMovement(transaction, {
+      organizationId: fixture.organizationId,
+      owner: 'domain.cashbox-and-custody',
+      sourceType: 'CashboxDay',
+      sourceId: closeCashbox.id,
+      effectKey: 'cashbox-close-book-amount',
+      endpointType: 'CASHBOX',
+      endpointId: closeCashbox.id,
+      amount: '100',
+      currency: 'USD',
+      businessDate: '2026-08-08',
+    }));
     const closed = await operations.closeDay(closeContext, closeCashbox.id, '2026-08-08', {
-      counts: [{ currency: 'USD', countedAmount: '0' }],
+      counts: [{ currency: 'USD', countedAmount: '100' }],
       observedInstrumentIds: [],
     });
     assert.equal(closed.state, 'CLOSED');
+    assert.equal(closed.businessNumber, 'CBD-2026-0000000001');
+    assert.deepEqual(closed.counts, [{
+      currency: 'USD',
+      bookAmount: '100',
+      countedAmount: '100',
+      varianceAmount: '0',
+    }]);
     assert.equal((await operations.closeDay(
       closeContext,
       closeCashbox.id,
       '2026-08-08',
-      { counts: [{ currency: 'USD', countedAmount: '0' }], observedInstrumentIds: [] },
+      { counts: [{ currency: 'USD', countedAmount: '100' }], observedInstrumentIds: [] },
     )).id, closed.id);
+    await assert.rejects(
+      operations.closeDay(closeContext, closeCashbox.id, '2026-08-08', {
+        counts: [{ currency: 'USD', countedAmount: '100.000' }],
+        observedInstrumentIds: [],
+      }),
+      (error) => problem(error, 'TRS-GEN-001', 422),
+    );
+    const closedReservation = await database.pool.query<{
+      state: string;
+      cashbox_day_id: string;
+      business_number: string;
+      count: number;
+    }>(`
+      SELECT state, cashbox_day_id, business_number,
+             count(*) OVER ()::int AS count
+      FROM cashbox_day_number_reservations
+      WHERE organization_id = $1 AND cashbox_day_id = $2
+    `, [fixture.organizationId, closed.id]);
+    assert.deepEqual(closedReservation.rows, [{
+      state: 'CONSUMED',
+      cashbox_day_id: closed.id,
+      business_number: closed.businessNumber,
+      count: 1,
+    }]);
     for (const statement of [
       `UPDATE cashbox_day_counts SET counted_amount = 1 WHERE cashbox_day_id = '${closed.id}'`,
       `DELETE FROM cashbox_day_counts WHERE cashbox_day_id = '${closed.id}'`,
@@ -423,6 +536,39 @@ test('INC-1D PostgreSQL create/list/handover are scoped, replay-safe, atomic, an
     ]) {
       await assert.rejects(database.pool.query(statement), /count evidence is immutable/u);
     }
+
+    const rollbackCashbox = await service.create(
+      fixture.organizationId,
+      fixture.primaryUserId,
+      createDto(fixture, 'CLOSE_ROLLBACK'),
+      'cashbox-close-final-rollback',
+      'request-create-close-final-rollback',
+    );
+    const appendOutbox = effects.appendOutbox.bind(effects);
+    effects.appendOutbox = async () => { throw new Error('FORCED_FINAL_FAILURE'); };
+    try {
+      await assert.rejects(
+        operations.closeDay({
+          organizationId: fixture.organizationId,
+          actorUserId: fixture.primaryUserId,
+          key: 'close-final-rollback',
+          requestId: 'request-close-final-rollback',
+        }, rollbackCashbox.id, '2026-08-08', {
+          counts: [{ currency: 'USD', countedAmount: '0' }],
+          observedInstrumentIds: [],
+        }),
+        /FORCED_FINAL_FAILURE/u,
+      );
+    } finally {
+      effects.appendOutbox = appendOutbox;
+    }
+    const rollbackEvidence = await database.pool.query<{ days: number; reserved: number }>(`
+      SELECT
+        (SELECT count(*)::int FROM cashbox_days WHERE cashbox_id = $1) AS days,
+        (SELECT count(*)::int FROM cashbox_day_number_reservations
+          WHERE cashbox_id = $1 AND state = 'RESERVED') AS reserved
+    `, [rollbackCashbox.id]);
+    assert.deepEqual(rollbackEvidence.rows[0], { days: 0, reserved: 1 });
 
     const reopenRequest = await database.pool.query<{ id: string }>(`
       INSERT INTO cashbox_day_approval_requests (
@@ -512,6 +658,24 @@ test('INC-1D PostgreSQL create/list/handover are scoped, replay-safe, atomic, an
       'cashbox-source',
       'request-create-source',
     );
+    await assert.rejects(
+      operations.createPettyCashFund({
+        organizationId: fixture.organizationId,
+        actorUserId: fixture.primaryUserId,
+        key: 'create-fund-overprecision',
+        requestId: 'request-create-fund-overprecision',
+      }, {
+        cashboxId: fundCashbox.id,
+        ceiling: { amount: '100.001', currency: 'USD' },
+        expenseCategoryCodes: ['OFFICE'],
+        settlementDays: 30,
+        replenishmentSource: {
+          type: ReplenishmentSourceType.CASHBOX,
+          id: multiCurrencySource.id,
+        },
+      }),
+      (error) => problem(error, 'TRS-GEN-001', 422),
+    );
     const fund = await operations.createPettyCashFund({
       organizationId: fixture.organizationId,
       actorUserId: fixture.primaryUserId,
@@ -528,6 +692,7 @@ test('INC-1D PostgreSQL create/list/handover are scoped, replay-safe, atomic, an
       },
     });
     assert.equal(fund.replenishmentSource.id, multiCurrencySource.id);
+    assert.equal(fund.ceiling.amount, '100');
 
     const approvalCashbox = await service.create(
       fixture.organizationId,
@@ -545,6 +710,18 @@ test('INC-1D PostgreSQL create/list/handover are scoped, replay-safe, atomic, an
       counts: [{ currency: 'USD', countedAmount: '1', varianceReason: 'Count variance' }],
       observedInstrumentIds: [],
     });
+    await assert.rejects(
+      operations.requestCloseApproval({
+        organizationId: fixture.organizationId,
+        actorUserId: fixture.primaryUserId,
+        key: 'request-close-approval',
+        requestId: 'request-close-approval-invalid-replay',
+      }, approvalCashbox.id, '2026-08-08', {
+        counts: [{ currency: 'USD', countedAmount: '1.000', varianceReason: 'Count variance' }],
+        observedInstrumentIds: [],
+      }),
+      (error) => problem(error, 'TRS-GEN-001', 422),
+    );
     const actionContext = {
       organizationId: fixture.organizationId,
       actorUserId: fixture.otherUserId,
@@ -651,6 +828,12 @@ test('INC-1D PostgreSQL create/list/handover are scoped, replay-safe, atomic, an
     const closeRejected = concurrentClose.find(({ status }) => status === 'rejected');
     assert.ok(closeRejected?.status === 'rejected');
     assert.ok(problem(closeRejected.reason, 'TRS-CSH-004', 409));
+    const concurrentReservation = await database.pool.query<{ consumed: number }>(`
+      SELECT count(*) FILTER (WHERE state = 'CONSUMED')::int AS consumed
+      FROM cashbox_day_number_reservations
+      WHERE cashbox_id = $1
+    `, [concurrentCashbox.id]);
+    assert.equal(concurrentReservation.rows[0]!.consumed, 1);
   } finally {
     await cleanup(database);
     await database.onModuleDestroy();
@@ -712,6 +895,14 @@ async function seed(database: DatabaseService) {
         organization_id, branch_id, code, name, default_currency
       ) VALUES ($1,$2,'TREASURY','Treasury','USD') RETURNING id
     `, [organizationId, branch.rows[0]!.id]);
+    await client.query(`
+      INSERT INTO numbering_rules (
+        organization_id, operation, branch_id, treasury_unit_id,
+        fiscal_year, fiscal_year_starts_on, fiscal_year_ends_on,
+        prefix, number_width, next_value
+      ) VALUES ($1, 'CASHBOX_DAY_CLOSE', $2, $3,
+        '2026', '2026-01-01', '2026-12-31', 'CBD-', 10, 1)
+    `, [organizationId, branch.rows[0]!.id, unit.rows[0]!.id]);
     const users = await client.query<{ id: string; subject_key: string }>(`
       INSERT INTO user_refs (organization_id, subject_key, display_name)
       VALUES
@@ -801,6 +992,7 @@ async function cleanup(database: DatabaseService): Promise<void> {
       'audit_events',
       'movement_facts',
       'petty_cash_profiles',
+      'cashbox_day_number_reservations',
       'cashbox_handover_instruments',
       'cashbox_handover_money',
       'cashbox_handovers',
@@ -835,6 +1027,7 @@ async function cleanup(database: DatabaseService): Promise<void> {
       'method_mappings',
       'method_definitions',
       'user_refs',
+      'numbering_rules',
       'treasury_units',
       'branches',
       'currencies',
