@@ -115,6 +115,7 @@ export class CashboxOperationsService {
         context.organizationId,
         dto.replenishmentSource.type,
         dto.replenishmentSource.id,
+        cashbox.mainCurrency,
       );
       if (!source) throw new Error('RESOURCE_HIDDEN');
       if (source.id === cashbox.id || source.state !== 'ACTIVE'
@@ -126,8 +127,8 @@ export class CashboxOperationsService {
         context.organizationId,
         context.actorUserId,
         {
-          branchId: cashbox.branchId,
-          treasuryUnitId: cashbox.treasuryUnitId,
+          branchIds: uniqueDefined([cashbox.branchId, source.branchId]),
+          treasuryUnitIds: uniqueDefined([cashbox.treasuryUnitId, source.treasuryUnitId]),
           cashboxIds: [cashbox.id, ...(dto.replenishmentSource.type === ReplenishmentSourceType.CASHBOX
             ? [source.id] : [])],
           bankAccountIds: dto.replenishmentSource.type === ReplenishmentSourceType.BANK_ACCOUNT
@@ -224,7 +225,9 @@ export class CashboxOperationsService {
         transaction, context, scope, requestDigest,
       );
       if (replay) return replay;
-      const cashbox = await this.requiredCashbox(transaction, context.organizationId, cashboxId);
+      const cashbox = await this.requiredCashbox(
+        transaction, context.organizationId, cashboxId, businessDate,
+      );
       const latest = await this.repository.latestDay(
         transaction, context.organizationId, cashboxId, businessDate, 'update',
       );
@@ -461,7 +464,9 @@ export class CashboxOperationsService {
         transaction, context, scope, requestDigest,
       );
       if (replay) return replay;
-      const cashbox = await this.requiredCashbox(transaction, context.organizationId, cashboxId);
+      const cashbox = await this.requiredCashbox(
+        transaction, context.organizationId, cashboxId, businessDate,
+      );
       const latest = await this.repository.latestDay(
         transaction, context.organizationId, cashboxId, businessDate, 'update',
       );
@@ -646,9 +651,10 @@ export class CashboxOperationsService {
     transaction: DatabaseTransaction,
     organizationId: string,
     cashboxId: string,
+    businessDate?: string,
   ): Promise<CashboxOperationFacts> {
     const cashbox = await this.repository.cashboxFacts(
-      transaction, organizationId, cashboxId, 'update',
+      transaction, organizationId, cashboxId, 'update', businessDate,
     );
     if (!cashbox) throw new Error('RESOURCE_HIDDEN');
     if (cashbox.state !== 'ACTIVE') throw new Error('STATE_CONFLICT');
@@ -688,13 +694,21 @@ export class CashboxOperationsService {
       transaction, context.organizationId, view.cashboxId,
     );
     if (!cashbox) throw new Error('RESOURCE_HIDDEN');
+    const source = await this.repository.replenishmentSource(
+      transaction,
+      context.organizationId,
+      view.replenishmentSource.type,
+      view.replenishmentSource.id,
+      view.currency,
+    );
+    if (!source) throw new Error('RESOURCE_HIDDEN');
     if (!await this.authorization.canOperateCashbox(
       transaction,
       context.organizationId,
       context.actorUserId,
       {
-        branchId: cashbox.branchId,
-        treasuryUnitId: cashbox.treasuryUnitId,
+        branchIds: uniqueDefined([cashbox.branchId, source.branchId]),
+        treasuryUnitIds: uniqueDefined([cashbox.treasuryUnitId, source.treasuryUnitId]),
         cashboxIds: [view.cashboxId, ...(view.replenishmentSource.type === ReplenishmentSourceType.CASHBOX
           ? [view.replenishmentSource.id] : [])],
         bankAccountIds: view.replenishmentSource.type === ReplenishmentSourceType.BANK_ACCOUNT
@@ -719,8 +733,8 @@ export class CashboxOperationsService {
       organizationId,
       actorUserId,
       {
-        branchId: cashbox.branchId,
-        treasuryUnitId: cashbox.treasuryUnitId,
+        branchIds: uniqueDefined([cashbox.branchId]),
+        treasuryUnitIds: [cashbox.treasuryUnitId],
         cashboxIds: [view.cashboxId],
         bankAccountIds: [],
         currencies: [view.currency],
@@ -750,8 +764,8 @@ export class CashboxOperationsService {
       organizationId,
       actorUserId,
       {
-        branchId: cashbox.branchId,
-        treasuryUnitId: cashbox.treasuryUnitId,
+        branchIds: uniqueDefined([cashbox.branchId]),
+        treasuryUnitIds: [cashbox.treasuryUnitId],
         cashboxIds: [cashbox.id],
         bankAccountIds: [],
         currencies: [],
@@ -791,8 +805,8 @@ export class CashboxOperationsService {
         organizationId,
         actorUserId,
         {
-          branchId: cashbox.branchId,
-          treasuryUnitId: cashbox.treasuryUnitId,
+          branchIds: uniqueDefined([cashbox.branchId]),
+          treasuryUnitIds: [cashbox.treasuryUnitId],
           cashboxIds: [cashbox.id],
           bankAccountIds: [],
           currencies: [count.currency],
@@ -816,8 +830,8 @@ export class CashboxOperationsService {
       context.organizationId,
       context.actorUserId,
       {
-        branchId: cashbox.branchId,
-        treasuryUnitId: cashbox.treasuryUnitId,
+        branchIds: uniqueDefined([cashbox.branchId]),
+        treasuryUnitIds: [cashbox.treasuryUnitId],
         cashboxIds: [cashbox.id],
         bankAccountIds: [],
         currencies: [],
@@ -1080,6 +1094,10 @@ function validDate(value: string): boolean {
   if (!DATE.test(value)) return false;
   const date = new Date(`${value}T00:00:00Z`);
   return Number.isFinite(date.getTime()) && date.toISOString().slice(0, 10) === value;
+}
+
+function uniqueDefined(values: Array<string | null>): string[] {
+  return [...new Set(values.filter((value): value is string => value !== null))];
 }
 
 function decimal(value: string): bigint {

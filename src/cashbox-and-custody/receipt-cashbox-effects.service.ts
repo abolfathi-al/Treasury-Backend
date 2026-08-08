@@ -56,7 +56,7 @@ export class ReceiptCashboxEffectsRepository {
       .orderBy(desc(cashboxDays.closeCycle))
       .limit(1)
       .for('update');
-    return days[0]?.state === 'CLOSED' ? 'CLOSED' : 'OK';
+    return days[0] && days[0].state !== 'OPEN' ? 'CLOSED' : 'OK';
   }
 }
 

@@ -33,8 +33,8 @@ export interface SettlementReadScope {
 }
 
 export interface CashboxAuthorizationContext {
-  branchId: string | null;
-  treasuryUnitId: string;
+  branchIds: string[];
+  treasuryUnitIds: string[];
   cashboxIds: string[];
   bankAccountIds: string[];
   currencies: string[];
@@ -119,8 +119,8 @@ export class AccessAuthorizationService {
       permission,
     );
     return grants.some((grant) => (
-      covers(grant.branchIds, context.branchId ? [context.branchId] : [])
-      && covers(grant.treasuryUnitIds, [context.treasuryUnitId])
+      covers(grant.branchIds, context.branchIds)
+      && covers(grant.treasuryUnitIds, context.treasuryUnitIds)
       && covers(grant.cashboxIds, context.cashboxIds)
       && covers(grant.bankAccountIds, context.bankAccountIds)
       && covers(grant.currencies, context.currencies)

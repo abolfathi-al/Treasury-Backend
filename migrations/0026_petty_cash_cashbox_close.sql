@@ -183,6 +183,44 @@ CREATE TRIGGER cashbox_days_history_immutable
 BEFORE UPDATE OR DELETE ON cashbox_days
 FOR EACH ROW EXECUTE FUNCTION prevent_cashbox_day_history_rewrite();
 
+CREATE FUNCTION prevent_cashbox_day_count_rewrite()
+RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE
+  old_parent_state varchar(24);
+  new_parent_xmin bigint;
+  new_parent_state varchar(24);
+BEGIN
+  IF TG_OP IN ('UPDATE', 'DELETE') THEN
+    SELECT state INTO old_parent_state
+    FROM cashbox_days
+    WHERE organization_id = OLD.organization_id
+      AND id = OLD.cashbox_day_id;
+
+    IF old_parent_state = 'CLOSED' THEN
+      RAISE EXCEPTION 'closed Cashbox Day count evidence is immutable';
+    END IF;
+  END IF;
+
+  IF TG_OP IN ('INSERT', 'UPDATE') THEN
+    SELECT xmin::text::bigint, state
+    INTO new_parent_xmin, new_parent_state
+    FROM cashbox_days
+    WHERE organization_id = NEW.organization_id
+      AND id = NEW.cashbox_day_id;
+
+    IF new_parent_state = 'CLOSED'
+       AND (TG_OP <> 'INSERT' OR new_parent_xmin <> txid_current()) THEN
+      RAISE EXCEPTION 'closed Cashbox Day count evidence is immutable';
+    END IF;
+  END IF;
+  RETURN CASE WHEN TG_OP = 'DELETE' THEN OLD ELSE NEW END;
+END;
+$$;
+
+CREATE TRIGGER cashbox_day_counts_history_immutable
+BEFORE INSERT OR UPDATE OR DELETE ON cashbox_day_counts
+FOR EACH ROW EXECUTE FUNCTION prevent_cashbox_day_count_rewrite();
+
 CREATE FUNCTION prevent_cashbox_day_approval_rewrite()
 RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN

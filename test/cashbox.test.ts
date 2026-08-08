@@ -13,7 +13,8 @@ import type { CashboxRepository } from '../src/cashbox-and-custody/cashbox.repos
 import { CashboxService } from '../src/cashbox-and-custody/cashbox.service';
 import { TreasuryProblem } from '../src/common/problem';
 import type { DatabaseService } from '../src/database/database.service';
-import type { AccessAuthorizationService } from '../src/access-control/access-authorization.service';
+import { AccessAuthorizationService } from '../src/access-control/access-authorization.service';
+import type { AccessAuthorizationRepository } from '../src/access-control/access-authorization.repository';
 import type { IdentityService } from '../src/access-control/identity.service';
 import type { MasterDataService } from '../src/master-data/master-data.service';
 
@@ -107,6 +108,40 @@ test('Cashbox DTO requires capabilities and a timezone-bearing RFC3339 activeTo'
     ));
     assert.ok(errors.some(({ property }) => property === 'activeTo'));
   }
+});
+
+test('Cashbox authorization requires one grant to cover every resource branch and unit', async () => {
+  const repository = {
+    paymentGrants: async () => [{
+      id: id(10),
+      grantUserId: id(2),
+      delegatedFromUserId: null,
+      amountCeiling: null,
+      amountCeilingCurrency: null,
+      branchIds: [id(11)],
+      treasuryUnitIds: [id(12)],
+      cashboxIds: [id(13), id(14)],
+      bankAccountIds: [],
+      documentTypes: [],
+      methodCategories: [],
+      currencies: ['USD'],
+    }],
+  } as unknown as AccessAuthorizationRepository;
+  const authorization = new AccessAuthorizationService(repository);
+
+  assert.equal(await authorization.canOperateCashbox(
+    {} as never,
+    id(9),
+    id(2),
+    {
+      branchIds: [id(11), id(15)],
+      treasuryUnitIds: [id(12), id(16)],
+      cashboxIds: [id(13), id(14)],
+      bankAccountIds: [],
+      currencies: ['USD'],
+    },
+    'petty-cash.create',
+  ), false);
 });
 
 test('Cashbox service maps stable create, stale-version, and custody failures', async () => {

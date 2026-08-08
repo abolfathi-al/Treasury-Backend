@@ -16,9 +16,12 @@ import { CashboxRepository } from '../src/cashbox-and-custody/cashbox.repository
 import { CashboxService } from '../src/cashbox-and-custody/cashbox.service';
 import {
   CashboxDayApprovalCommand,
+  ReplenishmentSourceType,
 } from '../src/cashbox-and-custody/cashbox-operations.dto';
 import { CashboxOperationsRepository } from '../src/cashbox-and-custody/cashbox-operations.repository';
 import { CashboxOperationsService } from '../src/cashbox-and-custody/cashbox-operations.service';
+import { PaymentCashboxEffectsRepository } from '../src/cashbox-and-custody/payment-cashbox-effects.service';
+import { ReceiptCashboxEffectsRepository } from '../src/cashbox-and-custody/receipt-cashbox-effects.service';
 import { digest } from '../src/common/http';
 import { TreasuryProblem } from '../src/common/problem';
 import { DatabaseService } from '../src/database/database.service';
@@ -28,6 +31,8 @@ import {
 } from '../src/foundation-effects/foundation-effects.service';
 import { MasterDataRepository } from '../src/master-data/master-data.repository';
 import { MasterDataService } from '../src/master-data/master-data.service';
+import { TransferEndpointType, type TransferView } from '../src/transfers/transfer.dto';
+import { TransferRepository } from '../src/transfers/transfer.repository';
 
 const connectionString = process.env.TEST_DATABASE_URL;
 
@@ -48,11 +53,12 @@ test('INC-1D PostgreSQL create/list/handover are scoped, replay-safe, atomic, an
     ),
     new MasterDataService(new MasterDataRepository(database)),
   );
+  const effects = new FoundationEffectsService(new FoundationEffectsRepository());
   const operations = new CashboxOperationsService(
     database,
     new CashboxOperationsRepository(),
     new AccessAuthorizationService(new AccessAuthorizationRepository()),
-    new FoundationEffectsService(new FoundationEffectsRepository()),
+    effects,
   );
   try {
     const fixture = await seed(database);
@@ -367,6 +373,18 @@ test('INC-1D PostgreSQL create/list/handover are scoped, replay-safe, atomic, an
       key: 'close-rollback',
       requestId: 'request-close-rollback',
     };
+    await database.db.transaction((transaction) => effects.appendMovement(transaction, {
+      organizationId: fixture.organizationId,
+      owner: 'domain.cashbox-and-custody',
+      sourceType: 'CashboxDay',
+      sourceId: closeCashbox.id,
+      effectKey: 'cashbox-close-future-fact',
+      endpointType: 'CASHBOX',
+      endpointId: closeCashbox.id,
+      amount: '100',
+      currency: 'USD',
+      businessDate: '2026-08-09',
+    }));
     await assert.rejects(
       operations.closeDay({
         ...closeContext,
@@ -396,6 +414,120 @@ test('INC-1D PostgreSQL create/list/handover are scoped, replay-safe, atomic, an
       '2026-08-08',
       { counts: [{ currency: 'USD', countedAmount: '0' }], observedInstrumentIds: [] },
     )).id, closed.id);
+    for (const statement of [
+      `UPDATE cashbox_day_counts SET counted_amount = 1 WHERE cashbox_day_id = '${closed.id}'`,
+      `DELETE FROM cashbox_day_counts WHERE cashbox_day_id = '${closed.id}'`,
+      `INSERT INTO cashbox_day_counts (
+        cashbox_day_id, organization_id, currency, book_amount, counted_amount, variance_amount
+      ) VALUES ('${closed.id}', '${fixture.organizationId}', 'EUR', 0, 0, 0)`,
+    ]) {
+      await assert.rejects(database.pool.query(statement), /count evidence is immutable/u);
+    }
+
+    const reopenRequest = await database.pool.query<{ id: string }>(`
+      INSERT INTO cashbox_day_approval_requests (
+        organization_id, cashbox_id, business_date, command_kind, command_body,
+        command_digest, source_day_id, source_day_version, requested_by_user_id,
+        state, version
+      ) VALUES ($1, $2, '2026-08-08', 'REOPEN', '{}'::jsonb, repeat('a', 64),
+        $3, $4, $5, 'APPROVED', 2)
+      RETURNING id
+    `, [fixture.organizationId, closeCashbox.id, closed.id, closed.version, fixture.primaryUserId]);
+    const reopenAction = await database.pool.query<{ id: string }>(`
+      INSERT INTO cashbox_day_approval_actions (
+        organization_id, approval_request_id, actor_user_id, action
+      ) VALUES ($1, $2, $3, 'APPROVED')
+      RETURNING id
+    `, [fixture.organizationId, reopenRequest.rows[0]!.id, fixture.otherUserId]);
+    const reopened = await database.pool.query<{ id: string }>(`
+      INSERT INTO cashbox_days (
+        organization_id, cashbox_id, business_date, close_cycle, prior_close_id,
+        approval_action_id, reopen_reason, reopened_by_user_id, reopened_at,
+        state, version
+      ) VALUES ($1, $2, '2026-08-08', 2, $3, $4, 'Governed correction', $5, now(),
+        'REOPENED', 0)
+      RETURNING id
+    `, [
+      fixture.organizationId,
+      closeCashbox.id,
+      closed.id,
+      reopenAction.rows[0]!.id,
+      fixture.primaryUserId,
+    ]);
+    await assert.rejects(database.pool.query(
+      'UPDATE cashbox_day_counts SET cashbox_day_id = $1 WHERE cashbox_day_id = $2',
+      [reopened.rows[0]!.id, closed.id],
+    ), /count evidence is immutable/u);
+    await database.pool.query(
+      `UPDATE cashboxes SET active_from = '2026-08-01T00:00:00Z' WHERE id = $1`,
+      [closeCashbox.id],
+    );
+    await database.db.transaction(async (transaction) => {
+      assert.equal(await new ReceiptCashboxEffectsRepository().receivable(
+        transaction,
+        fixture.organizationId,
+        closeCashbox.id,
+        'USD',
+        '2026-08-08',
+      ), 'CLOSED');
+      assert.equal(await new PaymentCashboxEffectsRepository().payable(
+        transaction,
+        fixture.organizationId,
+        closeCashbox.id,
+        'USD',
+        '2026-08-08',
+        '00000000-0000-4000-8000-000000000077',
+        '1',
+      ), 'CLOSED');
+      const transferAvailability = await new TransferRepository().sourceAvailability(
+        transaction,
+        {
+          organizationId: fixture.organizationId,
+          businessDate: '2026-08-08',
+          source: { type: TransferEndpointType.CASHBOX, id: closeCashbox.id },
+          sourceMoney: { amount: '1', currency: 'USD' },
+        } as TransferView,
+      );
+      assert.equal(transferAvailability?.active, false);
+    });
+
+    const fundCashbox = await service.create(
+      fixture.organizationId,
+      fixture.primaryUserId,
+      { ...createDto(fixture, 'FUND'), type: CashboxType.PETTY_CASH },
+      'cashbox-fund',
+      'request-create-fund',
+    );
+    const multiCurrencySource = await service.create(
+      fixture.organizationId,
+      fixture.primaryUserId,
+      {
+        ...createDto(fixture, 'SOURCE'),
+        mainCurrency: 'EUR',
+        currencyControls: [
+          { currency: 'EUR', allowNegative: false },
+          { currency: 'USD', allowNegative: false },
+        ],
+      },
+      'cashbox-source',
+      'request-create-source',
+    );
+    const fund = await operations.createPettyCashFund({
+      organizationId: fixture.organizationId,
+      actorUserId: fixture.primaryUserId,
+      key: 'create-fund',
+      requestId: 'request-create-fund-profile',
+    }, {
+      cashboxId: fundCashbox.id,
+      ceiling: { amount: '100', currency: 'USD' },
+      expenseCategoryCodes: ['OFFICE'],
+      settlementDays: 30,
+      replenishmentSource: {
+        type: ReplenishmentSourceType.CASHBOX,
+        id: multiCurrencySource.id,
+      },
+    });
+    assert.equal(fund.replenishmentSource.id, multiCurrencySource.id);
 
     const approvalCashbox = await service.create(
       fixture.organizationId,
@@ -567,7 +699,9 @@ async function seed(database: DatabaseService) {
     await client.query(`
       INSERT INTO currencies (
         organization_id, code, name, decimal_places, base_currency
-      ) VALUES ($1, 'USD', 'US Dollar', 2, true)
+      ) VALUES
+        ($1, 'USD', 'US Dollar', 2, true),
+        ($1, 'EUR', 'Euro', 2, false)
     `, [organizationId]);
     const branch = await client.query<{ id: string }>(`
       INSERT INTO branches (organization_id, code, name)

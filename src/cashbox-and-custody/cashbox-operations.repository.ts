@@ -141,6 +141,7 @@ export class CashboxOperationsRepository {
     organizationId: string,
     cashboxId: string,
     lock: 'share' | 'update' = 'share',
+    businessDate?: string,
   ): Promise<CashboxOperationFacts | undefined> {
     const rows = await transaction
       .select({
@@ -205,6 +206,7 @@ export class CashboxOperationsRepository {
        AND mf.endpoint_id = cc.cashbox_id
        AND mf.currency = cc.currency
        AND mf.state IN ('POSTED', 'REVERSED')
+       AND (${businessDate ?? null}::date IS NULL OR mf.business_date <= ${businessDate ?? null}::date)
       WHERE cc.organization_id = ${organizationId}
         AND cc.cashbox_id = ${cashboxId}
       GROUP BY cc.currency, cc.maximum_holding
@@ -241,6 +243,7 @@ export class CashboxOperationsRepository {
     organizationId: string,
     type: ReplenishmentSourceType,
     id: string,
+    currency: string,
   ): Promise<{
       id: string;
       label: string;
@@ -257,7 +260,7 @@ export class CashboxOperationsRepository {
           code: cashboxes.code,
           name: cashboxes.name,
           state: cashboxes.state,
-          currency: cashboxes.mainCurrency,
+          currency: cashboxCurrencyControls.currency,
           canTransfer: cashboxes.canTransfer,
           branchId: cashboxes.branchId,
           treasuryUnitId: cashboxes.treasuryUnitId,
@@ -266,7 +269,7 @@ export class CashboxOperationsRepository {
         .innerJoin(cashboxCurrencyControls, and(
           eq(cashboxCurrencyControls.organizationId, cashboxes.organizationId),
           eq(cashboxCurrencyControls.cashboxId, cashboxes.id),
-          eq(cashboxCurrencyControls.currency, cashboxes.mainCurrency),
+          eq(cashboxCurrencyControls.currency, currency),
         ))
         .where(and(eq(cashboxes.organizationId, organizationId), eq(cashboxes.id, id)))
         .for('share', { of: cashboxes })
@@ -286,7 +289,11 @@ export class CashboxOperationsRepository {
         treasuryUnitId: bankAccounts.treasuryUnitId,
       })
       .from(bankAccounts)
-      .where(and(eq(bankAccounts.organizationId, organizationId), eq(bankAccounts.id, id)))
+      .where(and(
+        eq(bankAccounts.organizationId, organizationId),
+        eq(bankAccounts.id, id),
+        eq(bankAccounts.currency, currency),
+      ))
       .for('share')
       .limit(1);
     const row = rows[0];
@@ -403,7 +410,9 @@ export class CashboxOperationsRepository {
     const row = rows[0];
     if (!row) return undefined;
     const sourceType = row.sourceType as ReplenishmentSourceType;
-    const source = await this.replenishmentSource(transaction, organizationId, sourceType, row.sourceId);
+    const source = await this.replenishmentSource(
+      transaction, organizationId, sourceType, row.sourceId, row.currency,
+    );
     if (!source) return undefined;
     return compact({
       id: row.id,
