@@ -66,6 +66,14 @@ const expectedOperations = [
   ['GET', 'v1/cashboxes'],
   ['POST', 'v1/cashboxes'],
   ['POST', 'v1/cashboxes/:cashboxId/handovers'],
+  ['GET', 'v1/petty-cash-funds'],
+  ['POST', 'v1/petty-cash-funds'],
+  ['POST', 'v1/cashboxes/:cashboxId/days/:businessDate/close'],
+  ['POST', 'v1/cashboxes/:cashboxId/days/:businessDate/close-approval-requests'],
+  ['POST', 'v1/cashboxes/:cashboxId/days/:businessDate/reopen'],
+  ['POST', 'v1/cashboxes/:cashboxId/days/:businessDate/reopen-approval-requests'],
+  ['GET', 'v1/cashbox-day-approval-requests'],
+  ['POST', 'v1/cashbox-day-approval-requests/:approvalRequestId/actions'],
   ['GET', 'v1/bank-types'],
   ['POST', 'v1/bank-types'],
   ['GET', 'v1/banks'],
@@ -565,11 +573,54 @@ test('Cashbox operations use exact scoped permissions and operation IDs', () => 
       'cashbox.handover',
       'createCashboxHandover',
     ],
+    [CashboxController.prototype.listPettyCashFunds, 'petty-cash.view', 'listPettyCashFunds'],
+    [CashboxController.prototype.createPettyCashFund, 'petty-cash.create', 'createPettyCashFund'],
+    [CashboxController.prototype.requestCloseApproval, 'cashbox.close', 'requestCashboxDayCloseApproval'],
+    [CashboxController.prototype.requestReopenApproval, 'cashbox.reopen', 'requestCashboxDayReopenApproval'],
+    [CashboxController.prototype.closeDay, 'cashbox.close', 'closeCashboxDay'],
+    [CashboxController.prototype.reopenDay, 'cashbox.reopen', 'reopenCashboxDay'],
   ] as const) {
     assert.equal(Reflect.getMetadata(REQUIRED_PERMISSION, handler), permission);
     assert.equal(Reflect.getMetadata(AUTHORIZATION_OPERATION, handler), operationId);
     assert.equal(Reflect.getMetadata(PERMISSION_SCOPE_MODE, handler), 'ONE_GRANT_RESOURCE');
   }
+  assert.equal(
+    Reflect.getMetadata(STEP_UP_REQUIRED, CashboxController.prototype.actOnApproval),
+    'actOnCashboxDayApproval',
+  );
+  assert.equal(
+    Reflect.getMetadata(STEP_UP_REQUIRED, CashboxController.prototype.reopenDay),
+    'reopenCashboxDay',
+  );
+});
+
+test('INC-5B migration and Drizzle schema preserve cashbox close evidence', async () => {
+  const migration = (await Promise.all([
+    readFile('migrations/0015_receipt_execute_reverse.sql', 'utf8'),
+    readFile('migrations/0026_petty_cash_cashbox_close.sql', 'utf8'),
+  ])).join('\n');
+  const schema = await readFile('src/database/schema.ts', 'utf8');
+  for (const source of [migration, schema]) {
+    for (const invariant of [
+      'petty_cash_profiles',
+      'cashbox_day_approval_requests',
+      'cashbox_day_approval_actions',
+      'cashbox_day_counts',
+      'numbering_rules',
+      'cashbox_day_number_reservations',
+      'source_day_version',
+      'book_snapshot_digest',
+      'held_instrument_snapshot',
+    ]) assert.match(source, new RegExp(invariant, 'u'));
+  }
+  assert.match(migration, /cashbox_day_approval_actions_immutable/u);
+  assert.match(migration, /cashbox_day_approval_requests_terminal_transition/u);
+  assert.match(migration, /cashbox_day_number_reservations_terminal_transition/u);
+  assert.match(migration, /DEFERRABLE INITIALLY DEFERRED/u);
+  assert.match(migration, /cashbox_days_closed_shape/u);
+  assert.match(migration, /cashbox_days_reopened_shape/u);
+  assert.match(migration, /UNIQUE \(organization_id, cashbox_id, business_date, close_cycle\)/u);
+  assert.match(migration, /command_kind = 'CLOSE'[\s\S]*source_day_id IS NOT NULL AND source_day_version > 0/u);
 });
 
 test('Party operations use exact organization-wide permissions and operation IDs', () => {
@@ -752,6 +803,7 @@ test('CHG-017 admits the emergency separation override permission', async () => 
     readFile('migrations/0012_separation_override_permission.sql', 'utf8'),
     readFile('migrations/0021_transfer_draft_approval.sql', 'utf8'),
     readFile('migrations/0024_settlement_action_handoff.sql', 'utf8'),
+    readFile('migrations/0026_petty_cash_cashbox_close.sql', 'utf8'),
   ]);
   const persisted = [...migrations.join('\n').matchAll(/\('([^']+)'\)/gu)]
     .map((match) => match[1])

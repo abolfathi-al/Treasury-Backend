@@ -61,7 +61,7 @@ export class PaymentCashboxEffectsRepository {
       .orderBy(desc(cashboxDays.closeCycle))
       .limit(1)
       .for('update');
-    if (day?.state === 'CLOSED') return 'CLOSED';
+    if (day && day.state !== 'OPEN') return 'CLOSED';
 
     if (row.transactionCeiling !== null && decimal(amount) > decimal(row.transactionCeiling)) {
       return 'INSUFFICIENT';

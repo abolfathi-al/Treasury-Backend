@@ -469,7 +469,9 @@ export class TransferRepository {
       )).orderBy(desc(cashboxDays.closeCycle)).limit(1).for('update');
       state = source.state;
       canTransfer = source.canTransfer;
-      active = source.activeFrom <= at && (source.activeTo === null || source.activeTo > at) && day?.state !== 'CLOSED';
+      active = source.activeFrom <= at
+        && (source.activeTo === null || source.activeTo > at)
+        && (!day || day.state === 'OPEN');
       transactionCeiling = source.transactionCeiling;
       minimumPosition = source.minimumPosition ?? (source.allowNegative ? null : '0');
     } else if (view.source.type === TransferEndpointType.BANK_ACCOUNT) {

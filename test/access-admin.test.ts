@@ -24,11 +24,13 @@ import { TreasuryProblem } from '../src/common/problem';
 const id = (suffix: number) => `00000000-0000-4000-8000-${String(suffix).padStart(12, '0')}`;
 
 test('Role permission admission is the exact Canon vocabulary including conditional step-up', () => {
-  assert.equal(CANON_PERMISSIONS.length, 75);
+  assert.equal(CANON_PERMISSIONS.length, 77);
   assert.equal(new Set(CANON_PERMISSIONS).size, CANON_PERMISSIONS.length);
   assert.deepEqual([...PRIVILEGED_PERMISSIONS].sort(), [
     'access-grant.manage',
     'approval-policy.manage',
+    'cashbox.approve',
+    'cashbox.reject',
     'cashbox.reopen',
     'cheque.transition',
     'delegation.manage',

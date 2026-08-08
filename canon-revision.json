@@ -1,20 +1,34 @@
 {
   "repository": "Treasury-Canon",
-  "revision": "bbe3dc7cf2d03f650e735458520d3fc817cd0c30",
+  "revision": "7f062f7d6cdd136f8a92c327472dc61cac4eacad",
   "canon_root": "canon-v4",
-  "authorized_delivery_slice": "SLICE-4-TRANSFER-SETTLEMENT",
-  "authorized_increment": "INC-4D-SETTLEMENT-ACTION-HANDOFF",
+  "authorized_delivery_slice": "SLICE-5-OPERATIONS",
+  "authorized_increment": "INC-5B-PETTY-CASH-CASHBOX-CLOSE",
   "requirements": [
-    "REQ-COL-004",
-    "REQ-COL-005",
-    "REQ-COL-009",
-    "REQ-COL-010"
+    "REQ-ACC-009",
+    "REQ-MST-002",
+    "REQ-MST-008",
+    "REQ-CSH-006",
+    "REQ-CSH-007",
+    "REQ-CSH-008",
+    "REQ-CSH-009"
   ],
   "acceptance_scenarios": [
-    "SCN-COL-007"
+    "SCN-MST-004",
+    "SCN-ACC-007",
+    "SCN-CSH-004",
+    "SCN-CSH-005",
+    "SCN-CSH-007",
+    "SCN-CSH-008"
   ],
   "authorized_operations": [
-    "listSettlementBatches",
-    "getSettlementBatch"
+    "listPettyCashFunds",
+    "createPettyCashFund",
+    "listCashboxDayApprovalRequests",
+    "requestCashboxDayCloseApproval",
+    "requestCashboxDayReopenApproval",
+    "actOnCashboxDayApproval",
+    "closeCashboxDay",
+    "reopenCashboxDay"
   ]
 }
